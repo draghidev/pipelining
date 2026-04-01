@@ -1,16 +1,9 @@
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
+
 namespace Draghi.Pipelining;
 
-public enum PipelineExecutionMode
-{
-    /// <summary>Execution loop runs fully asynchronously on a scheduler thread.</summary>
-    Async,
-    /// <summary>First item executes on the caller's thread, then yields to the scheduler.</summary>
-    SyncFirst,
-    /// <summary>Execution loop runs entirely on the caller's thread. Use only when items complete quickly.</summary>
-    Sync,
-}
-
-public interface IPipelinePolicy<T> where T : class
+public interface IPipelinePolicy<T>
 {
     /// Runs the item's work and returns its pipeline and trailing execution tasks.
     ValueTask<PipelineItemResult> ExecuteItemAsync(T item, CancellationToken cancellationToken);
@@ -24,23 +17,33 @@ public interface IPipelinePolicy<T> where T : class
 
     /// Attempts to recover from a failed item. Returns a recovery item that supplants the failed item in the pipeline,
     /// or null if recovery is not possible. When non-null the pipeline will not complete the failed item.
-    /// Without this hook the policy would have to wrap every item's tasks in its own async state machines
-    /// to handle recovery, creating a per-item allocation cliff for a rare error path.
-    T? TryRecoverItemFailure(PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken) => null;
+    /// NOTE: struct policies should override this to avoid DIM boxing.
+    bool TryRecoverItemFailure(PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out T? recoveryItem)
+    {
+        recoveryItem = default;
+        return false;
+    }
 
     /// The scheduler used for the execution loop.
     /// When null, falls back to ThreadPool.
     PipelineScheduler? ExecutionScheduler => null;
 
-    /// The execution mode for the pipeline execution loop.
-    PipelineExecutionMode ExecutionMode => PipelineExecutionMode.Async;
-
-    /// The cancellation token for the pipeline's lifetime.
-    CancellationToken CancellationToken => default;
+    /// When true, Enqueue dispatches to the scheduler. When false, runs the executor inline on the caller's thread.
+    bool RunEnqueueAsynchronously => true;
 
     /// Called when the executor is idle, before waiting for more work.
-    /// Waiters may still be active — use <see cref="Pipeline{T,TPolicy}.WaitForIdleAsync"/> for full pipeline idle.
+    /// Waiters may still be active, use <see cref="Pipeline{T,TPolicy}.WaitForIdleAsync"/> for full pipeline idle.
     ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
+
+    /// Called after the executor processes the first item of a resumed batch, when there are more items.
+    /// The policy can yield to the scheduler (e.g. to free a caller's thread) or return default to continue inline.
+    /// Default: when RunEnqueueAsynchronously is false, yield to the current scheduler.
+    /// NOTE: struct policies should override this to avoid DIM boxing.
+    ValueTask YieldAfterFirstItem() => RunEnqueueAsynchronously ? default : DefaultYieldAsync();
+
+    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
+    private static async ValueTask DefaultYieldAsync()
+        => await PipelineScheduler.ThreadPool.ContinueOnAsync(forceYielding: true);
 }
 
 /// <summary>

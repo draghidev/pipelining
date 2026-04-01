@@ -38,9 +38,9 @@ sealed class PipelineChannel<T> where T : class
     ManualResetValueTaskSourceCore<bool> _readerSignal;
     bool _readerWaiting;
 
-    public PipelineChannel(PipelineExecutionMode mode = PipelineExecutionMode.SyncFirst)
+    public PipelineChannel(bool runEnqueueAsynchronously = false)
     {
-        _pipeline = Pipeline.Create<Envelope, Policy>(new Policy(this, mode));
+        _pipeline = Pipeline.Create<Envelope, Policy>(new Policy(this, runEnqueueAsynchronously));
     }
 
     public void Write(Envelope envelope)
@@ -115,17 +115,17 @@ sealed class PipelineChannel<T> where T : class
         public void Reset() => Value = default;
     }
 
-    struct Policy(PipelineChannel<T> channel, PipelineExecutionMode mode) : IPipelinePolicy<Envelope>
+    struct Policy(PipelineChannel<T> channel, bool runEnqueueAsynchronously) : IPipelinePolicy<Envelope>
     {
         public ValueTask<PipelineItemResult> ExecuteItemAsync(Envelope item, CancellationToken cancellationToken)
             => new(new PipelineItemResult(ValueTask.CompletedTask));
 
-        public void ActivateHeadItem(Envelope item, bool schedule = true) { }
+        public void ActivateHeadItem(Envelope item, bool preferAsync = true) { }
 
         public void CompleteItem(Envelope item, int remainingDepth, Exception? exception)
             => channel.OnItemCompleted(item);
 
-        public PipelineExecutionMode ExecutionMode => mode;
+        public bool RunEnqueueAsynchronously => runEnqueueAsynchronously;
     }
 }
 
@@ -136,13 +136,13 @@ public class PipelineChannelBenchmarks
     PipelineChannel<object> _channel = null!;
     PipelineChannel<object>.Envelope _envelope = null!;
 
-    [Params(PipelineExecutionMode.SyncFirst)]
-    public PipelineExecutionMode Mode { get; set; }
+    [Params(false)]
+    public bool RunAsync { get; set; }
 
     [GlobalSetup]
     public void Setup()
     {
-        _channel = new PipelineChannel<object>(Mode);
+        _channel = new PipelineChannel<object>(RunAsync);
         _envelope = new PipelineChannel<object>.Envelope();
     }
 

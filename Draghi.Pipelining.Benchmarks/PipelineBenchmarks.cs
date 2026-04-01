@@ -17,13 +17,13 @@ public class PipelineBenchmarks
     Pipeline<BareItem, BarePolicy> _pipeline = null!;
     BareItem _item = null!;
 
-    [Params(PipelineExecutionMode.SyncFirst, PipelineExecutionMode.Async)]
-    public PipelineExecutionMode Mode { get; set; }
+    [Params(false, true)]
+    public bool RunAsync { get; set; }
 
     [GlobalSetup]
     public void Setup()
     {
-        _pipeline = Pipeline.Create<BareItem, BarePolicy>(new BarePolicy(Mode));
+        _pipeline = Pipeline.Create<BareItem, BarePolicy>(new BarePolicy(RunAsync));
         _item = new BareItem();
     }
 
@@ -62,24 +62,29 @@ sealed class BareItem
 /// Minimal policy that immediately completes items during execution.
 /// No trailing work, no pipelining phase, just the fastest possible round-trip.
 /// </summary>
-struct BarePolicy(PipelineExecutionMode mode) : IPipelinePolicy<BareItem>
+struct BarePolicy(bool runEnqueueAsynchronously) : IPipelinePolicy<BareItem>
 {
     public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItem item, CancellationToken cancellationToken)
     {
         return new(new PipelineItemResult(ValueTask.CompletedTask));
     }
 
-    public void ActivateHeadItem(BareItem item, bool schedule = true) { }
+    public void ActivateHeadItem(BareItem item, bool preferAsync = true) { }
 
     public void CompleteItem(BareItem item, int remainingDepth, Exception? exception)
     {
         item.SignalComplete();
     }
 
-    public BareItem? TryRecoverItemFailure(PipelineItemFailureContext context, BareItem failedItem, CancellationToken cancellationToken)
-        => null;
+    public bool TryRecoverItemFailure(PipelineItemFailureContext context, BareItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareItem? recoveryItem)
+    {
+        recoveryItem = null;
+        return false;
+    }
 
     public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
 
-    public PipelineExecutionMode ExecutionMode => mode;
+    public ValueTask YieldAfterFirstItem() => default;
+
+    public bool RunEnqueueAsynchronously => runEnqueueAsynchronously;
 }

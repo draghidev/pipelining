@@ -12,14 +12,12 @@ public enum PipelineItemFailureKind
     TrailingExecutionTask,
 }
 
-public readonly struct PipelineItemFailureContext(PipelineItemFailureKind kind, Exception exception, ValueTask pipelineTask = default)
+public readonly struct PipelineItemFailureContext(PipelineItemFailureKind kind, Exception exception, Task? pipelineTask = null)
 {
     public PipelineItemFailureKind Kind { get; } = kind;
     public Exception Exception { get; } = exception;
-    /// <summary>
-    /// The item's pipeline task, if still live at the time of failure.
-    /// Meaningful when <see cref="Kind"/> is <see cref="PipelineItemFailureKind.TrailingExecutionTask"/>;
-    /// the policy is responsible for observing this task to prevent unobserved task exceptions.
-    /// </summary>
-    public ValueTask PipelineTask { get; } = pipelineTask;
+    /// The item's pipeline task, if still live at the time of failure. Converted to Task so it can
+    /// be safely observed by both the policy and the pipeline.
+    /// Meaningful when <see cref="Kind"/> is <see cref="PipelineItemFailureKind.TrailingExecutionTask"/>.
+    public Task? PipelineTask { get; } = pipelineTask;
 }

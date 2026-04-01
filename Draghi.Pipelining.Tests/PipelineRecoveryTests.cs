@@ -6,7 +6,7 @@ public class PipelineRecoveryTests
     [TestMethod]
     public async Task RecoveryReturnsNull_ItemCompletedWithOriginalException()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
         pipeline.Enqueue(item).Execute();
         await item.WaitForCompleteAsync();
@@ -19,7 +19,7 @@ public class PipelineRecoveryTests
     public async Task RecoveryExecuteSyncSuccess()
     {
         var recovery = new TestPipelineItem();
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async, _ => recovery));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
         pipeline.Enqueue(item).Execute();
 
@@ -32,7 +32,7 @@ public class PipelineRecoveryTests
     public async Task RecoveryExecuteAsyncSuccess()
     {
         var recovery = new TestPipelineItem { ExecuteAsync = true };
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async, _ => recovery));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
         pipeline.Enqueue(item).Execute();
 
@@ -47,7 +47,7 @@ public class PipelineRecoveryTests
     public async Task RecoveryExecuteThrows_RecoveryCompletedWithException()
     {
         var recovery = new TestPipelineItem { ThrowOnExecute = new ApplicationException("recovery failed") };
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async, _ => recovery));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
         pipeline.Enqueue(item).Execute();
 
@@ -60,7 +60,7 @@ public class PipelineRecoveryTests
     public async Task RecoveryPipelineTaskPending_StoredAsTailWaiter()
     {
         var recovery = new TestPipelineItem { CompleteAsync = true };
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async, _ => recovery));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
         pipeline.Enqueue(item).Execute();
 
@@ -78,7 +78,7 @@ public class PipelineRecoveryTests
     public async Task RecoveryPipelineTaskFaults_RecoveryCompletedWithException()
     {
         var recovery = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new ApplicationException("pipeline failed") };
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async, _ => recovery));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
         pipeline.Enqueue(item).Execute();
 
@@ -92,7 +92,7 @@ public class PipelineRecoveryTests
     {
         var recovery = new TestPipelineItem();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async,
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
             idleTcs));
 
@@ -115,7 +115,7 @@ public class PipelineRecoveryTests
     public async Task TrailingTaskFailure_RecoveryTakesOver()
     {
         var recovery = new TestPipelineItem();
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async, ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery : null));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery : null));
 
         var item = new TestPipelineItem
         {
@@ -141,7 +141,7 @@ public class PipelineRecoveryTests
         // of which path handles it (PipelineTask or PipelineTaskWaiter).
         var recovery = new TestPipelineItem();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async,
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask or PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
             idleTcs));
 

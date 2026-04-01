@@ -5,40 +5,42 @@ using System.Runtime.CompilerServices;
 namespace Draghi.Pipelining;
 
 public sealed class Pipeline<T, TPolicy>
-    where T : class
     where TPolicy : IPipelinePolicy<T>
 {
     TPolicy _policy;
 
     // Execution.
-    readonly PipelineExecutionMode _mode;
     readonly SingleProducerSingleConsumerQueue<Element> _queue;
+    bool _notEmpty; // Set by Enqueue before the queue write, checked by the executor under the wake lock.
     readonly Pipeline.WakeSignal _wakeSignal;
     readonly Task _executionTask;
     // Pipeline state.
+    bool _completing; // First-writer guard for CompleteAsync.
     int _pipelineDepth; // Authoritative total of all queued and waiting items.
-    bool _completed;
     Exception? _completionException;
-    readonly CancellationTokenSource _cts;
-    readonly CancellationToken _completionToken;
     TaskCompletionSource? _drainTcs;
 
-    // Waiter tracking — items that could not be completed synchronously wait for their turn in the pipeline.
-    readonly SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)> _waiters;
-    int _waiterQueueCount; // Authoritative count.
-    // Published by the execution loop for deferred activation via Interlocked.Exchange.
-    // Also used as the activation handshake for the pending tail.
-    T? _executingItem;
-    // Pending tail — the most recent waiter, held outside the queue so the executor can swap it
+    // Executor-owned, only touched by the execution loop. Padded to isolate from cross-thread atomics.
+    // Pending tail, the most recent waiter, held outside the queue so the executor can swap it
     // for a recovery item if the trailing task fails. Committed to the waiter queue on the next
-    // loop iteration. Executor-owned; fields rather than locals because RecoverTailWaiter is
-    // async and async methods cannot capture locals by ref.
-    T? _tailWaiter;
+    // loop iteration.
+    T _tailWaiter = default!;
+    bool _hasTailWaiter;
     ValueTask _tailWaiterTask;
+    // Published by the execution loop for deferred activation. The bool flag is the handshake:
+    // set (true) by the executor, claimed (false) by the advancer via Interlocked.Exchange.
+    // The item field is written before the flag (ordered by the Exchange barrier).
+    T _executingItem = default!;
+    bool _hasExecutingItem;
 
-    // Waiter completion — serialized via the advancer pattern to ensure head-first processing.
+    // Cross-thread atomics, touched by the executor, advancer, enqueuer, and completion callbacks.
+    readonly SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)> _waiters;
+    int _waiterQueueCount; // Authoritative count. Interlocked by executor and advancer.
     int _waiterCompletedCount; // Number of completed waiter tasks not yet processed by the advancer.
     bool _advancing; // True if a thread is currently the advancer.
+    bool _waiterInRecovery; // True when recovery holds _advancing across an async boundary.
+    T _waiterRecoveryItem = default!; // The item being recovered, so DrainOnCompletion can complete it.
+    readonly Lock _waiterRecoveryLock = new(); // Protects AdvanceAndDrain in recovery from racing with CompleteAsync's drain.
 
     // Activation.
     readonly Action _onWaiterTaskCompletedAction;
@@ -50,25 +52,29 @@ public sealed class Pipeline<T, TPolicy>
         _policy = policy;
         _queue = new();
         _waiters = new();
-        _mode = policy.ExecutionMode;
-        _wakeSignal = new(_mode is PipelineExecutionMode.Async, policy.ExecutionScheduler ?? PipelineScheduler.ThreadPool);
+        _wakeSignal = new(policy.RunEnqueueAsynchronously, policy.ExecutionScheduler ?? PipelineScheduler.ThreadPool);
         _onWaiterTaskCompletedAction = OnWaiterTaskCompleted;
-        _cts = CancellationTokenSource.CreateLinkedTokenSource(policy.CancellationToken);
-        _completionToken = _cts.Token;
         _executionTask = ExecuteQueue();
     }
 
-    readonly Lock _drainLock = new(); // Protects drain TCS and completion state.
+    int _drainLock; // Spinlock for drain TCS and completion state.
 
+    /// Cancellation token that fires when the pipeline is completing. Can be used by the protocol
+    /// to create a linked token or to abort IO operations directly.
+    public CancellationToken CompletionToken => _wakeSignal.CompletionToken;
 
     public int Depth => Volatile.Read(ref _pipelineDepth);
 
     /// Returns an action to invoke outside any held lock to signal the execution loop to continue.
     public Pipeline.EnqueueResult Enqueue(T item)
     {
-        if (_completed)
+        if (_wakeSignal.IsCompleted)
             ThrowCompleted();
 
+        // Plain write ordered before the enqueue by the SPSC queue's internal volatile write of _last.
+        // The executor's wake-lock acquire at the top of the loop is the cross-thread fence
+        // that makes this visible; no fence needed on this side. Keeps Enqueue hot.
+        _notEmpty = true;
         _queue.Enqueue(new(item));
         Interlocked.Increment(ref _pipelineDepth);
 
@@ -76,10 +82,11 @@ public sealed class Pipeline<T, TPolicy>
     }
 
     /// Waits for the pipeline to become idle (all items completed, depth reaches zero).
-    /// Does not prevent new items from being enqueued — the caller is responsible for that.
+    /// Does not prevent new items from being enqueued, the caller is responsible for that.
     public ValueTask WaitForIdleAsync(CancellationToken cancellationToken = default)
     {
-        lock (_drainLock)
+        AcquireDrainLock();
+        try
         {
             if (_pipelineDepth is 0)
                 return ValueTask.CompletedTask;
@@ -87,59 +94,54 @@ public sealed class Pipeline<T, TPolicy>
             _drainTcs ??= new(TaskCreationOptions.RunContinuationsAsynchronously);
             return new(_drainTcs.Task.WaitAsync(cancellationToken));
         }
-    }
-
-    public async ValueTask CompleteAsync(Exception? exception = null)
-    {
-        lock (_drainLock)
+        finally
         {
-            if (_completed)
-                return;
-            _completed = true;
-            _completionException = exception;
-            _cts.Cancel();
-            _wakeSignal.Complete();
+            ReleaseDrainLock();
         }
-
-        await _executionTask.ConfigureAwait(false);
-
-        while (_waiters.TryDequeue(out var item))
-            CompleteWaiter(item.Waiter, exception);
-        while (_queue.TryDequeue(out var item))
-            CompleteWaiter(item.Value, exception);
     }
 
-    /// <summary>Returns an enumerator for items currently in the pipeline and queue, from oldest to newest.</summary>
-    /// <remarks>Best-effort under concurrent mutation.</remarks>
+    public ValueTask CompleteAsync(Exception? exception = null)
+    {
+        if (Interlocked.Exchange(ref _completing, true))
+            return new(_executionTask);
+
+        _completionException = exception;
+        _wakeSignal.Complete();
+
+        // The executor drains remaining items on exit. Await it for full completion.
+        return new(_executionTask);
+    }
+
+    /// <summary>Returns an enumerator over all items currently in the pipeline, from oldest to newest.</summary>
+    /// <remarks>
+    /// Best-effort under concurrent mutation. Both the execution queue and the waiters queue may
+    /// be mutated by the execution loop or the advancer, pausing enqueues alone is not sufficient.
+    /// For reference types, null checks filter out cleared queue slots.
+    /// For value types the enumerator may yield default(T) values from slots that were concurrently dequeued,
+    /// or torn values for types that are not atomically writable.
+    /// Use a reference type for T if you need more reliable enumeration.
+    /// </remarks>
     public Enumerator GetEnumerator() => new(this);
 
     async Task ExecuteQueue()
     {
-        var needsYield = _mode is PipelineExecutionMode.SyncFirst;
-        while (true)
+        var needsYieldAfterFirst = true;
+        while (!_wakeSignal.IsCompleted)
         {
-            if (_completionToken.IsCancellationRequested)
-                return;
-
             _wakeSignal.AcquireWakeLock();
-            if (_queue.IsEmpty)
+            _notEmpty = false;
+            if (_queue.IsEmpty && !_notEmpty)
             {
-                needsYield = _mode is PipelineExecutionMode.SyncFirst;
+                // Lock held through OnCompleted which releases it after storing the continuation.
                 if (!await _wakeSignal.WaitUnsynchronized())
-                    return;
-            }
-            else if (needsYield)
-            {
-                needsYield = false;
-                _wakeSignal.ReleaseWakeLock();
-                await LocalContinueOnAsync();
+                    break;
             }
             else
             {
                 _wakeSignal.ReleaseWakeLock();
             }
 
-            while (!_completionToken.IsCancellationRequested && _queue.TryDequeue(out var element))
+            while (!_wakeSignal.IsCompleted && _queue.TryDequeue(out var element))
             {
                 // Commit the previous iteration's pending tail to the waiter queue.
                 CommitTailWaiter();
@@ -149,26 +151,24 @@ public sealed class Pipeline<T, TPolicy>
                 var activated = false;
                 if (Volatile.Read(ref _waiterQueueCount) is 0)
                 {
-                    ActivateHeadItem(item, schedule: false);
+                    ActivateHeadItem(item, preferAsync: false);
                     activated = true;
                 }
                 else
-                    Interlocked.Exchange(ref _executingItem, item);
+                {
+                    _executingItem = item;
+                    Interlocked.Exchange(ref _hasExecutingItem, true);
+                }
 
                 PipelineItemResult itemResult;
                 try
                 {
-                    // Elide the await when the result is immediately available — avoids awaiter
-                    // overhead for ValueTasks not backed by a Task or IValueTaskSource.
-                    var executeTask = _policy.ExecuteItemAsync(item, _completionToken);
-                    itemResult = executeTask.IsCompletedSuccessfully
-                        ? executeTask.Result
-                        : await executeTask.ConfigureAwait(false);
+                    itemResult = await _policy.ExecuteItemAsync(item, _wakeSignal.CompletionToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     ClearExecutingItem(activated);
-                    await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), activated, _completionToken).ConfigureAwait(false);
+                    await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), activated, _wakeSignal.CompletionToken).ConfigureAwait(false);
                     goto afterItem;
                 }
 
@@ -189,7 +189,7 @@ public sealed class Pipeline<T, TPolicy>
                     }
                     catch (Exception ex)
                     {
-                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), activated, _completionToken).ConfigureAwait(false);
+                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), activated, _wakeSignal.CompletionToken).ConfigureAwait(false);
                         goto afterItem;
                     }
 
@@ -197,13 +197,14 @@ public sealed class Pipeline<T, TPolicy>
                 }
                 else
                 {
-                    // Pipeline task pending — store as pending tail for the next iteration.
+                    // Pipeline task pending, store as pending tail for the next iteration.
                     _tailWaiter = item;
+                    _hasTailWaiter = true;
                     _tailWaiterTask = itemResult.PipelineTask;
                 }
 
-                // Await trailing execution task if not yet complete.
-                if (!itemResult.TrailingExecutionTask.IsCompletedSuccessfully)
+                // Await trailing execution task if present.
+                if (itemResult.TrailingExecutionTask != default)
                 {
                     try
                     {
@@ -211,41 +212,87 @@ public sealed class Pipeline<T, TPolicy>
                     }
                     catch (Exception ex)
                     {
-                        if (_tailWaiter is not null)
+                        if (_hasTailWaiter)
                         {
-                            await RecoverTrailingFailure(item, activated, ex, _completionToken).ConfigureAwait(false);
+                            await RecoverTrailingFailure(item, activated, ex, _wakeSignal.CompletionToken).ConfigureAwait(false);
                         }
                     }
                 }
 
                 afterItem:
-                // Scheduling: yield off the caller's stack after the first iteration in SyncFirst mode.
-                if (needsYield)
+                if (needsYieldAfterFirst)
                 {
+                    needsYieldAfterFirst = false;
                     if (_queue.IsEmpty)
                         break;
 
-                    needsYield = false;
-                    await LocalContinueOnAsync();
+                    var yieldTask = _policy.YieldAfterFirstItem();
+                    if (yieldTask != default)
+                        await yieldTask.ConfigureAwait(false);
                 }
             }
 
             // Commit any remaining tail before going idle.
             CommitTailWaiter();
 
-            // Skip the idle callback if we're completing with an error — the callback may not be able to handle a broken state.
-            if (_completionException is null)
+            // No in-flight check before idle: the wake signal is the floor for every race
+            // between drain-completion and OnExecutionIdleAsync actually parking, so any
+            // pre-idle flag/queue probe is pure overhead that the signal would catch anyway.
+            // Callers requiring strict ordering with idle handoff must synchronize externally.
+
+            try
             {
-                // Elide the await when completed synchronously — still call GetResult to
-                // complete the IValueTaskSource contract.
-                var idleTask = _policy.OnExecutionIdleAsync(_completionToken);
-                if (!idleTask.IsCompletedSuccessfully)
+                var idleTask = _policy.OnExecutionIdleAsync(_wakeSignal.CompletionToken);
+                if (idleTask != default)
                     await idleTask.ConfigureAwait(false);
-                else
-                    idleTask.GetAwaiter().GetResult();
             }
+            catch (Exception ex)
+            {
+                _ = CompleteAsync(ex);
+                // Drain, then throw so _executionTask faults and callers observe the failure.
+                await DrainOnCompletionAsync();
+                throw;
+            }
+
+            needsYieldAfterFirst = true;
         }
 
+        await DrainOnCompletionAsync();
+    }
+
+    /// Drains remaining items after the execution loop exits. Acquires the advancer to prevent
+    /// racing with completion callbacks. Recovery is locked out via _recoveryLock if active.
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    async ValueTask DrainOnCompletionAsync()
+    {
+        if (_waiterInRecovery)
+        {
+            // Recovery holds _advancing, take the lock and drain under it so recovery's
+            // AdvanceAndDrainRecovery can't race with us on the queue.
+            // Also complete the in-flight recovery item since it's not in any queue.
+            lock (_waiterRecoveryLock)
+            {
+                CompleteWaiter(_waiterRecoveryItem, _completionException);
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                    _waiterRecoveryItem = default!;
+                DoDrain();
+            }
+        }
+        else
+        {
+            while (Interlocked.Exchange(ref _advancing, true))
+                await Task.Yield();
+            DoDrain();
+        }
+
+        void DoDrain()
+        {
+            var exception = _completionException;
+            while (_waiters.TryDequeue(out var item))
+                CompleteWaiter(item.Waiter, exception);
+            while (_queue.TryDequeue(out var item))
+                CompleteWaiter(item.Value, exception);
+        }
     }
 
     /// Handles execution-phase or pipeline-task failures, including recovery.
@@ -253,18 +300,20 @@ public sealed class Pipeline<T, TPolicy>
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask RecoverItem(T item, PipelineItemFailureContext context, bool activated, CancellationToken cancellationToken)
     {
-        var recoveryItem = _policy.TryRecoverItemFailure(context, item, cancellationToken);
-        if (recoveryItem is null)
+        if (!_policy.TryRecoverItemFailure(context, item, cancellationToken, out var recoveryItem))
         {
             CompleteWaiter(item, context.Exception);
             return;
         }
 
-        // Recovery item takes over — activate and execute with full async support.
-        ActivateHeadItem(recoveryItem, schedule: false);
+        // Recovery item takes over, activate and execute with full async support.
+        ActivateHeadItem(recoveryItem, preferAsync: false);
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _completionToken).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken).ConfigureAwait(false);
+
+            if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
+                await result.TrailingExecutionTask.ConfigureAwait(false);
 
             if (result.PipelineTask.IsCompleted)
             {
@@ -275,16 +324,14 @@ public sealed class Pipeline<T, TPolicy>
             else
             {
                 _tailWaiter = recoveryItem;
+                _hasTailWaiter = true;
                 _tailWaiterTask = result.PipelineTask;
             }
-
-            if (!result.TrailingExecutionTask.IsCompleted)
-                await result.TrailingExecutionTask.ConfigureAwait(false);
         }
         catch (Exception recoveryEx)
         {
             var pipelineTask = _tailWaiterTask;
-            _tailWaiter = null;
+            _hasTailWaiter = false;
             _tailWaiterTask = default;
             ClearExecutingItem(activated);
 
@@ -295,7 +342,7 @@ public sealed class Pipeline<T, TPolicy>
                 pipelineTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
                 {
                     try { pipelineTask.GetAwaiter().GetResult(); }
-                    catch { /* Recovery already failed — pipeline task result is discarded. */ }
+                    catch { /* Recovery already failed, pipeline task result is discarded. */ }
                 });
             }
             CompleteWaiter(recoveryItem, recoveryEx);
@@ -306,30 +353,30 @@ public sealed class Pipeline<T, TPolicy>
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask RecoverTrailingFailure(T item, bool activated, Exception ex, CancellationToken cancellationToken)
     {
-        var pipelineTask = _tailWaiterTask;
+        var pipelineValueTask = _tailWaiterTask;
+        // Convert to Task so both the policy and the pipeline can safely observe it (ValueTask may be single consume).
+        var pipelineTask = pipelineValueTask.AsTask();
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.TrailingExecutionTask, ex, pipelineTask);
-        var recoveryItem = _policy.TryRecoverItemFailure(context, item, cancellationToken);
-
-        if (recoveryItem is null)
+        if (!_policy.TryRecoverItemFailure(context, item, cancellationToken, out var recoveryItem))
         {
-            // Pipeline task may still be pending — enqueue as a waiter rather than completing prematurely.
+            // Pipeline task may still be pending, enqueue as a waiter rather than completing prematurely.
             // Items can handle their own interdependency between the two tasks if needed.
-            _tailWaiter = null;
+            _hasTailWaiter = false;
             _tailWaiterTask = default;
-            EnqueueWaiter(item, activated, pipelineTask);
+            EnqueueWaiter(item, activated, new(pipelineTask));
             return;
         }
 
-        // Swap the tail: exchange _executingItem with the recovery item.
-        // If old value is null, the waiter path already activated the original — activate recovery too.
-        var previous = Interlocked.Exchange(ref _executingItem, recoveryItem);
-        var recoveryActivated = previous is null;
+        // Swap the tail: replace _executingItem with the recovery item.
+        // If null was returned, the waiter path already claimed it, activate recovery too.
+        _executingItem = recoveryItem;
+        var recoveryActivated = !Interlocked.Exchange(ref _hasExecutingItem, true);
         if (recoveryActivated)
-            ActivateHeadItem(recoveryItem, schedule: false);
+            ActivateHeadItem(recoveryItem, preferAsync: false);
 
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _completionToken).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
             {
@@ -337,15 +384,19 @@ public sealed class Pipeline<T, TPolicy>
                 {
                     await result.TrailingExecutionTask.ConfigureAwait(false);
                 }
-                catch
+                catch (Exception trailingEx)
                 {
-                    // Trailing failure is secondary.
+                    _hasTailWaiter = false;
+                    _tailWaiterTask = default;
+                    ClearExecutingItem(recoveryActivated);
+                    CompleteWaiter(recoveryItem, trailingEx);
+                    return;
                 }
             }
 
             if (result.PipelineTask.IsCompleted)
             {
-                _tailWaiter = null;
+                _hasTailWaiter = false;
                 _tailWaiterTask = default;
                 ClearExecutingItem(recoveryActivated);
                 Exception? pipelineEx = null;
@@ -366,7 +417,7 @@ public sealed class Pipeline<T, TPolicy>
         }
         catch (Exception recoveryEx)
         {
-            _tailWaiter = null;
+            _hasTailWaiter = false;
             _tailWaiterTask = default;
             ClearExecutingItem(recoveryActivated);
             CompleteWaiter(recoveryItem, recoveryEx);
@@ -378,16 +429,18 @@ public sealed class Pipeline<T, TPolicy>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void CommitTailWaiter()
     {
-        var item = _tailWaiter;
-        if (item is null)
+        if (!_hasTailWaiter)
             return;
 
+        var item = _tailWaiter;
         var task = _tailWaiterTask;
-        _tailWaiter = null;
+        _hasTailWaiter = false;
         _tailWaiterTask = default;
 
         // Check whether the waiter path already activated this item via _executingItem.
-        var alreadyActivated = Interlocked.Exchange(ref _executingItem, null) is null;
+        var alreadyActivated = !Interlocked.Exchange(ref _hasExecutingItem, false);
+        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            _executingItem = default!;
 
         if (task.IsCompleted)
         {
@@ -419,24 +472,23 @@ public sealed class Pipeline<T, TPolicy>
             exception = ex;
         }
 
-        // Pipeline task failed — attempt recovery.
+        // Pipeline task failed, attempt recovery.
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, exception);
-        var recoveryItem = _policy.TryRecoverItemFailure(context, item, _completionToken);
-        if (recoveryItem is null)
+        if (!_policy.TryRecoverItemFailure(context, item, _wakeSignal.CompletionToken, out var recoveryItem))
         {
             CompleteWaiter(item, exception);
             return;
         }
 
-        // Recovery item takes over — activate and execute.
+        // Recovery item takes over, activate and execute.
         // This runs on the executor so we can't await, but the recovery may need async work.
         // Use the same continuation-based pattern as the advancer recovery.
-        ActivateHeadItem(recoveryItem, schedule: false);
+        ActivateHeadItem(recoveryItem, preferAsync: false);
 
         ValueTask<PipelineItemResult> executeTask;
         try
         {
-            executeTask = _policy.ExecuteItemAsync(recoveryItem, _completionToken);
+            executeTask = _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken);
         }
         catch (Exception recoveryEx)
         {
@@ -450,7 +502,7 @@ public sealed class Pipeline<T, TPolicy>
             return;
         }
 
-        // Execute is async — hook continuation.
+        // Execute is async, hook continuation.
         executeTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
         {
             PipelineItemResult result;
@@ -483,12 +535,16 @@ public sealed class Pipeline<T, TPolicy>
             }
             else
             {
-                // Trailing task is async — hook continuation.
+                // Trailing task is async, hook continuation.
                 var pipelineTask = result.PipelineTask;
                 result.TrailingExecutionTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
                 {
                     try { result.TrailingExecutionTask.GetAwaiter().GetResult(); }
-                    catch { /* Trailing failure is secondary */ }
+                    catch (Exception ex)
+                    {
+                        CompleteWaiter(recoveryItem, ex);
+                        return;
+                    }
                     RecoverCommittedTailWaiterPipelineTask(recoveryItem, pipelineTask);
                 });
                 return;
@@ -515,7 +571,7 @@ public sealed class Pipeline<T, TPolicy>
         }
         else
         {
-            // Recovery's pipeline task is pending — enqueue it.
+            // Recovery's pipeline task is pending, enqueue it.
             EnqueueWaiter(recoveryItem, activated: true, pipelineTask);
         }
     }
@@ -527,13 +583,18 @@ public sealed class Pipeline<T, TPolicy>
 
         if (depth is 0 && _drainTcs is not null)
         {
-            lock (_drainLock)
+            AcquireDrainLock();
+            try
             {
                 if (_drainTcs is not null)
                 {
                     _drainTcs.SetResult();
                     _drainTcs = null;
                 }
+            }
+            finally
+            {
+                ReleaseDrainLock();
             }
         }
     }
@@ -549,16 +610,17 @@ public sealed class Pipeline<T, TPolicy>
         {
             // If we were the first waiter, all previous waiters may have drained while we were inside Execute.
             // Atomically claim _executingItem: if non-null, the advancer didn't activate us.
-            if (wasEmpty && Interlocked.Exchange(ref _executingItem, null) is not null)
+            if (wasEmpty && Interlocked.Exchange(ref _hasExecutingItem, false))
             {
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                    _executingItem = default!;
                 ActivateHeadItem(item);
             }
             else
             {
-                // Plain write: _executingItem is only read when _waiterQueueCount reaches zero,
-                // which requires as many OnWaiterTaskReady calls (full barriers) as the current
-                // count — all of which happen after this write.
-                _executingItem = null;
+                _hasExecutingItem = false;
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                    _executingItem = default!;
             }
         }
 
@@ -574,8 +636,9 @@ public sealed class Pipeline<T, TPolicy>
     {
         Interlocked.Increment(ref _waiterCompletedCount);
 
-        // Try to become the advancer — only one thread processes completions at a time.
-        if (Interlocked.Exchange(ref _advancing, true))
+        // Try to become the advancer, only one thread processes completions at a time.
+        // Don't acquire if completed, CompleteAsync will drain remaining items.
+        if (_wakeSignal.IsCompleted || Interlocked.Exchange(ref _advancing, true))
             return;
 
         DrainReadyWaiters();
@@ -620,13 +683,18 @@ public sealed class Pipeline<T, TPolicy>
 
                 if (count is 0)
                 {
-                    // Last waiter drained — activate the pending tail or executing item, if any.
-                    if (Interlocked.Exchange(ref _executingItem, null) is { } executing)
+                    // Last waiter drained, activate the pending tail or executing item, if any.
+                    if (Interlocked.Exchange(ref _hasExecutingItem, false))
+                    {
+                        var executing = _executingItem;
+                        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                            _executingItem = default!;
                         ActivateHeadItem(executing);
+                    }
                 }
                 else
                 {
-                    // More waiters remain — activate the next one.
+                    // More waiters remain, activate the next one.
                     _waiters.TryPeek(out var nextItem);
                     ActivateHeadItem(nextItem.Waiter);
                 }
@@ -637,7 +705,8 @@ public sealed class Pipeline<T, TPolicy>
             // (release) and the Exchange below (re-acquire), both full barriers on all architectures.
             // This avoids a Volatile.Read which has higher cost on arm64 (ldapr).
             Interlocked.Exchange(ref _advancing, false);
-        } while (_waiterCompletedCount > 0
+        } while (!_wakeSignal.IsCompleted
+                 && _waiterCompletedCount > 0
                  && _waiters.TryPeek(out var pending) && pending.WaiterTask.IsCompleted
                  && !Interlocked.Exchange(ref _advancing, true));
     }
@@ -655,7 +724,7 @@ public sealed class Pipeline<T, TPolicy>
         try
         {
             waiterTask.GetAwaiter().GetResult();
-            ex = null!; // Unreachable — task was faulted.
+            ex = null!; // Unreachable, task was faulted.
         }
         catch (Exception e)
         {
@@ -663,21 +732,19 @@ public sealed class Pipeline<T, TPolicy>
         }
 
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTaskWaiter, ex);
-        var recoveryItem = _policy.TryRecoverItemFailure(context, failedItem, _completionToken);
-
-        if (recoveryItem is null)
+        if (!_policy.TryRecoverItemFailure(context, failedItem, _wakeSignal.CompletionToken, out var recoveryItem))
         {
             CompleteWaiter(failedItem, ex);
             return true;
         }
 
-        // Recovery item takes over — activate it at the current pipeline position.
+        // Recovery item takes over, activate it at the current pipeline position.
         ActivateHeadItem(recoveryItem);
 
         ValueTask<PipelineItemResult> executeTask;
         try
         {
-            executeTask = _policy.ExecuteItemAsync(recoveryItem, _completionToken);
+            executeTask = _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken);
         }
         catch (Exception recoveryEx)
         {
@@ -690,9 +757,18 @@ public sealed class Pipeline<T, TPolicy>
             return RecoverWaiterResult(recoveryItem, executeTask.Result);
         }
 
-        // Execute is async — hook continuation. Advancer stops; continuation owns the flag.
+        // Execute is async, hook continuation. Advancer stops, continuation owns the flag.
+        _waiterInRecovery = true;
+        _waiterRecoveryItem = recoveryItem;
         executeTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
         {
+            // If completed, DrainOnCompletion already completed the recovery item.
+            if (_wakeSignal.IsCompleted)
+            {
+                _waiterInRecovery = false;
+                return;
+            }
+
             PipelineItemResult result;
             try
             {
@@ -701,14 +777,14 @@ public sealed class Pipeline<T, TPolicy>
             catch (Exception recoveryEx)
             {
                 CompleteWaiter(recoveryItem, recoveryEx);
-                AdvanceAndDrain();
+                AdvanceAndDrainRecovery();
                 return;
             }
 
             if (!RecoverWaiterResult(recoveryItem, result))
                 return; // pipeline task pending, continuation will resume
 
-            AdvanceAndDrain();
+            AdvanceAndDrainRecovery();
         });
         return false;
     }
@@ -717,7 +793,7 @@ public sealed class Pipeline<T, TPolicy>
     /// false if the recovery's pipeline task is pending (occupying this position).
     bool RecoverWaiterResult(T recoveryItem, PipelineItemResult result)
     {
-        // Await trailing execution — must observe the result.
+        // Await trailing execution, must observe the result.
         if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
         {
             if (result.TrailingExecutionTask.IsCompleted)
@@ -731,17 +807,36 @@ public sealed class Pipeline<T, TPolicy>
             }
             else
             {
-                // Trailing task is async — hook continuation.
+                // Trailing task is async, hook continuation.
                 var pipelineTask = result.PipelineTask;
                 result.TrailingExecutionTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
                 {
                     try { result.TrailingExecutionTask.GetAwaiter().GetResult(); }
-                    catch { /* Trailing failure is secondary */ }
+                    catch (Exception ex)
+                    {
+                        if (_wakeSignal.IsCompleted)
+                        {
+                            _waiterInRecovery = false;
+                        }
+                        else
+                        {
+                            CompleteWaiter(recoveryItem, ex);
+                            AdvanceAndDrainRecovery();
+                        }
+                        return;
+                    }
+
+                    // If completed, DrainOnCompletion already completed the recovery item.
+                    if (_wakeSignal.IsCompleted)
+                    {
+                        _waiterInRecovery = false;
+                        return;
+                    }
 
                     if (!RecoverWaiterPipelineTask(recoveryItem, pipelineTask))
-                        return; // pipeline task pending
+                        return; // pipeline task pending, lock still held
 
-                    AdvanceAndDrain();
+                    AdvanceAndDrainRecovery();
                 });
                 return false;
             }
@@ -768,7 +863,7 @@ public sealed class Pipeline<T, TPolicy>
             return true;
         }
 
-        // Pipeline task pending — hook continuation. Advancer stays held.
+        // Pipeline task pending, hook continuation. Advancer stays held.
         pipelineTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
         {
             Exception? pipelineException = null;
@@ -780,10 +875,44 @@ public sealed class Pipeline<T, TPolicy>
             {
                 pipelineException = ex;
             }
-            CompleteWaiter(recoveryItem, pipelineException);
-            AdvanceAndDrain();
+            if (_wakeSignal.IsCompleted)
+            {
+                // DrainOnCompletion already completed the recovery item.
+                _waiterInRecovery = false;
+            }
+            else
+            {
+                CompleteWaiter(recoveryItem, pipelineException);
+                AdvanceAndDrainRecovery();
+            }
         });
         return false;
+    }
+
+    /// Called from recovery continuations. Tries to take the recovery lock, if it can't
+    /// CompleteAsync is already draining and recovery just bails.
+    void AdvanceAndDrainRecovery()
+    {
+        var entered = false;
+        try
+        {
+            entered = _waiterRecoveryLock.TryEnter();
+            if (!entered)
+            {
+                // Plain read is ordered after TryEnter's barrier.
+                if (!_wakeSignal.IsCompleted)
+                    throw new InvalidOperationException("Concurrent waiter recoveries.");
+                _waiterInRecovery = false;
+                return;
+            }
+            _waiterInRecovery = false;
+            AdvanceAndDrain();
+        }
+        finally
+        {
+            if (entered)
+                _waiterRecoveryLock.Exit();
+        }
     }
 
     /// Decrements waiter count, activates the next item, and resumes draining.
@@ -795,8 +924,8 @@ public sealed class Pipeline<T, TPolicy>
 
         if (count is 0)
         {
-            if (Interlocked.Exchange(ref _executingItem, null) is { } executing)
-                ActivateHeadItem(executing);
+            if (Interlocked.Exchange(ref _hasExecutingItem, false))
+                ActivateHeadItem(_executingItem);
         }
         else
         {
@@ -804,69 +933,107 @@ public sealed class Pipeline<T, TPolicy>
             ActivateHeadItem(nextItem.Waiter);
         }
 
-        // Continue draining ready items — we already hold the advancer flag.
+        // Continue draining ready items, we already hold the advancer flag.
         DrainReadyWaiters();
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    void ActivateHeadItem(T item, bool schedule = true) => _policy.ActivateHeadItem(item, schedule);
+    void ActivateHeadItem(T item, bool preferAsync = true) => _policy.ActivateHeadItem(item, preferAsync);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void ClearExecutingItem(bool wasActivated)
     {
         if (!wasActivated)
-            Interlocked.Exchange(ref _executingItem, null);
+        {
+            Interlocked.Exchange(ref _hasExecutingItem, false);
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                _executingItem = default!;
+        }
     }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void AcquireDrainLock()
+    {
+        if (Interlocked.Exchange(ref _drainLock, 1) != 0)
+            AcquireDrainLockSlow();
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    void AcquireDrainLockSlow()
+    {
+        var spinner = new SpinWait();
+        while (Interlocked.Exchange(ref _drainLock, 1) != 0)
+            spinner.SpinOnce();
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void ReleaseDrainLock() => Volatile.Write(ref _drainLock, 0);
 
     [DoesNotReturn]
     [MethodImpl(MethodImplOptions.NoInlining)]
     static void ThrowCompleted() => throw new InvalidOperationException("The pipeline has been completed.");
 
-    ContinueOnAwaitable LocalContinueOnAsync() => ExecutionScheduler.ContinueOnAsync(forceYielding: true, preferLocal: true);
 
     public struct Enumerator
     {
+        readonly Pipeline<T, TPolicy> _pipeline;
         SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)>.Enumerator _waitersEnumerator;
         SingleProducerSingleConsumerQueue<Element>.Enumerator _queueEnumerator;
-        bool _enumeratingQueue;
+        // 0: init waiters, 1: enumerate waiters, 2: tail waiter, 3: init queue, 4: enumerate queue, 5: done
+        int _phase;
 
         internal Enumerator(Pipeline<T, TPolicy> pipeline)
         {
-            _waitersEnumerator = new(pipeline._waiters);
-            _queueEnumerator = new(pipeline._queue);
+            _pipeline = pipeline;
         }
 
         public T Current { get; private set; } = default!;
 
         public bool MoveNext()
         {
-            if (!_enumeratingQueue)
+            switch (_phase)
             {
-                while (_waitersEnumerator.MoveNext())
-                {
-                    // Attempt to filter out nonsensical observations due to concurrent mutations of segments.
-                    // This can cause us to observe default element values during dequeue slot clearing.
-                    if (_waitersEnumerator.Current.Waiter is { } item)
+                case 0:
+                    _waitersEnumerator = new(_pipeline._waiters);
+                    _phase = 1;
+                    goto case 1;
+                case 1:
+                    while (_waitersEnumerator.MoveNext())
                     {
-                        Current = item;
+                        if (_waitersEnumerator.Current.Waiter is { } waiter)
+                        {
+                            Current = waiter;
+                            return true;
+                        }
+                    }
+                    _phase = 2;
+                    goto case 2;
+                case 2:
+                    _phase = 3;
+                    if (_pipeline._hasTailWaiter)
+                    {
+                        Current = _pipeline._tailWaiter;
                         return true;
                     }
-                }
-                _enumeratingQueue = true;
+                    goto case 3;
+                case 3:
+                    _queueEnumerator = new(_pipeline._queue);
+                    _phase = 4;
+                    goto case 4;
+                case 4:
+                    while (_queueEnumerator.MoveNext())
+                    {
+                        if (_queueEnumerator.Current.Value is { } queued)
+                        {
+                            Current = queued;
+                            return true;
+                        }
+                    }
+                    _phase = 5;
+                    return false;
+                default:
+                    return false;
             }
-
-            while (_queueEnumerator.MoveNext())
-            {
-                // Attempt to filter out nonsensical observations due to concurrent mutations of segments.
-                // This can cause us to observe default element values during dequeue slot clearing.
-                if (_queueEnumerator.Current.Value is { } item)
-                {
-                    Current = item;
-                    return true;
-                }
-            }
-
-            return false;
         }
     }
 
@@ -880,7 +1047,6 @@ public sealed class Pipeline<T, TPolicy>
 public static class Pipeline
 {
     public static Pipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy)
-        where T : class
         where TPolicy : IPipelinePolicy<T>
         => new(policy);
 
@@ -888,7 +1054,7 @@ public static class Pipeline
     /// Represents a deferred enqueue completion returned by <see cref="Pipeline{T,TPolicy}.Enqueue"/>.
     /// The item is already in the queue; calling <see cref="Execute"/> may signal the execution loop to process it.
     /// This two-step design exists because the signal may synchronously run the execution loop on the caller's
-    /// thread (in <see cref="PipelineExecutionMode.Sync"/> or <see cref="PipelineExecutionMode.SyncFirst"/> mode),
+    /// thread (when <see cref="IPipelinePolicy{T}.RunEnqueueAsynchronously"/> is false),
     /// so it must be invoked outside any held lock.
     /// </summary>
     public readonly struct EnqueueResult
@@ -896,7 +1062,7 @@ public static class Pipeline
         readonly WakeSignal? _signal;
         internal EnqueueResult(WakeSignal? signal) => _signal = signal;
 
-        /// <summary>Finalizes the enqueue, which may signal and run the execution loop on the calling thread.</summary>
+        /// <summary>Signals the execution loop, which may run the executor inline on the calling thread.</summary>
         public void Execute() => _signal?.Signal();
     }
 
@@ -907,14 +1073,23 @@ public static class Pipeline
     /// A spinlock is used instead of Lock because the critical section is a few field reads/writes
     /// with at most two threads contending (execution loop and Signal caller).
     /// No code under the lock re-enters or is user code that may, so reentrancy support is not needed either.
-    internal sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineScheduler executionScheduler) : ICriticalNotifyCompletion, IThreadPoolWorkItem
+    internal sealed class WakeSignal : IThreadPoolWorkItem
     {
-        readonly bool _runContinuationsAsynchronously = runContinuationsAsynchronously;
-        public PipelineScheduler Scheduler { get; } = executionScheduler;
+        readonly bool _runContinuationsAsynchronously;
+        readonly CancellationTokenSource _cts = new();
         Action? _continuation;
         bool _pending;
-        bool _completed;
         int _wakeLock;
+
+        public WakeSignal(bool runContinuationsAsynchronously, PipelineScheduler executionScheduler)
+        {
+            _runContinuationsAsynchronously = runContinuationsAsynchronously;
+            Scheduler = executionScheduler;
+        }
+
+        public PipelineScheduler Scheduler { get; }
+        public CancellationToken CompletionToken => _cts.Token;
+        public bool IsCompleted => _cts.IsCancellationRequested;
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void AcquireWakeLock()
@@ -934,28 +1109,13 @@ public static class Pipeline
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void ReleaseWakeLock() => Volatile.Write(ref _wakeLock, 0);
 
-        /// Returns this signal as an awaitable. Must be called under the queue lock —
-        /// the lock is released by OnCompleted.
-        public WakeSignal WaitUnsynchronized()
+        /// Prepares the signal for a new wait. Must be called under the wake lock.
+        /// Returns an awaiter that holds the lock through OnCompleted.
+        public Awaiter WaitUnsynchronized()
         {
             Debug.Assert(!_pending, "Concurrent wait calls.");
             _pending = true;
-            return this;
-        }
-
-        public WakeSignal GetAwaiter() => this;
-
-        public bool IsCompleted => !_pending;
-
-        public bool GetResult() => !_completed;
-
-        public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
-
-        public void UnsafeOnCompleted(Action continuation)
-        {
-            if (!ReferenceEquals(_continuation, continuation))
-                _continuation = continuation;
-            ReleaseWakeLock();
+            return new(this);
         }
 
         public void Signal() => SignalCore(_runContinuationsAsynchronously);
@@ -967,7 +1127,6 @@ public static class Pipeline
             {
                 if (!_pending)
                     return;
-
                 _pending = false;
             }
             finally
@@ -980,21 +1139,39 @@ public static class Pipeline
                 Scheduler.SubmitDetached(this, preferLocal: true);
             }
             else
-            {
                 _continuation!();
-            }
         }
 
-        void IThreadPoolWorkItem.Execute()
-        {
-            _continuation!();
-        }
+        void IThreadPoolWorkItem.Execute() => _continuation!();
 
-        /// Marks the signal as completed, cancels any pending wait.
+        /// Marks the source as completed, wakes any pending wait.
         public void Complete()
         {
-            _completed = true;
+            _cts.Cancel();
             SignalCore(runContinuationsAsynchronously: true);
+        }
+
+        internal readonly struct Awaiter(WakeSignal signal) : ICriticalNotifyCompletion
+        {
+            public Awaiter GetAwaiter() => this;
+
+            // Always false so OnCompleted always runs and releases the lock.
+            public bool IsCompleted => false;
+
+            public bool GetResult() => !signal.IsCompleted;
+
+            public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
+
+            public void UnsafeOnCompleted(Action continuation)
+            {
+                if (!ReferenceEquals(signal._continuation, continuation))
+                    signal._continuation = continuation;
+                signal.ReleaseWakeLock();
+
+                // If completed while we were setting up the wait, wake ourselves.
+                if (signal.IsCompleted)
+                    signal.SignalCore(runContinuationsAsynchronously: true);
+            }
         }
     }
 }

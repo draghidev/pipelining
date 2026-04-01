@@ -6,7 +6,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task ConcurrentEnqueuers()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         var enqueueLock = new Lock();
         const int itemsPerThread = 100;
         const int threadCount = 4;
@@ -45,7 +45,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task EnqueueDuringExecution()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
 
         // First item has an async execute — while it's pending, enqueue more items.
         var first = new TestPipelineItem { ExecuteAsync = true };
@@ -76,7 +76,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task CompleteAsyncDuringProcessing()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
 
         // Enqueue items with pending pipeline tasks.
         var items = new TestPipelineItem[5];
@@ -103,7 +103,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task PipelinedCompletionOrder()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         var completionOrder = new List<int>();
         var orderLock = new object();
 
@@ -141,7 +141,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task WaitForIdleWithConcurrentEnqueue()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
 
         // Enqueue an item.
         var first = new TestPipelineItem { CompleteAsync = true };
@@ -172,7 +172,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task HighThroughputSequential()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         const int count = 1_000;
 
         for (var i = 0; i < count; i++)
@@ -189,7 +189,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task HighThroughputPipelined()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(PipelineExecutionMode.Async));
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         const int count = 1_000;
 
         var items = new TestPipelineItem[count];
