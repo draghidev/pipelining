@@ -29,49 +29,49 @@ namespace Draghi.Pipelining.Benchmarks;
 /// - The executor loop is a serialization point. Under extreme multi-core write throughput it
 ///   can become a bottleneck. Channel's direct writer-to-reader handoff avoids this.
 /// - No backpressure — the SPSC queue is unbounded.
-sealed class PipelineChannel<T> where T : class
+sealed class PipelineChannel<T>
 {
-    readonly Pipeline<Envelope, Policy> _pipeline;
-    // Single-consumer: one slot for the ready item.
-    Envelope? _readyItem;
+    readonly Pipeline<T, Policy> _pipeline;
+    // Single-consumer: one slot for the ready item. _hasReady is the readiness indicator
+    // so the slot can hold any T (including default for value types).
+    T _readyItem = default!;
+    bool _hasReady;
     // Reader signal — wakes a suspended ReadAsync.
     ManualResetValueTaskSourceCore<bool> _readerSignal;
     bool _readerWaiting;
 
     public PipelineChannel(bool runEnqueueAsynchronously = false)
     {
-        _pipeline = Pipeline.Create<Envelope, Policy>(new Policy(this, runEnqueueAsynchronously));
+        _pipeline = Pipeline.Create<T, Policy>(new Policy(this, runEnqueueAsynchronously));
     }
 
-    public void Write(Envelope envelope)
+    public void Write(T item)
     {
-        _pipeline.Enqueue(envelope).Execute();
+        _pipeline.Enqueue(item).Execute();
     }
 
     /// Delivers a completed item to a waiting reader or stores it.
     /// Called by the policy's CompleteItem — runs on the execution loop (single-threaded).
-    void OnItemCompleted(Envelope item)
+    void OnItemCompleted(T item)
     {
+        _readyItem = item;
+        _hasReady = true;
         if (_readerWaiting)
         {
             _readerWaiting = false;
-            _readyItem = item;
             _readerSignal.SetResult(true);
-        }
-        else
-        {
-            _readyItem = item;
         }
     }
 
     /// Returns the next completed item, or suspends until one is available.
-    public ValueTask<Envelope> ReadAsync()
+    public ValueTask<T> ReadAsync()
     {
-        var item = _readyItem;
-        if (item is not null)
+        if (_hasReady)
         {
-            _readyItem = null;
-            return new ValueTask<Envelope>(item);
+            var item = _readyItem;
+            _readyItem = default!;
+            _hasReady = false;
+            return new ValueTask<T>(item);
         }
 
         // No item ready, suspend until OnItemCompleted signals.
@@ -79,12 +79,13 @@ sealed class PipelineChannel<T> where T : class
         _readerWaiting = true;
 
         // Double-check after setting the flag.
-        item = _readyItem;
-        if (item is not null)
+        if (_hasReady)
         {
-            _readyItem = null;
+            var item = _readyItem;
+            _readyItem = default!;
+            _hasReady = false;
             _readerWaiting = false;
-            return new ValueTask<Envelope>(item);
+            return new ValueTask<T>(item);
         }
 
         return new(new ReaderAwaitable(this), _readerSignal.Version);
@@ -92,14 +93,15 @@ sealed class PipelineChannel<T> where T : class
 
     public ValueTask CompleteAsync() => _pipeline.CompleteAsync();
 
-    sealed class ReaderAwaitable(PipelineChannel<T> channel) : IValueTaskSource<Envelope>
+    sealed class ReaderAwaitable(PipelineChannel<T> channel) : IValueTaskSource<T>
     {
-        public Envelope GetResult(short token)
+        public T GetResult(short token)
         {
             channel._readerSignal.GetResult(token);
             var item = channel._readyItem;
-            channel._readyItem = null;
-            return item!;
+            channel._readyItem = default!;
+            channel._hasReady = false;
+            return item;
         }
 
         public ValueTaskSourceStatus GetStatus(short token) => channel._readerSignal.GetStatus(token);
@@ -108,24 +110,27 @@ sealed class PipelineChannel<T> where T : class
             => channel._readerSignal.OnCompleted(continuation, state, token, flags);
     }
 
-    internal sealed class Envelope
+    struct Policy(PipelineChannel<T> channel, bool runEnqueueAsynchronously) : IPipelinePolicy<T>
     {
-        public T? Value;
-
-        public void Reset() => Value = default;
-    }
-
-    struct Policy(PipelineChannel<T> channel, bool runEnqueueAsynchronously) : IPipelinePolicy<Envelope>
-    {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(Envelope item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(T item, CancellationToken cancellationToken)
             => new(new PipelineItemResult(ValueTask.CompletedTask));
 
-        public void ActivateHeadItem(Envelope item, bool preferAsync = true) { }
+        public void ActivateHeadItem(T item, bool preferAsync = true) { }
 
-        public void CompleteItem(Envelope item, int remainingDepth, Exception? exception)
+        public void CompleteItem(T item, int remainingDepth, Exception? exception)
             => channel.OnItemCompleted(item);
 
         public bool RunEnqueueAsynchronously => runEnqueueAsynchronously;
+
+        // Override IPipelinePolicy DIM methods explicitly. DIM dispatch through an interface
+        // call on a struct boxes the struct on every call. Explicit overrides avoid the box.
+        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
+        public ValueTask YieldAfterFirstItem() => default;
+        public bool TryRecoverItemFailure(PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out T? recoveryItem)
+        {
+            recoveryItem = default;
+            return false;
+        }
     }
 }
 
@@ -134,7 +139,7 @@ sealed class PipelineChannel<T> where T : class
 public class PipelineChannelBenchmarks
 {
     PipelineChannel<object> _channel = null!;
-    PipelineChannel<object>.Envelope _envelope = null!;
+    object _item = null!;
 
     [Params(false)]
     public bool RunAsync { get; set; }
@@ -143,7 +148,7 @@ public class PipelineChannelBenchmarks
     public void Setup()
     {
         _channel = new PipelineChannel<object>(RunAsync);
-        _envelope = new PipelineChannel<object>.Envelope();
+        _item = new object();
     }
 
     [GlobalCleanup]
@@ -156,9 +161,8 @@ public class PipelineChannelBenchmarks
     [Benchmark]
     public void WriteReadSync()
     {
-        var envelope = _envelope;
-        _channel.Write(envelope);
-        // Item completes synchronously in SyncFirst — it's already in the ready slot.
+        _channel.Write(_item);
+        // Item completes synchronously, it's already in the ready slot.
         var read = _channel.ReadAsync();
         if (!read.IsCompletedSuccessfully)
             throw new Exception("Expected synchronous completion");

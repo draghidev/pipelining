@@ -30,7 +30,6 @@ sealed class TestPipelineItem
 
     public void SignalExecuted() => _executed.Set();
     public void WaitForExecuted() => Assert.IsTrue(_executed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item execution.");
-    public bool WaitForExecutedWithTimeout(int ms) => _executed.Wait(ms);
     public Task WaitForExecutedAsync()
     {
         if (_executed.IsSet)
@@ -48,7 +47,6 @@ sealed class TestPipelineItem
     }
 
     public void WaitForComplete() => Assert.IsTrue(_completed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item completion.");
-    public bool WaitForCompleteWithTimeout(int ms) => _completed.Wait(ms);
 
     public Task WaitForCompleteAsync()
     {
@@ -148,4 +146,6 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
     }
 
     public bool RunEnqueueAsynchronously => _runEnqueueAsynchronously;
+
+    public ValueTask YieldAfterFirstItem() => default;
 }

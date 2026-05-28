@@ -67,10 +67,10 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     /// <summary>The maximum size to use for segments (in number of elements).</summary>
     const int MaxSegmentSize = 0x1000000; // this could be made as large as int.MaxValue / 2
 
-    /// <summary>The head of the linked list of segments.</summary>
-    volatile Segment _head;
-    /// <summary>The tail of the linked list of segments.</summary>
-    volatile Segment _tail;
+    /// <summary>The head of the linked list of segments. Consumer-owned writes, observers use Volatile.Read.</summary>
+    Segment _head;
+    /// <summary>The tail of the linked list of segments. Producer-owned writes, observers use Volatile.Read.</summary>
+    Segment _tail;
 
     /// <summary>Initializes the queue.</summary>
     public SingleProducerSingleConsumerQueue()
@@ -89,16 +89,18 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     /// <param name="item">The item to enqueue.</param>
     public void Enqueue(T item)
     {
-        Segment segment = _tail;
+        Segment segment = _tail; // producer-owned, plain read
         T[] array = segment._array;
-        int last = segment._state._last; // local copy to avoid multiple volatile reads
+        int last = segment._state._last; // producer-owned, plain read
 
         // Fast path: there's obviously room in the current segment
         int tail2 = (last + 1) & (array.Length - 1);
         if (tail2 != segment._state._firstCopy)
         {
             array[last] = item;
-            segment._state._last = tail2;
+            // Release: publish data slot write before the _last update so consumer's acquire-load
+            // on _last (slow-path refresh of _lastCopy) sees the data.
+            Volatile.Write(ref segment._state._last, tail2);
             return;
         }
 
@@ -113,9 +115,13 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     {
         Debug.Assert(segment != null, "Expected a non-null segment.");
 
-        if (segment._state._firstCopy != segment._state._first)
+        // Acquire-load on _first to see consumer's latest dequeue progress.
+        // Single read (vs BCL's two volatile reads): the window between two reads is sub-nanosecond, so
+        // the freshness benefit on assignment is dominated by the cost of a second ldar on ARM64.
+        int currentFirst = Volatile.Read(ref segment._state._first);
+        if (segment._state._firstCopy != currentFirst)
         {
-            segment._state._firstCopy = segment._state._first;
+            segment._state._firstCopy = currentFirst;
             Enqueue(item); // will only recur once for this enqueue operation
             return;
         }
@@ -143,15 +149,20 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     /// <returns>true if an item could be dequeued. Otherwise, false.</returns>
     public bool TryDequeue([MaybeNullWhen(false)] out T result)
     {
-        Segment segment = _head;
+        Segment segment = _head; // consumer-owned, plain read
         T[] array = segment._array;
-        int first = segment._state._first; // local copy to avoid multiple volatile reads
+        int first = segment._state._first; // consumer-owned: only this thread writes _first, so a plain read is correct. Data visibility rides the _last acquire/release pair, not _first.
 
         // Fast path: there's obviously data available in the current segment
         if (first != segment._state._lastCopy)
         {
             result = array[first];
             array[first] = default!; // Clear the slot to release the element
+            // Plain store on _first. The producer only reads _first to gauge free room, where a stale
+            // value is conservative and safe, so the hot, cross-core-bouncing index needs no release
+            // here - dropping the stlr off the contended line is a large ARM64/M-series win (a release
+            // store on the line that ping-pongs every dequeue was the dominant per-op cost). External
+            // observers (IsEmpty/Count/Enumerator) stay best-effort, exactly as already documented.
             segment._state._first = (first + 1) & (array.Length - 1);
             return true;
         }
@@ -165,9 +176,9 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     /// <returns>true if an item could be peeked. Otherwise, false.</returns>
     public bool TryPeek([MaybeNullWhen(false)] out T result)
     {
-        Segment segment = _head;
+        Segment segment = _head; // consumer-owned, plain read
         T[] array = segment._array;
-        int first = segment._state._first; // local copy to avoid multiple volatile reads
+        int first = segment._state._first; // consumer-owned plain read (see TryDequeue)
 
         // Fast path: there's obviously data available in the current segment
         if (first != segment._state._lastCopy)
@@ -192,24 +203,36 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         Debug.Assert(segment != null, "Expected a non-null segment.");
         Debug.Assert(array != null, "Expected a non-null item array.");
 
-        if (segment._state._last != segment._state._lastCopy)
+        // Acquire-load on _last to see producer's published data writes.
+        // Single read (vs BCL's two volatile reads): see EnqueueSlow for the cost reasoning.
+        int currentLast = Volatile.Read(ref segment._state._last);
+        if (currentLast != segment._state._lastCopy)
         {
-            segment._state._lastCopy = segment._state._last;
+            segment._state._lastCopy = currentLast;
             return peek ?
                 TryPeek(out result) :
                 TryDequeue(out result); // will only recur once for this operation
         }
 
-        if (segment._next != null && segment._state._first == segment._state._last)
+        // The hop guard must not decide on the pass-captured currentLast: it can be arbitrarily
+        // stale by the time _next is observed non-null (one preemption suffices), and hopping on
+        // stale-equal advances _head irreversibly past every entry the producer added in between,
+        // stranding them forever. The acquire sits on _next, pairing with EnqueueSlow's publish,
+        // whose release ordered the segment's final _last store before it. The _last read below
+        // is therefore the final value, not merely fresh at its own instant. Once _next is
+        // published the producer never writes this segment again, so first == final-last means
+        // permanently empty and the hop is safe.
+        if (Volatile.Read(ref segment._next) is { } nextSegment && segment._state._first == Volatile.Read(ref segment._state._last)) // consumer-owned plain read of _first
         {
-            segment = segment._next;
+            segment = nextSegment;
             array = segment._array;
-            _head = segment;
+            _head = segment; // consumer-owned write
         }
 
-        int first = segment._state._first; // local copy to avoid extraneous volatile reads
+        int first = segment._state._first; // consumer-owned plain read (see TryDequeue)
+        int last = Volatile.Read(ref segment._state._last); // acquire on potentially-new segment
 
-        if (first == segment._state._last)
+        if (first == last)
         {
             result = default;
             return false;
@@ -219,8 +242,10 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         if (!peek)
         {
             array[first] = default!; // Clear the slot to release the element
+            // Plain store on _first (see TryDequeue fast path).
             segment._state._first = (first + 1) & (segment._array.Length - 1);
-            segment._state._lastCopy = segment._state._last; // Refresh _lastCopy to ensure that _first has not passed _lastCopy
+            // Freshness-only refresh of _lastCopy to widen the fast-path window.
+            segment._state._lastCopy = Volatile.Read(ref segment._state._last);
         }
 
         return true;
@@ -232,9 +257,9 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     /// <returns>true if an item could be dequeued. Otherwise, false.</returns>
     public bool TryDequeueIf(Predicate<T>? predicate, [MaybeNullWhen(false)] out T result)
     {
-        Segment segment = _head;
+        Segment segment = _head; // consumer-owned, plain read
         T[] array = segment._array;
-        int first = segment._state._first; // local copy to avoid multiple volatile reads
+        int first = segment._state._first; // consumer-owned plain read (see TryDequeue)
 
         // Fast path: there's obviously data available in the current segment
         if (first != segment._state._lastCopy)
@@ -243,6 +268,7 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
             if (predicate == null || predicate(result))
             {
                 array[first] = default!; // Clear the slot to release the element
+                // Plain store on _first (see TryDequeue fast path).
                 segment._state._first = (first + 1) & (array.Length - 1);
                 return true;
             }
@@ -256,7 +282,7 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     }
 
     /// <summary>Attempts to dequeue an item from the queue.</summary>
-    /// <param name="predicate">The predicate that must return true for the item to be dequeued.  If null, all items implicitly return true.</param>
+    /// <param name="predicate">The predicate that must return true for the item to be dequeued.</param>
     /// <param name="array">The array from which the item was dequeued.</param>
     /// <param name="segment">The segment from which the item was dequeued.</param>
     /// <param name="result">The dequeued item.</param>
@@ -266,22 +292,29 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         Debug.Assert(segment != null, "Expected a non-null segment.");
         Debug.Assert(array != null, "Expected a non-null item array.");
 
-        if (segment._state._last != segment._state._lastCopy)
+        // Acquire-load on _last to see producer's published data writes.
+        // Single read (vs BCL's two volatile reads): see EnqueueSlow for the cost reasoning.
+        int currentLast = Volatile.Read(ref segment._state._last);
+        if (currentLast != segment._state._lastCopy)
         {
-            segment._state._lastCopy = segment._state._last;
+            segment._state._lastCopy = currentLast;
             return TryDequeueIf(predicate, out result); // will only recur once for this dequeue operation
         }
 
-        if (segment._next != null && segment._state._first == segment._state._last)
+        // Acquire on _next plus fresh _last, the same guard as TryDequeueSlow: hopping on the
+        // stale currentLast maroons entries added since it was captured, and the _next acquire
+        // guarantees the _last read is the segment's final value.
+        if (Volatile.Read(ref segment._next) is { } nextSegment && segment._state._first == Volatile.Read(ref segment._state._last)) // consumer-owned plain read of _first
         {
-            segment = segment._next;
+            segment = nextSegment;
             array = segment._array;
-            _head = segment;
+            _head = segment; // consumer-owned write
         }
 
-        int first = segment._state._first; // local copy to avoid extraneous volatile reads
+        int first = segment._state._first; // consumer-owned plain read (see TryDequeue)
+        int last = Volatile.Read(ref segment._state._last); // acquire on potentially-new segment
 
-        if (first == segment._state._last)
+        if (first == last)
         {
             result = default;
             return false;
@@ -291,8 +324,10 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         if (predicate == null || predicate(result))
         {
             array[first] = default!; // Clear the slot to release the element
+            // Plain store on _first (see TryDequeue fast path).
             segment._state._first = (first + 1) & (segment._array.Length - 1);
-            segment._state._lastCopy = segment._state._last; // Refresh _lastCopy to ensure that _first has not passed _lastCopy
+            // Freshness-only refresh of _lastCopy.
+            segment._state._lastCopy = Volatile.Read(ref segment._state._last);
             return true;
         }
 
@@ -313,18 +348,23 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         {
             // This implementation is optimized for calls from the consumer.
 
+            // Plain read of _head: reference reads are ordered via data-dependency through the load.
             Segment head = _head;
-            var first = head._state._first;
+            // Acquire-load on _first, subsequent plain read of _lastCopy cannot be reordered past it.
+            // Pairs with consumer's Volatile.Write release on _first.
+            var first = Volatile.Read(ref head._state._first);
             if (first != head._state._lastCopy)
-            {
-                return false; // _first is volatile, so the read of _lastCopy cannot get reordered
-            }
-
-            if (first != head._state._last)
             {
                 return false;
             }
 
+            // Acquire-load on _last to pair with producer's Volatile.Write release.
+            if (first != Volatile.Read(ref head._state._last))
+            {
+                return false;
+            }
+
+            // Plain read of _next: data-dependent on `head`, reference assignment by producer is release per the .NET memory model.
             return head._next == null;
         }
     }
@@ -364,15 +404,18 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         get
         {
             int count = 0;
+            // Reference reads of _head and _next are plain, data-dependency ordering covers them.
+            // Value-type reads of _first/_last use Volatile.Read to pair with producer/consumer releases.
             for (Segment? segment = _head; segment != null; segment = segment._next)
             {
                 int arraySize = segment._array.Length;
                 int first, last;
                 while (true) // Count is not meant to be used concurrently, but this helps to avoid issues if it is
                 {
-                    first = segment._state._first;
-                    last = segment._state._last;
-                    if (first == segment._state._first)
+                    first = Volatile.Read(ref segment._state._first);
+                    last = Volatile.Read(ref segment._state._last);
+                    // Re-check _first to detect concurrent consumer advancement during the read, if it moved we retry.
+                    if (first == Volatile.Read(ref segment._state._first))
                     {
                         break;
                     }
@@ -393,11 +436,13 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
 
         internal Enumerator(SingleProducerSingleConsumerQueue<T> queue)
         {
+            // Plain read of _head, reference assignment by producer is release per the .NET memory model,
+            // and subsequent value-type reads use Volatile.Read to pair with the producer/consumer releases on _first/_last.
             _segment = queue._head;
             if (_segment is not null)
             {
-                _position = _segment._state._first;
-                _last = _segment._state._last;
+                _position = Volatile.Read(ref _segment._state._first);
+                _last = Volatile.Read(ref _segment._state._last);
             }
         }
 
@@ -414,11 +459,12 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
                     return true;
                 }
 
+                // Plain read of _next, data-dependency through the loaded reference orders subsequent value-type reads.
                 _segment = _segment._next;
                 if (_segment is not null)
                 {
-                    _position = _segment._state._first;
-                    _last = _segment._state._last;
+                    _position = Volatile.Read(ref _segment._state._first);
+                    _last = Volatile.Read(ref _segment._state._last);
                 }
             }
             return false;
@@ -456,18 +502,21 @@ sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         /// <summary>Padding to reduce false sharing between the segment's array and _first.</summary>
         internal PaddingFor32 _pad0;
 
-        /// <summary>The index of the current head in the segment.</summary>
-        internal volatile int _first;
-        /// <summary>A copy of the current tail index.</summary>
-        internal int _lastCopy; // not volatile as read and written by the producer, except for IsEmpty, and there _lastCopy is only read after reading the volatile _first
+        /// <summary>The index of the current head in the segment. Consumer-owned: the consumer reads
+        /// and writes it PLAIN on its hot path (no fence needed for its own field; data visibility
+        /// rides the _last acquire/release pair). The producer's room-check and the best-effort
+        /// observers (IsEmpty/Count) read it with Volatile.Read since they touch it cross-thread.</summary>
+        internal int _first;
+        /// <summary>A copy of the current tail index. Consumer-owned (and read by IsEmpty after acquire-load on _first).</summary>
+        internal int _lastCopy;
 
         /// <summary>Padding to reduce false sharing between the first and last.</summary>
         internal PaddingFor32 _pad1;
 
-        /// <summary>A copy of the current head index.</summary>
-        internal int _firstCopy; // not volatile as only read and written by the consumer thread
-        /// <summary>The index of the current tail in the segment.</summary>
-        internal volatile int _last;
+        /// <summary>A copy of the current head index. Producer-owned.</summary>
+        internal int _firstCopy;
+        /// <summary>The index of the current tail in the segment. Producer uses Volatile.Write on publish, consumer uses Volatile.Read on slow-path refresh.</summary>
+        internal int _last;
 
         /// <summary>Padding to reduce false sharing with the last and what's after the segment.</summary>
         internal PaddingFor32 _pad2;

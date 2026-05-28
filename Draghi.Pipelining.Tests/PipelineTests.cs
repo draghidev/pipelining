@@ -147,7 +147,7 @@ public class PipelineTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true));
 
-        // Enqueue items with pending pipeline tasks — they become waiters.
+        // Enqueue items with pending pipeline tasks, they become waiters.
         var item1 = new TestPipelineItem { CompleteAsync = true };
         var item2 = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item1).Execute();
@@ -162,6 +162,27 @@ public class PipelineTests
 
         Assert.IsTrue(item1.IsCompleted);
         Assert.IsTrue(item2.IsCompleted);
+        Assert.AreEqual(0, pipeline.Depth);
+    }
+
+    /// RunEnqueueAsynchronously=false + async pipeline task: executor runs inline on the producer's
+    /// thread, item becomes a tail waiter, pipeline task completion happens on whichever thread
+    /// completes the TCS (here, the test thread). Cross-thread coordination still works.
+    [TestMethod]
+    public async Task SyncEnqueue_AsyncPipelineTask_CompletesViaWaiterPath()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(false));
+        var item = new TestPipelineItem { CompleteAsync = true };
+        pipeline.Enqueue(item).Execute();
+
+        // Executor ran inline: item executed then stored as tail waiter.
+        await item.WaitForExecutedAsync();
+        Assert.IsFalse(item.IsCompleted);
+
+        item.CompletePipelineTask();
+        await item.WaitForCompleteAsync();
+
+        Assert.IsNull(item.Exception);
         Assert.AreEqual(0, pipeline.Depth);
     }
 }

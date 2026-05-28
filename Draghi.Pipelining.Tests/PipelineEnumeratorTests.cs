@@ -1,0 +1,161 @@
+namespace Draghi.Pipelining.Tests;
+
+[TestClass]
+public class PipelineEnumeratorTests
+{
+    [TestMethod]
+    public void Empty_YieldsNothing()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+
+        var observed = new List<TestPipelineItem>();
+        foreach (var item in pipeline)
+            observed.Add(item);
+
+        Assert.AreEqual(0, observed.Count);
+    }
+
+    [TestMethod]
+    public async Task PendingWaiters_YieldsAllInEnqueueOrder()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+
+        const int count = 5;
+        var enqueued = new TestPipelineItem[count];
+        for (var i = 0; i < count; i++)
+        {
+            enqueued[i] = new TestPipelineItem { CompleteAsync = true };
+            pipeline.Enqueue(enqueued[i]).Execute();
+        }
+
+        // Wait for all items to enter the in-flight state (executor pulled them, awaiting pipeline task).
+        for (var i = 0; i < count; i++)
+            await enqueued[i].WaitForExecutedAsync();
+
+        var observed = new List<TestPipelineItem>();
+        foreach (var item in pipeline)
+            observed.Add(item);
+
+        Assert.AreEqual(count, observed.Count, "Enumerator should yield every in-flight item.");
+        for (var i = 0; i < count; i++)
+            Assert.AreSame(enqueued[i], observed[i], $"Item at position {i} should match enqueue order.");
+
+        // Drain.
+        for (var i = 0; i < count; i++)
+            enqueued[i].CompletePipelineTask();
+        for (var i = 0; i < count; i++)
+            await enqueued[i].WaitForCompleteAsync();
+    }
+
+    [TestMethod]
+    public async Task SegmentGrowth_YieldsAllItems()
+    {
+        // SPSC initial segment size is 32. Enqueue more than that to force segment growth.
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+
+        const int count = 50;
+        var enqueued = new TestPipelineItem[count];
+        for (var i = 0; i < count; i++)
+        {
+            enqueued[i] = new TestPipelineItem { CompleteAsync = true };
+            pipeline.Enqueue(enqueued[i]).Execute();
+        }
+
+        for (var i = 0; i < count; i++)
+            await enqueued[i].WaitForExecutedAsync();
+
+        var observed = new List<TestPipelineItem>();
+        foreach (var item in pipeline)
+            observed.Add(item);
+
+        Assert.AreEqual(count, observed.Count, "Enumerator should walk all segments and yield every item.");
+        for (var i = 0; i < count; i++)
+            Assert.AreSame(enqueued[i], observed[i]);
+
+        // Drain.
+        for (var i = 0; i < count; i++)
+            enqueued[i].CompletePipelineTask();
+        for (var i = 0; i < count; i++)
+            await enqueued[i].WaitForCompleteAsync();
+    }
+
+    [TestMethod]
+    public async Task AfterAllCompleted_YieldsNothing()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+
+        const int count = 3;
+        for (var i = 0; i < count; i++)
+        {
+            var item = new TestPipelineItem();
+            pipeline.Enqueue(item).Execute();
+            await item.WaitForCompleteAsync();
+        }
+
+        Assert.AreEqual(0, pipeline.Depth);
+
+        var observed = new List<TestPipelineItem>();
+        foreach (var item in pipeline)
+            observed.Add(item);
+
+        Assert.AreEqual(0, observed.Count, "Drained pipeline should yield no items.");
+    }
+
+    [TestMethod]
+    public async Task TwoSnapshots_BothObserveSameItems()
+    {
+        // Enumeration is non-mutating, repeating it yields the same items.
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+
+        const int count = 4;
+        var enqueued = new TestPipelineItem[count];
+        for (var i = 0; i < count; i++)
+        {
+            enqueued[i] = new TestPipelineItem { CompleteAsync = true };
+            pipeline.Enqueue(enqueued[i]).Execute();
+        }
+        for (var i = 0; i < count; i++)
+            await enqueued[i].WaitForExecutedAsync();
+
+        var first = new List<TestPipelineItem>();
+        foreach (var item in pipeline) first.Add(item);
+
+        var second = new List<TestPipelineItem>();
+        foreach (var item in pipeline) second.Add(item);
+
+        CollectionAssert.AreEqual(first, second, "Repeated enumerations should observe the same items (no mutation).");
+
+        // Drain.
+        for (var i = 0; i < count; i++)
+            enqueued[i].CompletePipelineTask();
+        for (var i = 0; i < count; i++)
+            await enqueued[i].WaitForCompleteAsync();
+    }
+
+    [TestMethod]
+    public void Enumerator_IsValueType()
+    {
+        // The enumerator should be a struct so `foreach` over the pipeline doesn't box.
+        Assert.IsTrue(typeof(Pipeline<TestPipelineItem, TestPipelinePolicy>.Enumerator).IsValueType,
+            "Pipeline enumerator should be a struct to support allocation-free foreach.");
+    }
+
+    [TestMethod]
+    public async Task ManualMoveNext_ReturnsFalseAfterLastItem()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+
+        var item = new TestPipelineItem { CompleteAsync = true };
+        pipeline.Enqueue(item).Execute();
+        await item.WaitForExecutedAsync();
+
+        var enumerator = pipeline.GetEnumerator();
+        Assert.IsTrue(enumerator.MoveNext(), "First MoveNext should yield the single in-flight item.");
+        Assert.AreSame(item, enumerator.Current);
+        Assert.IsFalse(enumerator.MoveNext(), "Subsequent MoveNext should return false.");
+        Assert.IsFalse(enumerator.MoveNext(), "Repeated MoveNext past end should keep returning false.");
+
+        item.CompletePipelineTask();
+        await item.WaitForCompleteAsync();
+    }
+}
