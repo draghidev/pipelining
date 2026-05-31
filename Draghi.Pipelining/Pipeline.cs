@@ -53,9 +53,9 @@ public sealed class Pipeline<T, TPolicy>
     readonly SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)> _waiters;
     int _waiterQueueCount; // Authoritative count. Interlocked by executor and advancer.
     int _waiterCompletedCount; // Number of completed waiter tasks not yet processed by the advancer.
-    bool _advancing; // True if a thread is currently the advancer.
+    Latch _advancing; // Held while a thread is currently the advancer. See Latch.cs for semantics.
     T _waiterRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
-    TaskCompletionSource? _advancerIdleTcs; // Set by DrainOnCompletionAsync while waiting for the advancer chain to fully quiesce; cleared after the wait completes.
+    TaskCompletionSource? _advancerIdleTcs; // Set by DrainOnCompletionAsync while waiting for the advancer chain to fully quiesce, cleared after the wait completes.
 
     // Activation.
     readonly Action _onWaiterTaskCompletedAction;
@@ -77,7 +77,7 @@ public sealed class Pipeline<T, TPolicy>
     /// <summary>
     /// Cancellation token fired by <see cref="CompleteAsync"/>. Can be linked or passed to IO operations
     /// to abort them on shutdown. The same token is delivered to <see cref="IPipelinePolicy{T}.ExecuteItemAsync"/>
-    /// and <see cref="IPipelinePolicy{T}.OnExecutionIdleAsync"/>; policies should observe it to allow shutdown to proceed.
+    /// and <see cref="IPipelinePolicy{T}.OnExecutionIdleAsync"/>. Policies should observe it to allow shutdown to proceed.
     /// </summary>
     public CancellationToken CompletionToken => _wakeSignal.CompletionToken;
 
@@ -110,8 +110,8 @@ public sealed class Pipeline<T, TPolicy>
 
     /// <summary>
     /// Waits for the pipeline depth to reach zero (all items have received
-    /// <see cref="IPipelinePolicy{T}.CompleteItem"/>). Does not prevent new items from being enqueued;
-    /// the caller is responsible for that.
+    /// <see cref="IPipelinePolicy{T}.CompleteItem"/>). Does not prevent new items from being enqueued.
+    /// The caller is responsible for that.
     /// </summary>
     /// <remarks>
     /// This is a pipeline-state query, not an executor-quiescence guarantee. The signal fires from
@@ -131,7 +131,7 @@ public sealed class Pipeline<T, TPolicy>
     /// <param name="exception">
     /// Optional exception delivered to any items still in flight when shutdown drains them
     /// (via <see cref="IPipelinePolicy{T}.CompleteItem"/>'s exception parameter). Note: this exception is
-    /// not propagated through the returned task; it only flows to items. Exceptions thrown by
+    /// not propagated through the returned task. It only flows to items. Exceptions thrown by
     /// <see cref="IPipelinePolicy{T}.OnExecutionIdleAsync"/> during shutdown DO fault the returned task.
     /// </param>
     /// <remarks>
@@ -205,7 +205,11 @@ public sealed class Pipeline<T, TPolicy>
                 else
                 {
                     _executingItem = item;
-                    Interlocked.Exchange(ref _hasExecutingItem, true);
+                    // Release-only publish: subsequent readers seeing _hasExecutingItem=true also see
+                    // the _executingItem write. The full fence isn't needed here, we use the ordering
+                    // not the Exchange's return value. CommitTailWaiter and the advancer C-path still
+                    // use Exchange because they DO need the return value (test-and-set claim).
+                    Volatile.Write(ref _hasExecutingItem, true);
                 }
 
                 try
@@ -243,10 +247,12 @@ public sealed class Pipeline<T, TPolicy>
                 }
                 else
                 {
-                    // Pending: store as tail for the next iteration.
+                    // Pending: store as tail for the next iteration. Publish via Volatile.Write
+                    // on _hasTailWaiter so cross-thread readers (Enumerator) that acquire-read the
+                    // flag see the prior _tailWaiter / _tailWaiterTask writes (release-acquire pair).
                     _tailWaiter = item;
-                    _hasTailWaiter = true;
                     _tailWaiterTask = itemResult.PipelineTask;
+                    Volatile.Write(ref _hasTailWaiter, true);
                 }
 
                 if (itemResult.TrailingExecutionTask != default)
@@ -319,17 +325,17 @@ public sealed class Pipeline<T, TPolicy>
     /// Drains remaining items after the execution loop exits. Waits for the advancer chain to
     /// quiesce via a TCS that DrainReadyWaiters / BailoutRecoveryOnShutdown signal on release of
     /// _advancing. Recovery continuations always complete their own items (via CompleteRecoveryWaiter
-    /// or BailoutRecoveryOnShutdown), so drain doesn't compete - it just waits for the chain to
+    /// or BailoutRecoveryOnShutdown), so drain doesn't compete, it just waits for the chain to
     /// finish. After advancer-idle, drains _waiters and _queue.
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask DrainOnCompletionAsync()
     {
-        while (Volatile.Read(ref _advancing))
+        while (_advancing.IsHeld)
         {
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             Volatile.Write(ref _advancerIdleTcs, tcs);
             // Re-check post-publish: advancer may have released before seeing our TCS.
-            if (!Volatile.Read(ref _advancing))
+            if (!_advancing.IsHeld)
             {
                 Volatile.Write(ref _advancerIdleTcs, null);
                 break;
@@ -375,8 +381,8 @@ public sealed class Pipeline<T, TPolicy>
             else
             {
                 _tailWaiter = recoveryItem;
-                _hasTailWaiter = true;
                 _tailWaiterTask = result.PipelineTask;
+                Volatile.Write(ref _hasTailWaiter, true);
             }
         }
         catch (Exception recoveryEx)
@@ -420,7 +426,10 @@ public sealed class Pipeline<T, TPolicy>
             if (recoveryActivated)
             {
                 ActivateHeadItem(recoveryItem, preferAsync: false);
-                Interlocked.Exchange(ref _hasExecutingItem, false);
+                // Inside _activationLock. Plain write suffices: all readers of _hasExecutingItem
+                // are Interlocked.Exchange (acquire-semantics, sees latest committed value), and
+                // the lock exit's release fence orders this write w.r.t. anyone acquiring next.
+                _hasExecutingItem = false;
                 if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                     _executingItem = default!;
             }
@@ -634,8 +643,7 @@ public sealed class Pipeline<T, TPolicy>
             }
         }
 
-        // Activation may have caused synchronous completion.
-        if (wasEmpty && waiterTask.IsCompleted)
+        if (waiterTask.IsCompleted)
             OnWaiterTaskCompleted();
         else
             waiterTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(_onWaiterTaskCompletedAction);
@@ -648,7 +656,7 @@ public sealed class Pipeline<T, TPolicy>
 
         // Try to become the advancer, only one thread processes completions at a time.
         // Don't acquire if completed, CompleteAsync will drain remaining items.
-        if (_wakeSignal.IsCompleted || Interlocked.Exchange(ref _advancing, true))
+        if (_wakeSignal.IsCompleted || !_advancing.TryAcquire())
             return;
 
         DrainReadyWaiters();
@@ -682,7 +690,7 @@ public sealed class Pipeline<T, TPolicy>
                 if (!advance)
                 {
                     // Recovery item is occupying this pipeline position. The advancer flag stays
-                    // held; the recovery continuation will complete the item, advance via
+                    // held. The recovery continuation will complete the item, advance via
                     // AdvanceAndDrainRecovery, and release the flag (which signals any waiting drain).
                     return;
                 }
@@ -702,10 +710,12 @@ public sealed class Pipeline<T, TPolicy>
                         if (Interlocked.Exchange(ref _hasExecutingItem, false))
                         {
                             // Re-check count under the lock. Executor iterations between our
-                            // Decrement and here can enqueue waiters and re-publish _executingItem;
-                            // the latest publish is no longer the head, so activating here would
+                            // Decrement and here can enqueue waiters and re-publish _executingItem.
+                            // The latest publish is no longer the head, so activating here would
                             // double-activate (now via C-path, again via D-path). Skip when count > 0.
-                            if (Volatile.Read(ref _waiterQueueCount) is 0)
+                            // Plain read: the Exchange above is a full fence (acquire on the read),
+                            // so this read sees the latest committed value without its own LDAR.
+                            if (_waiterQueueCount is 0)
                             {
                                 var executing = _executingItem;
                                 if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -728,27 +738,27 @@ public sealed class Pipeline<T, TPolicy>
                 }
             }
 
-            // Release flag, then re-check for late arrivals. Plain read of _waiterCompletedCount
-            // is safe: sandwiched between this Exchange (release) and TryReclaimAdvancerForWork's
-            // Exchange (re-acquire), both full barriers. Avoids ldapr cost of Volatile.Read on arm64.
-            Interlocked.Exchange(ref _advancing, false);
+            // Release latch, then re-check for late arrivals. Plain read of _waiterCompletedCount
+            // is safe: sandwiched between this release and TryReclaimAdvancerForWork's acquire,
+            // both full barriers via Latch's underlying Interlocked.Exchange.
+            _advancing.Release();
         } while (!_wakeSignal.IsCompleted && _waiterCompletedCount > 0 && TryReclaimAdvancerForWork());
 
         SignalAdvancerIdleIfWaiting();
 
-        // Re-acquire the advancer flag and check for a ready waiter. Returns true with the flag held
-        // if there's work, false (flag released) otherwise. TryPeek MUST run inside the _advancing
-        // protection so the SPSC single-consumer contract on _waiters holds against a racing
-        // OnWaiterTaskCompleted caller.
+        // Re-acquire the advancer latch and check for a ready waiter. Returns true with the latch
+        // held if there's work, false (latch released) otherwise. TryPeek MUST run inside the
+        // latch's protection so the SPSC single-consumer contract on _waiters holds against a
+        // racing OnWaiterTaskCompleted caller.
         bool TryReclaimAdvancerForWork()
         {
-            if (Interlocked.Exchange(ref _advancing, true))
+            if (!_advancing.TryAcquire())
                 return false;
 
             if (_waiters.TryPeek(out var pending) && pending.WaiterTask.IsCompleted)
                 return true;
 
-            Interlocked.Exchange(ref _advancing, false);
+            _advancing.Release();
             return false;
         }
     }
@@ -795,7 +805,7 @@ public sealed class Pipeline<T, TPolicy>
         // Publish the recovery item so the bailout path can complete it on shutdown.
         // The recovery continuation always completes this item itself (via CompleteRecoveryWaiter
         // on the normal path or BailoutRecoveryOnShutdown on shutdown), so no atomic claim race
-        // with drain is needed; drain just waits for the advancer chain to quiesce.
+        // with drain is needed, drain just waits for the advancer chain to quiesce.
         _waiterRecoveryItem = recoveryItem;
 
         if (executeTask.IsCompletedSuccessfully)
@@ -939,7 +949,7 @@ public sealed class Pipeline<T, TPolicy>
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _waiterRecoveryItem = default!;
         CompleteWaiter(recoveryItem, _completionException);
-        Interlocked.Exchange(ref _advancing, false);
+        _advancing.Release();
         SignalAdvancerIdleIfWaiting();
     }
 
@@ -949,7 +959,7 @@ public sealed class Pipeline<T, TPolicy>
 
     /// Signals any drain that's waiting for the advancer chain to quiesce. Null check is the
     /// common case (no one waiting), only allocates a Volatile.Read + null compare.
-    /// Ordering: no hardware fence is required - cache coherence delivers the write eventually
+    /// Ordering: no hardware fence is required, cache coherence delivers the write eventually
     /// on any target. The only real requirement is to stop the JIT from hoisting or caching the
     /// load across calls (a relaxed atomic load would express this exactly). .NET lacks a
     /// relaxed-read primitive, so we use Volatile.Read and pay an unnecessary acquire fence
@@ -959,7 +969,7 @@ public sealed class Pipeline<T, TPolicy>
         => Volatile.Read(ref _advancerIdleTcs)?.TrySetResult();
 
     /// Completes the recovery item on the normal (non-shutdown) recovery path. The continuation
-    /// owns completion uncontested; drain (DrainOnCompletionAsync) only waits for the advancer
+    /// owns completion uncontested. Drain (DrainOnCompletionAsync) only waits for the advancer
     /// chain to quiesce via AdvanceAndDrainRecovery's loop-exit signal.
     void CompleteRecoveryWaiter(T recoveryItem, Exception? exception)
     {
@@ -984,8 +994,8 @@ public sealed class Pipeline<T, TPolicy>
                 if (Interlocked.Exchange(ref _hasExecutingItem, false))
                 {
                     // Re-check count under the lock (see DrainReadyWaiters count==0 branch).
-                    // Skipping when count > 0 prevents double-activating a re-published _executingItem.
-                    if (Volatile.Read(ref _waiterQueueCount) is 0)
+                    // Plain read: the Exchange above provides the acquire fence.
+                    if (_waiterQueueCount is 0)
                     {
                         var executing = _executingItem;
                         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -1020,7 +1030,7 @@ public sealed class Pipeline<T, TPolicy>
             if (Interlocked.Exchange(ref _hasExecutingItem, false))
             {
                 // Won the race-back: advancer won't activate. Item is done (callers invoke us after
-                // pipelineTask.IsCompleted), so activation is optional - skip it.
+                // pipelineTask.IsCompleted), so activation is optional, skip it.
                 if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                     _executingItem = default!;
             }
@@ -1075,12 +1085,11 @@ public sealed class Pipeline<T, TPolicy>
                     goto case 2;
                 case 2:
                     _phase = 3;
-                    // Match cases 1/4 null-filter: under concurrent enumeration the executor's
-                    // publish of _hasTailWaiter=true could be observed (on weak-memory architectures)
-                    // before its publish of _tailWaiter, yielding a stale default(T). The
-                    // `is { }` pattern filters the ref-T null case in line with the documented
-                    // best-effort contract; value-T may still yield default per the same docs.
-                    if (_pipeline._hasTailWaiter && _pipeline._tailWaiter is { } tail)
+                    // Volatile.Read pairs with the executor's Volatile.Write on _hasTailWaiter:
+                    // if observed true, the prior _tailWaiter / _tailWaiterTask writes are visible.
+                    // Consistent for any T that fits in a native word (refs, primitives, small
+                    // structs). Larger structs can tear their own write regardless of fences.
+                    if (Volatile.Read(ref _pipeline._hasTailWaiter) && _pipeline._tailWaiter is { } tail)
                     {
                         Current = tail;
                         return true;
@@ -1122,7 +1131,7 @@ public static class Pipeline
 
     /// <summary>
     /// Represents a deferred enqueue completion returned by <see cref="Pipeline{T,TPolicy}.Enqueue"/>.
-    /// The item is already in the queue; calling <see cref="Execute"/> may signal the execution loop to process it.
+    /// The item is already in the queue. Calling <see cref="Execute"/> may signal the execution loop to process it.
     /// This two-step design exists because the signal may synchronously run the execution loop on the caller's
     /// thread (when <see cref="IPipelinePolicy{T}.RunEnqueueAsynchronously"/> is false),
     /// so it must be invoked outside any held lock.
@@ -1289,7 +1298,7 @@ public static class Pipeline
             // Single-producer pre-check, race-safe: only the producer increments, decrements
             // only lower the value. Observing MaxValue means a further Increment would wrap to
             // MinValue and silently break the drain protocol (negative depth never reaches 0).
-            // Hitting this implies an unbounded producer; the queue's GC heap would exhaust
+            // Hitting this implies an unbounded producer. The queue's GC heap would exhaust
             // long before this in any realistic workload.
             if (Depth == int.MaxValue)
                 ThrowOverflow();

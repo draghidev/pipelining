@@ -155,11 +155,17 @@ public class PipelineEnumeratorTests
     [TestMethod]
     public async Task ManualMoveNext_ReturnsFalseAfterLastItem()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        // WaitForExecutedAsync only signals that SignalExecuted fired inside ExecuteItemAsync.
+        // the executor hasn't yet committed the item to _tailWaiter / _waiters. Use idleTcs to
+        // wait until the executor is settled before enumerating, otherwise MoveNext races the
+        // routing and may see no items.
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
 
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();
         await item.WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var enumerator = pipeline.GetEnumerator();
         Assert.IsTrue(enumerator.MoveNext(), "First MoveNext should yield the single in-flight item.");
@@ -170,4 +176,5 @@ public class PipelineEnumeratorTests
         item.CompletePipelineTask();
         await item.WaitForCompleteAsync();
     }
+
 }

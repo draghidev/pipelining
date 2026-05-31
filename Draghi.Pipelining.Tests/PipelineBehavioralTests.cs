@@ -366,4 +366,129 @@ public class PipelineBehavioralTests
             return false;
         }
     }
+
+    /// Reentrant Enqueue from ActivateHeadItem. SPSC enqueue runs on the executor thread
+    /// (single producer at this moment per the public API contract), so it's safe. Follower is
+    /// picked up on the inner loop's next iteration.
+    [TestMethod]
+    public async Task ReentrantEnqueueFromActivateHeadItem_FollowerCompletes()
+    {
+        var follower = new TestPipelineItem();
+        var enqueued = false;
+        Pipeline<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>? pipelineRef = null;
+
+        var pipeline = Pipeline.Create<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>(
+            new ReentrantEnqueueOnActivatePolicy(_ =>
+            {
+                if (enqueued)
+                    return;
+                enqueued = true;
+                pipelineRef!.Enqueue(follower).Execute();
+            }));
+        pipelineRef = pipeline;
+
+        var first = new TestPipelineItem();
+        pipeline.Enqueue(first).Execute();
+
+        await first.WaitForCompleteAsync();
+        await follower.WaitForCompleteAsync();
+
+        Assert.IsNull(first.Exception);
+        Assert.IsNull(follower.Exception);
+        Assert.AreEqual(0, pipeline.Depth);
+    }
+
+    /// Reentrant Enqueue from OnExecutionIdleAsync. The "refill a batch" pattern: idle hook
+    /// enqueues the next batch, executor picks it up on the outer loop's next iteration without
+    /// parking (queue is non-empty). Gated by a counter to avoid infinite refilling.
+    [TestMethod]
+    public async Task ReentrantEnqueueFromOnExecutionIdleAsync_RefillsBatchUntilGated()
+    {
+        var refills = new TestPipelineItem[3];
+        for (var i = 0; i < refills.Length; i++)
+            refills[i] = new TestPipelineItem();
+
+        var refillIdx = 0;
+        Pipeline<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>? pipelineRef = null;
+
+        var pipeline = Pipeline.Create<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>(
+            new ReentrantEnqueueOnIdlePolicy(() =>
+            {
+                if (refillIdx < refills.Length)
+                    pipelineRef!.Enqueue(refills[refillIdx++]).Execute();
+            }));
+        pipelineRef = pipeline;
+
+        var first = new TestPipelineItem();
+        pipeline.Enqueue(first).Execute();
+
+        await first.WaitForCompleteAsync();
+        foreach (var item in refills)
+            await item.WaitForCompleteAsync();
+
+        Assert.AreEqual(refills.Length, refillIdx);
+        Assert.AreEqual(0, pipeline.Depth);
+        foreach (var item in refills)
+            Assert.IsNull(item.Exception);
+    }
+
+    struct ReentrantEnqueueOnActivatePolicy : IPipelinePolicy<TestPipelineItem>
+    {
+        readonly Action<TestPipelineItem> _onActivate;
+        public ReentrantEnqueueOnActivatePolicy(Action<TestPipelineItem> onActivate) => _onActivate = onActivate;
+
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        {
+            item.SignalExecuted();
+            return new(new PipelineItemResult(default));
+        }
+
+        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true)
+        {
+            _onActivate(item);
+            item.Activate();
+        }
+
+        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+
+        public bool TryRecoverItemFailure(PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        {
+            recoveryItem = null;
+            return false;
+        }
+
+        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
+        public bool RunEnqueueAsynchronously => true;
+        public ValueTask YieldAfterFirstItem() => default;
+    }
+
+    struct ReentrantEnqueueOnIdlePolicy : IPipelinePolicy<TestPipelineItem>
+    {
+        readonly Action _onIdle;
+        public ReentrantEnqueueOnIdlePolicy(Action onIdle) => _onIdle = onIdle;
+
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        {
+            item.SignalExecuted();
+            return new(new PipelineItemResult(default));
+        }
+
+        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
+        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+
+        public bool TryRecoverItemFailure(PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        {
+            recoveryItem = null;
+            return false;
+        }
+
+        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
+        {
+            _onIdle();
+            return default;
+        }
+
+        public bool RunEnqueueAsynchronously => true;
+        public ValueTask YieldAfterFirstItem() => default;
+    }
 }

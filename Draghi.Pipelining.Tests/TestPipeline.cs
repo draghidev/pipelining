@@ -2,6 +2,21 @@ namespace Draghi.Pipelining.Tests;
 
 sealed class TestPipelineItem
 {
+    static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(2);
+
+    static string BuildTimeoutMessage(string description)
+    {
+        ThreadPool.GetAvailableThreads(out var availWorker, out var availIO);
+        ThreadPool.GetMaxThreads(out var maxWorker, out var maxIO);
+        ThreadPool.GetMinThreads(out var minWorker, out var minIO);
+        return $"{description} ({WaitTimeout.TotalSeconds}s timeout) | ThreadPool: " +
+            $"pending={ThreadPool.PendingWorkItemCount}, threads={ThreadPool.ThreadCount}, " +
+            $"completed={ThreadPool.CompletedWorkItemCount}, " +
+            $"avail={availWorker}/{availIO}, min={minWorker}/{minIO}, max={maxWorker}/{maxIO} | " +
+            $"GC: gen0={GC.CollectionCount(0)}, gen1={GC.CollectionCount(1)}, gen2={GC.CollectionCount(2)}, " +
+            $"heap={GC.GetTotalMemory(forceFullCollection: false)}";
+    }
+
     public string? Name { get; init; }
     readonly ManualResetEventSlim _completed = new(false);
     readonly ManualResetEventSlim _activated = new(false);
@@ -29,12 +44,26 @@ sealed class TestPipelineItem
     }
 
     public void SignalExecuted() => _executed.Set();
-    public void WaitForExecuted() => Assert.IsTrue(_executed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item execution.");
+
+    public void WaitForExecuted()
+    {
+        if (!_executed.Wait(WaitTimeout))
+        {
+            Assert.Fail(BuildTimeoutMessage("Timed out waiting for item execution."));
+        }
+    }
+
     public Task WaitForExecutedAsync()
     {
         if (_executed.IsSet)
             return Task.CompletedTask;
-        return Task.Run(() => Assert.IsTrue(_executed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item execution."));
+        return Task.Run(() =>
+        {
+            if (!_executed.Wait(WaitTimeout))
+            {
+                Assert.Fail(BuildTimeoutMessage("Timed out waiting for item execution."));
+            }
+        });
     }
 
     int _activationCount;
@@ -45,21 +74,46 @@ sealed class TestPipelineItem
         Interlocked.Increment(ref _activationCount);
         _activated.Set();
     }
-    public void WaitForActivation() => Assert.IsTrue(_activated.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item activation.");
+    public void WaitForActivation()
+    {
+        if (!_activated.Wait(WaitTimeout))
+        {
+            Assert.Fail(BuildTimeoutMessage("Timed out waiting for item activation."));
+        }
+    }
+
     public Task WaitForActivationAsync()
     {
         if (_activated.IsSet)
             return Task.CompletedTask;
-        return Task.Run(() => Assert.IsTrue(_activated.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item activation."));
+        return Task.Run(() =>
+        {
+            if (!_activated.Wait(WaitTimeout))
+            {
+                Assert.Fail(BuildTimeoutMessage("Timed out waiting for item activation."));
+            }
+        });
     }
 
-    public void WaitForComplete() => Assert.IsTrue(_completed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item completion.");
+    public void WaitForComplete()
+    {
+        if (!_completed.Wait(WaitTimeout))
+        {
+            Assert.Fail(BuildTimeoutMessage("Timed out waiting for item completion."));
+        }
+    }
 
     public Task WaitForCompleteAsync()
     {
         if (_completed.IsSet)
             return Task.CompletedTask;
-        return Task.Run(() => Assert.IsTrue(_completed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item completion."));
+        return Task.Run(() =>
+        {
+            if (!_completed.Wait(WaitTimeout))
+            {
+                Assert.Fail(BuildTimeoutMessage("Timed out waiting for item completion."));
+            }
+        });
     }
 
     public void CompletePipelineTask()
@@ -86,7 +140,7 @@ sealed class TestPipelineItem
     public ValueTask GetPipelineTask()
     {
         if (!CompleteAsync)
-            return default;
+            return PipelineTaskException is { } ex ? new(Task.FromException(ex)) : default;
         return new(_pipelineTaskTcs.Task);
     }
 
