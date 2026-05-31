@@ -37,7 +37,14 @@ sealed class TestPipelineItem
         return Task.Run(() => Assert.IsTrue(_executed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item execution."));
     }
 
-    public void Activate() => _activated.Set();
+    int _activationCount;
+    public int ActivationCount => Volatile.Read(ref _activationCount);
+
+    public void Activate()
+    {
+        Interlocked.Increment(ref _activationCount);
+        _activated.Set();
+    }
     public void WaitForActivation() => Assert.IsTrue(_activated.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for item activation.");
     public Task WaitForActivationAsync()
     {

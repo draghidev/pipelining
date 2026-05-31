@@ -95,13 +95,13 @@ public class PipelineTests
     }
 
     [TestMethod]
-    public async Task WaitForIdleAsync()
+    public async Task WaitForEmptyAsync()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();
 
-        var drainTask = pipeline.WaitForIdleAsync();
+        var drainTask = pipeline.WaitForEmptyAsync();
         Assert.IsFalse(drainTask.IsCompleted);
 
         item.CompletePipelineTask();

@@ -44,7 +44,7 @@ public class PipelineBehavioralTests
         await item.WaitForCompleteAsync();
 
         // Give the executor a chance to settle into the idle path.
-        await pipeline.WaitForIdleAsync();
+        await pipeline.WaitForEmptyAsync();
         await Task.Delay(50);
 
         Assert.AreEqual(0, counter.Value, "YieldAfterFirstItem should not fire when the queue is empty after the first item.");
@@ -54,7 +54,12 @@ public class PipelineBehavioralTests
     public async Task YieldAfterFirstItem_CalledAgainOnNewBatch()
     {
         var counter = new Counter();
-        var pipeline = Pipeline.Create<TestPipelineItem, YieldCountingPolicy>(new(counter));
+        // The re-arm contract is per genuine executor park, not per depth-zero. WaitForEmptyAsync
+        // returns at depth-zero (fired from inside CompleteItem while executor may still be mid-batch),
+        // which can race the second batch's enqueue into the same inner-while iteration. Sync on the
+        // policy's OnExecutionIdleAsync hook instead - testing a policy contract via the policy hook.
+        var idleSem = new SemaphoreSlim(0);
+        var pipeline = Pipeline.Create<TestPipelineItem, YieldCountingPolicy>(new(counter, () => idleSem.Release()));
 
         // First batch.
         var firstA = new TestPipelineItem { ExecuteAsync = true };
@@ -66,10 +71,10 @@ public class PipelineBehavioralTests
         await firstA.WaitForCompleteAsync();
         await secondA.WaitForCompleteAsync();
 
-        await pipeline.WaitForIdleAsync();
+        await idleSem.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.AreEqual(1, counter.Value, "After first batch, yield count should be 1.");
 
-        // Second batch. Executor went idle and is back at the top, needsYieldAfterFirst is reset.
+        // Second batch. Executor is genuinely parked now, needsYieldAfterFirst is reset.
         var firstB = new TestPipelineItem { ExecuteAsync = true };
         pipeline.Enqueue(firstB).Execute();
         await firstB.WaitForExecutedAsync();
@@ -79,6 +84,7 @@ public class PipelineBehavioralTests
         await firstB.WaitForCompleteAsync();
         await secondB.WaitForCompleteAsync();
 
+        await idleSem.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.AreEqual(2, counter.Value, "Each idle→active batch transition should re-arm YieldAfterFirstItem.");
     }
 
@@ -224,7 +230,7 @@ public class PipelineBehavioralTests
         }
     }
 
-    struct YieldCountingPolicy(Counter counter) : IPipelinePolicy<TestPipelineItem>
+    struct YieldCountingPolicy(Counter counter, Action? onIdle = null) : IPipelinePolicy<TestPipelineItem>
     {
         public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
         {
@@ -245,6 +251,12 @@ public class PipelineBehavioralTests
         public ValueTask YieldAfterFirstItem()
         {
             counter.Value++;
+            return default;
+        }
+
+        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
+        {
+            onIdle?.Invoke();
             return default;
         }
     }

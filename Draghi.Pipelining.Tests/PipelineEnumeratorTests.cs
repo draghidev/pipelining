@@ -18,7 +18,10 @@ public class PipelineEnumeratorTests
     [TestMethod]
     public async Task PendingWaiters_YieldsAllInEnqueueOrder()
     {
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        // Items are CompleteAsync, so depth never reaches 0 - use OnExecutionIdleAsync as the
+        // executor-at-rest signal (CommitTailWaiter's transit window must be settled before enum).
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
 
         const int count = 5;
         var enqueued = new TestPipelineItem[count];
@@ -31,6 +34,7 @@ public class PipelineEnumeratorTests
         // Wait for all items to enter the in-flight state (executor pulled them, awaiting pipeline task).
         for (var i = 0; i < count; i++)
             await enqueued[i].WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var observed = new List<TestPipelineItem>();
         foreach (var item in pipeline)
@@ -51,7 +55,10 @@ public class PipelineEnumeratorTests
     public async Task SegmentGrowth_YieldsAllItems()
     {
         // SPSC initial segment size is 32. Enqueue more than that to force segment growth.
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        // Items are CompleteAsync, so depth never reaches 0 - use OnExecutionIdleAsync as the
+        // executor-at-rest signal (CommitTailWaiter's transit window must be settled before enum).
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
 
         const int count = 50;
         var enqueued = new TestPipelineItem[count];
@@ -63,6 +70,7 @@ public class PipelineEnumeratorTests
 
         for (var i = 0; i < count; i++)
             await enqueued[i].WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var observed = new List<TestPipelineItem>();
         foreach (var item in pipeline)
@@ -104,8 +112,11 @@ public class PipelineEnumeratorTests
     [TestMethod]
     public async Task TwoSnapshots_BothObserveSameItems()
     {
-        // Enumeration is non-mutating, repeating it yields the same items.
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        // Enumeration is non-mutating, repeating it yields the same items. Items are CompleteAsync,
+        // so depth never reaches 0 during enumeration - WaitForEmptyAsync would hang. Need an
+        // executor-at-rest signal independent of depth. Use the policy's OnExecutionIdleAsync TCS.
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
 
         const int count = 4;
         var enqueued = new TestPipelineItem[count];
@@ -116,6 +127,7 @@ public class PipelineEnumeratorTests
         }
         for (var i = 0; i < count; i++)
             await enqueued[i].WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var first = new List<TestPipelineItem>();
         foreach (var item in pipeline) first.Add(item);

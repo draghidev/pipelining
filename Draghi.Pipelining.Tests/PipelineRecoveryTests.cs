@@ -684,7 +684,7 @@ public class PipelineRecoveryTests
 
         heldRecovery!.CompleteExecuteTask();
         await heldRecovery.WaitForCompleteAsync();
-        await pipeline.WaitForIdleAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+        await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
 
         item = null!;
         heldRecovery = null!;

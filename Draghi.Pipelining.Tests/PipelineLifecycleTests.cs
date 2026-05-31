@@ -8,7 +8,7 @@ public class PipelineLifecycleTests
     /// between those two writes, CompleteWaiter decrements depth before Enqueue's increment,
     /// producing a negative remainingDepth in policy.CompleteItem. Worse, the depth==0 transition
     /// is observed at "-1 instead of 0" so OnDepthReachedZero never fires, potentially leaving
-    /// WaitForIdleAsync waiters hanging. Fix: IncrementDepth BEFORE _queue.Enqueue.
+    /// WaitForEmptyAsync waiters hanging. Fix: IncrementDepth BEFORE _queue.Enqueue.
     [TestMethod]
     public async Task Enqueue_TightBurst_RemainingDepthNeverNegative()
     {
@@ -110,28 +110,28 @@ public class PipelineLifecycleTests
     }
 
     [TestMethod]
-    public void WaitForIdleAsync_AlreadyIdle_CompletesImmediately()
+    public void WaitForEmptyAsync_AlreadyIdle_CompletesImmediately()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
 
-        // Depth is 0 from construction. WaitForIdleAsync should return a completed task synchronously.
-        var task = pipeline.WaitForIdleAsync();
+        // Depth is 0 from construction. WaitForEmptyAsync should return a completed task synchronously.
+        var task = pipeline.WaitForEmptyAsync();
         Assert.IsTrue(task.IsCompleted);
         Assert.IsTrue(task.IsCompletedSuccessfully);
     }
 
     [TestMethod]
-    public async Task WaitForIdleAsync_Cancelled_ThrowsTaskCanceled()
+    public async Task WaitForEmptyAsync_Cancelled_ThrowsTaskCanceled()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
 
-        // Hold an item in-flight so WaitForIdleAsync has to wait.
+        // Hold an item in-flight so WaitForEmptyAsync has to wait.
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();
         await item.WaitForExecutedAsync();
 
         using var cts = new CancellationTokenSource();
-        var idleTask = pipeline.WaitForIdleAsync(cts.Token).AsTask();
+        var idleTask = pipeline.WaitForEmptyAsync(cts.Token).AsTask();
 
         Assert.IsFalse(idleTask.IsCompleted);
 
@@ -185,20 +185,28 @@ public class PipelineLifecycleTests
         CollectionAssert.AreEqual(expected, depths);
     }
 
-    /// CompleteAsync called while recovery has an in-flight async continuation (_waiterInRecovery=true).
-    /// Exercises the _waiterRecoveryLock path in DrainOnCompletionAsync that prevents racing the
-    /// recovery's AdvanceAndDrainRecovery against the drain.
+    /// CompleteAsync called while a recovery continuation is in flight. DrainOnCompletionAsync
+    /// waits on the advancer-idle TCS, which the recovery continuation signals when it releases
+    /// _advancing via BailoutRecoveryOnShutdown (or via AdvanceAndDrainRecovery's loop exit).
     [TestMethod]
     public async Task CompleteAsync_DuringActiveRecovery_DrainsCleanly()
     {
         var recovery = new TestPipelineItem { ExecuteAsync = true };
+        // We deliberately only handle the advancer's PipelineTaskWaiter kind. The test must avoid
+        // the racy executor-side trailing-recovery path (RecoverCommittedTailWaiterAsync), which
+        // fires kind=PipelineTask when CommitTailWaiter sees a pre-faulted tail task. Sync on
+        // OnExecutionIdleAsync via idleTcs to guarantee the executor has done its pre-idle commit
+        // (faulting moved to _waiters with callback registered) before we fault the task.
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null));
+            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
+            idleTcs));
 
         // Waiter item with a pipeline task that will fault, triggering recovery.
         var faulting = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
         pipeline.Enqueue(faulting).Execute();
         await faulting.WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Fault the pipeline task. Advancer picks it up and starts recovery (async execute).
         faulting.CompletePipelineTask();
@@ -206,7 +214,7 @@ public class PipelineLifecycleTests
         // Wait until recovery is in-flight (executing) before completing.
         await recovery.WaitForExecutedAsync();
 
-        // Now CompleteAsync should serialize against the active recovery via _waiterRecoveryLock.
+        // CompleteAsync's drain waits on the advancer-idle TCS while recovery is in flight.
         var completeTask = pipeline.CompleteAsync().AsTask();
 
         // Recovery is still pending its execute task. Complete it.
@@ -219,7 +227,7 @@ public class PipelineLifecycleTests
         Assert.IsFalse(faulting.IsCompleted, "Original faulting item is not completed when recovery takes over.");
     }
 
-    /// Multiple WaitForIdleAsync callers must all observe the drain. Exercises the drain TCS
+    /// Multiple WaitForEmptyAsync callers must all observe the drain. Exercises the drain TCS
     /// reuse: the first caller creates the TCS, subsequent callers attach to the same task.
     [TestMethod]
     public async Task MultipleConcurrentWaitForIdleCallers()
@@ -233,7 +241,7 @@ public class PipelineLifecycleTests
         const int waiters = 8;
         var idleTasks = new Task[waiters];
         for (var i = 0; i < waiters; i++)
-            idleTasks[i] = pipeline.WaitForIdleAsync().AsTask();
+            idleTasks[i] = pipeline.WaitForEmptyAsync().AsTask();
 
         foreach (var t in idleTasks)
             Assert.IsFalse(t.IsCompleted, "Idle should not signal while item is pending.");
@@ -245,11 +253,11 @@ public class PipelineLifecycleTests
             Assert.IsTrue(t.IsCompletedSuccessfully, "Every concurrent waiter should observe the drain.");
     }
 
-    /// Repeated drain cycles: each WaitForIdleAsync must be cleanly resolved (TCS torn down and
+    /// Repeated drain cycles: each WaitForEmptyAsync must be cleanly resolved (TCS torn down and
     /// new one created on next call). Exercises the SetResult+null pattern in CompleteWaiter
-    /// and the lazy creation in WaitForIdleAsync.
+    /// and the lazy creation in WaitForEmptyAsync.
     [TestMethod]
-    public async Task WaitForIdleAsync_AcrossRepeatedDrainCycles()
+    public async Task WaitForEmptyAsync_AcrossRepeatedDrainCycles()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         const int cycles = 20;
@@ -260,26 +268,26 @@ public class PipelineLifecycleTests
             pipeline.Enqueue(item).Execute();
             await item.WaitForExecutedAsync();
 
-            var idleTask = pipeline.WaitForIdleAsync().AsTask();
+            var idleTask = pipeline.WaitForEmptyAsync().AsTask();
             Assert.IsFalse(idleTask.IsCompleted, $"Cycle {c}: idle should not signal while item is pending.");
 
             item.CompletePipelineTask();
             await idleTask.WaitAsync(TimeSpan.FromSeconds(5));
             Assert.IsTrue(idleTask.IsCompletedSuccessfully, $"Cycle {c}: idle task should complete.");
 
-            // Subsequent WaitForIdleAsync (depth==0) should return a completed task immediately.
-            var immediate = pipeline.WaitForIdleAsync();
+            // Subsequent WaitForEmptyAsync (depth==0) should return a completed task immediately.
+            var immediate = pipeline.WaitForEmptyAsync();
             Assert.IsTrue(immediate.IsCompleted, $"Cycle {c}: idle should be immediately completed after drain.");
         }
     }
 
-    /// Regression guard for DepthState's lock-free publish-and-backstop. A WaitForIdleAsync
+    /// Regression guard for DepthState's lock-free publish-and-backstop. A WaitForEmptyAsync
     /// caller arriving in the narrow window between depth hitting 0 in CompleteWaiter and the
     /// publish-side observing it must still see the TCS signaled. The backstop depth re-check
     /// after CompareExchange-publish covers the case where the caller's first depth read raced
     /// with a concurrent decrement. Multiple iterations to exercise the timing.
     [TestMethod]
-    public async Task WaitForIdleAsync_DuringDepthZeroTransition()
+    public async Task WaitForEmptyAsync_DuringDepthZeroTransition()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         const int iterations = 100;
@@ -290,10 +298,10 @@ public class PipelineLifecycleTests
             pipeline.Enqueue(item).Execute();
             await item.WaitForExecutedAsync();
 
-            // Complete the item on one thread, call WaitForIdleAsync on this thread.
+            // Complete the item on one thread, call WaitForEmptyAsync on this thread.
             // Depending on timing, the caller publishes before, during, or after the depth==0 transition.
             var completeTask = Task.Run(item.CompletePipelineTask);
-            var idleTask = pipeline.WaitForIdleAsync().AsTask();
+            var idleTask = pipeline.WaitForEmptyAsync().AsTask();
 
             await completeTask;
             await item.WaitForCompleteAsync();
@@ -311,19 +319,19 @@ public class PipelineLifecycleTests
     /// completed task even when depth was non-zero. After the fix, the self-signal path also
     /// CAS-clears <c>_drainTcs</c> so the next publisher gets a fresh slot.
     [TestMethod]
-    public async Task WaitForIdleAsync_SelfSignalDoesNotLeakStaleTcs()
+    public async Task WaitForEmptyAsync_SelfSignalDoesNotLeakStaleTcs()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
 
         for (var i = 0; i < 500; i++)
         {
-            // First cycle: race a completion with a WaitForIdleAsync caller, hopefully landing in
+            // First cycle: race a completion with a WaitForEmptyAsync caller, hopefully landing in
             // the self-signal path on at least some iterations.
             var item = new TestPipelineItem { CompleteAsync = true };
             pipeline.Enqueue(item).Execute();
             await item.WaitForExecutedAsync();
             var completeTask = Task.Run(item.CompletePipelineTask);
-            var idle1 = pipeline.WaitForIdleAsync();
+            var idle1 = pipeline.WaitForEmptyAsync();
             await completeTask;
             await item.WaitForCompleteAsync();
             await idle1.AsTask().WaitAsync(TimeSpan.FromSeconds(2));
@@ -333,8 +341,8 @@ public class PipelineLifecycleTests
             var item2 = new TestPipelineItem { CompleteAsync = true };
             pipeline.Enqueue(item2).Execute();
             await item2.WaitForExecutedAsync();
-            var idle2 = pipeline.WaitForIdleAsync();
-            Assert.IsFalse(idle2.IsCompleted, $"iter {i}: WaitForIdleAsync returned completed task with depth={pipeline.Depth} — stale TCS leak.");
+            var idle2 = pipeline.WaitForEmptyAsync();
+            Assert.IsFalse(idle2.IsCompleted, $"iter {i}: WaitForEmptyAsync returned completed task with depth={pipeline.Depth} — stale TCS leak.");
             item2.CompletePipelineTask();
             await idle2.AsTask().WaitAsync(TimeSpan.FromSeconds(2));
         }
@@ -436,16 +444,16 @@ public class PipelineLifecycleTests
         Assert.AreSame(idleEx, ex);
     }
 
-    /// WaitForIdleAsync called after CompleteAsync has fully drained should return a completed
+    /// WaitForEmptyAsync called after CompleteAsync has fully drained should return a completed
     /// task immediately (depth is 0, drain TCS is null because no one was waiting during drain).
     [TestMethod]
-    public async Task WaitForIdleAsync_AfterCompleteAsync_CompletesImmediately()
+    public async Task WaitForEmptyAsync_AfterCompleteAsync_CompletesImmediately()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         await pipeline.CompleteAsync();
 
-        var task = pipeline.WaitForIdleAsync();
-        Assert.IsTrue(task.IsCompleted, "WaitForIdleAsync after CompleteAsync should be immediately completed.");
+        var task = pipeline.WaitForEmptyAsync();
+        Assert.IsTrue(task.IsCompleted, "WaitForEmptyAsync after CompleteAsync should be immediately completed.");
     }
 
     /// Concurrent CompleteAsync calls from multiple threads: Interlocked.Exchange on _completing
@@ -479,12 +487,12 @@ public class PipelineLifecycleTests
         CollectionAssert.Contains(exceptions, item.Exception, "Drained item should see one of the supplied exceptions.");
     }
 
-    /// WaitForIdleAsync caller is suspended when CompleteAsync fires concurrently. The drain must
-    /// complete the WaitForIdleAsync TCS even though the trigger was CompleteAsync rather than
+    /// WaitForEmptyAsync caller is suspended when CompleteAsync fires concurrently. The drain must
+    /// complete the WaitForEmptyAsync TCS even though the trigger was CompleteAsync rather than
     /// natural depth-to-zero. (CompleteWaiter drives the drain TCS; CompleteAsync's drain calls
     /// CompleteWaiter for each remaining item.)
     [TestMethod]
-    public async Task WaitForIdleAsync_RacingCompleteAsync_AlwaysCompletes()
+    public async Task WaitForEmptyAsync_RacingCompleteAsync_AlwaysCompletes()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
 
@@ -492,13 +500,13 @@ public class PipelineLifecycleTests
         pipeline.Enqueue(item).Execute();
         await item.WaitForExecutedAsync();
 
-        var idleTask = pipeline.WaitForIdleAsync().AsTask();
+        var idleTask = pipeline.WaitForEmptyAsync().AsTask();
         Assert.IsFalse(idleTask.IsCompleted);
 
         var completeTask = pipeline.CompleteAsync().AsTask();
 
         await Task.WhenAll(idleTask, completeTask).WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.IsTrue(idleTask.IsCompletedSuccessfully, "WaitForIdleAsync caller must observe the drain.");
+        Assert.IsTrue(idleTask.IsCompletedSuccessfully, "WaitForEmptyAsync caller must observe the drain.");
     }
 
     /// Regression guard for the executor's pre-idle local clears. ExecuteQueue promotes

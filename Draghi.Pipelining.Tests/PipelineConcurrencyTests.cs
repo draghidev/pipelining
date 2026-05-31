@@ -148,7 +148,7 @@ public class PipelineConcurrencyTests
         pipeline.Enqueue(first).Execute();
 
         // Start waiting for idle.
-        var idleTask = pipeline.WaitForIdleAsync();
+        var idleTask = pipeline.WaitForEmptyAsync();
         Assert.IsFalse(idleTask.IsCompleted);
 
         // Enqueue another item while waiting. Idle should not trigger until both are done.
@@ -210,47 +210,94 @@ public class PipelineConcurrencyTests
         Assert.AreEqual(0, pipeline.Depth);
     }
 
-    /// Regression guard for the executor's deferred-activation publish
-    /// (_executingItem=item, Interlocked.Exchange(ref _hasExecutingItem, true)) versus the
-    /// advancer's Interlocked.Exchange that claims the executing item when the last waiter
-    /// completes. Either path must end up activating the new item, never neither.
-    /// Uses an async B so it goes through the waiter-queue path.
+    /// Upper-bound regression guard for activation: every item must be activated at most once.
+    /// Activation is optional per the contract (items whose underlying work completes outside the
+    /// head-of-pipeline flow may skip it), so we don't assert a lower bound. The bug class this
+    /// catches is double activation, where two paths both call ActivateHeadItem for the same item.
     [TestMethod]
-    public async Task ActivationFiresForEveryItemUnderWaiterCompletionRace()
+    public async Task NoItemActivatedMoreThanOnceUnderLoad()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        const int iterations = 200;
+        const int iterations = 500;
 
+        var items = new TestPipelineItem[iterations];
         for (var i = 0; i < iterations; i++)
         {
-            // Item A becomes a waiter with a pending pipeline task.
-            var a = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(a).Execute();
-            await a.WaitForExecutedAsync();
-
-            // Complete A's pipeline task (drives advancer) and enqueue B (deferred-activation path)
-            // simultaneously. Whichever path runs first, advancer or EnqueueWaiter's line-615 branch,
-            // must end up activating B.
-            var completionTask = Task.Run(a.CompletePipelineTask);
-            var b = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(b).Execute();
-            await b.WaitForExecutedAsync();
-            b.CompletePipelineTask();
-
-            await completionTask;
-            await a.WaitForCompleteAsync();
-            await b.WaitForCompleteAsync();
-
-            // A always goes through immediate-activation (count=0 at dequeue) so must be activated.
-            // B's activation is contract-conditional: if B completes synchronously inside the
-            // deferred path before reaching the waiter queue, activation is unnecessary (a pooled
-            // flow may already have been returned). Only assert what the contract requires.
-            a.WaitForActivation();
-            Assert.IsNull(a.Exception);
-            Assert.IsNull(b.Exception);
+            // Mix of async (CompleteAsync=true) and sync items to exercise both deferred-publish
+            // and inline-activate paths.
+            items[i] = new TestPipelineItem { CompleteAsync = i % 2 == 0 };
+            pipeline.Enqueue(items[i]).Execute();
+            if (items[i].CompleteAsync)
+            {
+                // Fire pipeline tasks from a separate thread to race with the executor / advancer.
+                _ = Task.Run(items[i].CompletePipelineTask);
+            }
         }
 
+        await pipeline.WaitForEmptyAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+
+        var doubled = items.Select((it, idx) => (it, idx)).Where(p => p.it.ActivationCount > 1).ToList();
+        var detail = string.Join("; ", doubled.Select(p => $"{p.idx}({(p.it.CompleteAsync ? "async" : "sync")},count={p.it.ActivationCount})"));
+        Assert.AreEqual(0, doubled.Count, $"{doubled.Count} items had multiple activations: {detail}");
         Assert.AreEqual(0, pipeline.Depth);
+    }
+
+    /// Ordering regression guard: activations that do occur must be in pipeline-enqueue order.
+    /// Activation is optional (items whose work completes outside head-of-pipeline flow may skip),
+    /// so the recorded sequence is monotone-increasing rather than contiguous.
+    [TestMethod]
+    public async Task ActivationOrderMatchesEnqueueOrderUnderLoad()
+    {
+        var activationOrder = new System.Collections.Concurrent.ConcurrentQueue<int>();
+        var pipeline = Pipeline.Create<TestPipelineItem, ActivationOrderRecordingPolicy>(
+            new(activationOrder));
+        const int iterations = 500;
+
+        var items = new TestPipelineItem[iterations];
+        for (var i = 0; i < iterations; i++)
+        {
+            items[i] = new TestPipelineItem { Name = i.ToString(), CompleteAsync = true };
+            pipeline.Enqueue(items[i]).Execute();
+            _ = Task.Run(items[i].CompletePipelineTask);
+        }
+
+        await pipeline.WaitForEmptyAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
+
+        var recorded = activationOrder.ToArray();
+        Assert.IsTrue(recorded.Length <= iterations, "Recorded more activations than items.");
+        var prev = -1;
+        for (var i = 0; i < recorded.Length; i++)
+        {
+            Assert.IsTrue(recorded[i] > prev, $"Activation at position {i} ({recorded[i]}) is not strictly after previous ({prev}).");
+            prev = recorded[i];
+        }
+    }
+
+    struct ActivationOrderRecordingPolicy : IPipelinePolicy<TestPipelineItem>
+    {
+        readonly System.Collections.Concurrent.ConcurrentQueue<int> _order;
+
+        public ActivationOrderRecordingPolicy(System.Collections.Concurrent.ConcurrentQueue<int> order) => _order = order;
+
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        {
+            var task = item.GetExecuteTask();
+            item.SignalExecuted();
+            return task;
+        }
+
+        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true)
+        {
+            _order.Enqueue(int.Parse(item.Name!));
+            item.Activate();
+        }
+
+        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+            => item.Complete(exception);
+
+        public bool RunEnqueueAsynchronously => true;
+
+        public ValueTask YieldAfterFirstItem() => default;
     }
 
     /// Stresses the advancer's drain loop by completing many waiter pipeline tasks from

@@ -69,7 +69,7 @@ public interface IPipelinePolicy<T>
     bool RunEnqueueAsynchronously => true;
 
     /// Called when the executor is idle, before waiting for more work.
-    /// Waiters may still be active, use <see cref="Pipeline{T,TPolicy}.WaitForIdleAsync"/> for full pipeline idle.
+    /// Waiters may still be active, use <see cref="Pipeline{T,TPolicy}.CompleteAsync"/> for full pipeline drain.
     /// The executor awaits the returned task before parking. <paramref name="cancellationToken"/>
     /// is the pipeline's shutdown signal (same as <see cref="ExecuteItemAsync"/>); implementations
     /// must observe it so the executor can exit when <see cref="Pipeline{T,TPolicy}.CompleteAsync"/>
