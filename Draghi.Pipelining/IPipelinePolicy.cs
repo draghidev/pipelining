@@ -46,6 +46,12 @@ public interface IPipelinePolicy<T>
     /// no subsequent Activate will touch the returned object. No coordination with this
     /// method is required.
     /// </para>
+    /// <para>
+    /// Today this runs under the advancer latch, so slow inline work here (or in <see cref="CompleteItem"/>)
+    /// pins the drain and defers other completions. Treat <c>preferAsync: true</c> as required:
+    /// dispatch off-thread, no flow-body work inline. The name stays "prefer" because the
+    /// constraint is a framework limitation, not the contract's intent.
+    /// </para>
     /// </remarks>
     void ActivateHeadItem(T item, bool preferAsync = true);
 
