@@ -1,4 +1,5 @@
 using System.Diagnostics.CodeAnalysis;
+using System.Threading.Tasks.Sources;
 
 namespace Draghi.Pipelining;
 
@@ -101,10 +102,29 @@ public interface IPipelinePolicy<T>
 /// corrupting the source's token and producing undefined behavior. Distinct <see cref="Task"/>-backed
 /// or <see cref="ValueTask.CompletedTask"/>/<c>default</c> instances are always safe.
 /// </para>
+/// <para>
+/// Both phases retain their ordinary liveness obligation when the other phase faults. In particular,
+/// a trailing-task failure may be reported while the pipeline task still owns an external resource;
+/// recovery cannot safely revoke that ownership. The outstanding phase must therefore eventually
+/// settle itself, or be terminated through the item's surrounding cancellation/abort contract.
+/// </para>
 /// </remarks>
 public readonly struct PipelineItemResult(ValueTask trailingExecutionTask, ValueTask pipelineTask)
 {
-    /// <summary>Remaining execution work that must complete before the next item can execute.</summary>
+    /// <summary>
+    /// Remaining execution work (typically writes) that must complete before the next item can
+    /// execute. The framework awaits this between iterations to maintain backpressure on the
+    /// shared transport.
+    /// </summary>
+    /// <remarks>
+    /// Items returning a non-default <see cref="TrailingExecutionTask"/> are routed through the
+    /// tail-waiter path unconditionally. The framework guarantees that
+    /// <see cref="IPipelinePolicy{T}.CompleteItem"/> for such an item will fire only after this
+    /// task has been observed (success or fault), regardless of when <see cref="PipelineTask"/>
+    /// completes. Flow authors can return a sync-complete pipeline task while their trailing
+    /// task is still pending. The framework will not fire <c>CompleteItem</c> until trailing
+    /// has finished. No internal composition required at the flow.
+    /// </remarks>
     public ValueTask TrailingExecutionTask { get; } = trailingExecutionTask;
     /// <summary>The item's pipelined-phase task. Completion signals the item is done in the pipeline.</summary>
     public ValueTask PipelineTask { get; } = pipelineTask;

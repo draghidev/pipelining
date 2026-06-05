@@ -210,6 +210,36 @@ public class PipelineLifecycleTests
         CollectionAssert.AreEqual(expected, depths);
     }
 
+    /// CompleteItem must latch on BOTH the trailing AND the pipeline task - not the trailing alone.
+    /// An item whose trailing (write) settles first but whose pipeline (read) task is still in flight
+    /// has NOT finished its pipelined phase: retiring it early hands the next item a wire whose
+    /// terminating state (the RFQ a client reads at the end of the pipeline task) is unsettled. We
+    /// settle trailing, leave the pipeline task pending, and assert the item stays in-flight until the
+    /// pipeline task also settles.
+    [TestMethod]
+    public async Task CompleteItem_LatchesOnBothTasks_NotTrailingAlone()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        // CompleteAsync => pipeline task is TCS-gated (CompletePipelineTask); HasTrailingTask =>
+        // trailing task is separately TCS-gated (CompleteTrailingTask).
+        var item = new TestPipelineItem { CompleteAsync = true, HasTrailingTask = true };
+        pipeline.Enqueue(item).Execute();
+        await item.WaitForExecutedAsync();
+
+        // Settle ONLY the trailing task. The pipeline task is still in flight.
+        item.CompleteTrailingTask();
+
+        Assert.IsFalse(await item.TryWaitForCompletedAsync(TimeSpan.FromMilliseconds(250)),
+            "CompleteItem fired after trailing settled while the pipeline task was still pending - " +
+            "completion latched on trailing alone instead of both tasks.");
+
+        // Settling the pipeline task releases completion.
+        item.CompletePipelineTask();
+        await item.WaitForCompleteAsync();
+    }
+
     /// Enqueue after CompleteAsync must throw - the wake signal is completed and the pipeline
     /// is shutting down, accepting new items would lose them in the drain.
     [TestMethod]

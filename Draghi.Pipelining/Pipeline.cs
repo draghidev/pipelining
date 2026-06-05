@@ -210,15 +210,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     goto afterItem;
                 }
 
-                if (itemResult.PipelineTask.IsCompletedSuccessfully)
+                // Sync shortcut: only taken when both tasks are already observed successful at dispatch
+                // time. Items with a non-default trailing task fall through to the tail-waiter path until
+                // their trailing is also sync-complete (default(ValueTask) is success, so items without a
+                // trailing keep the fast path). This is how the framework guarantees CompleteWaiter doesn't
+                // fire before trailing is observed.
+                if (itemResult.PipelineTask.IsCompletedSuccessfully && itemResult.TrailingExecutionTask.IsCompletedSuccessfully)
                 {
                     itemResult.PipelineTask.GetAwaiter().GetResult();
                     ClearExecutingItem(activated);
                     CompleteWaiter(item, null);
                 }
-                else if (itemResult.PipelineTask.IsCompleted)
+                else if (itemResult.PipelineTask.IsCompleted && !itemResult.PipelineTask.IsCompletedSuccessfully)
                 {
-                    // Pipeline task faulted synchronously.
+                    // Pipeline task faulted synchronously. Recovery path. Trailing fate is
+                    // handled separately below.
                     ClearExecutingItem(activated);
                     try
                     {
@@ -229,14 +235,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                         await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), activated, _completionCts.Token).ConfigureAwait(false);
                         goto afterItem;
                     }
-
-                    CompleteWaiter(item, null);
                 }
                 else
                 {
-                    // Pending: store as tail for the next iteration. Publish via Volatile.Write
-                    // on _hasTailWaiter so cross-thread readers (Enumerator) that acquire-read the
-                    // flag see the prior _tailWaiter / _tailWaiterTask writes (release-acquire pair).
+                    // Tail waiter path. Either pipeline task is pending, or it's sync-complete
+                    // but trailing is pending/faulted. Either way, completion must be gated on
+                    // both. The framework's trailing-await below stalls the executor before
+                    // next iteration's CommitTailWaiter, which is what fires CompleteWaiter for
+                    // this item. So trailing is structurally observed before completion.
                     _tailWaiter = item;
                     _tailWaiterTask = itemResult.PipelineTask;
                     Volatile.Write(ref _hasTailWaiter, true);
