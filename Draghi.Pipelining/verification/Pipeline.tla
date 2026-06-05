@@ -1,24 +1,28 @@
 ------------------------------- MODULE Pipeline -------------------------------
-(* TLA+ model of the Draghi.Pipelining executor/advancer/callback protocol.
+(* TLA+ model of the source-driven Draghi.Pipelining executor/advancer/callback protocol.
+
+   The queue variant of Pipeline is verified separately and known correct; this spec
+   targets the source-driven variant where the pipeline consumes from an
+   IPipelineSource<T, TEnumerator> via `await foreach`. The source owns item storage
+   and idle/wake semantics; the pipeline just consumes. Slon's idle handoff
+   collapses into the source's MoveNextAsync logic.
 
    Captures:
-     1. FIFO ordering on _queue and _waiters (sequences).
+     1. FIFO ordering on _waiters (sequence).
      2. The do-while retry in DrainReadyWaiters (TryReclaimAdvancerForWork) -
         the mechanism that heals stranded callback increments.
-     3. Inline OnWaiterTaskCompleted from EnqueueWaiter (line 641) when
-        wasEmpty and task already completed.
+     3. The inline-callback race in EnqueueWaiter when task already completed.
      4. Weak-memory toggles on the deferred-publish handshake and advancer-latch
         release (see WeakMemory.tla).
      5. Explicit fairness so liveness checks are meaningful.
 
    Safety invariants:
      - ItemConservation: every item is in exactly one bucket.
-     - QueueCountConsistency: _waiterQueueCount = Len(waiters) (approximately,
-       accounting for in-flight increments).
+     - QueueCountConsistency: _waiterQueueCount = Len(waiters).
      - NoTripleActivation: activations[i] <= 2 for all i.
 
    Liveness:
-     - EventuallyCompleted: every enqueued item with a completed task is
+     - EventuallyCompleted: every yielded item with a completed task is
        eventually drained to Completed (under fair scheduling).
 *)
 
@@ -28,7 +32,7 @@ CONSTANTS
   NumItems,
   WeakAdvancerRelease,    \* TRUE: AdvancerRelease modeled as Volatile.Write (visibility delay).
                              \* FALSE: modeled as Interlocked.Exchange (immediate global visibility).
-  WeakHasExecutingPublish,\* TRUE: ExecDequeueDeferred's set-to-TRUE on _hasExecutingItem is
+  WeakHasExecutingPublish,\* TRUE: SourceYieldDeferred's set-to-TRUE on _hasExecutingItem is
                              \* Volatile.Write (release-only, no global fence). FALSE: Interlocked.Exchange.
   IsReferenceT               \* TRUE: T is a reference type (GC write barrier guarantees release-fence
                              \* on plain reference writes). FALSE: T is a value type (no implicit fence).
@@ -54,33 +58,32 @@ VARIABLES
   advancing,
   advancingVisible,
 
-  \* Counters: queue length, completed-but-not-drained.
+  \* Counters: waiter queue length, completed-but-not-drained.
   queueCount,
   completedCount,
 
-  \* Queues, FIFO.
-  waiters,
-  queue
+  \* Waiter queue, FIFO.
+  waiters
 
 \* Variable groupings - used as `UNCHANGED group_name` in action bodies for compactness.
 publish_vars == <<executingItem, executingItemVisible, hasExecuting, hasExecutingVisible>>
 tail_vars    == <<tailWaiter, hasTail>>
 adv_vars     == <<advancing, advancingVisible>>
 counters     == <<queueCount, completedCount>>
-queues       == <<waiters, queue>>
 item_vars    == <<loc, taskDone, activations, callbackFired>>
 
 vars == <<loc, taskDone, activations, callbackFired,
           executingItem, executingItemVisible, hasExecuting, hasExecutingVisible,
           tailWaiter, hasTail, advancing, advancingVisible, queueCount, completedCount,
-          waiters, queue>>
+          waiters>>
 
 Item == 1..NumItems
 NoItem == 0
 \* InWaitersPending: transient state inside EnqueueWaiter between _waiters.Enqueue (count incremented)
 \* and either the inline OnWaiterTaskCompleted call (if wasEmpty && task done) or callback registration.
 \* During this window, CompleteTask can fire and turn the would-be register into an inline callback.
-Locations == {"Nowhere", "InQueue", "Executing", "InTail", "InWaitersPending", "InWaiters", "Completed"}
+\* Nowhere: not yet yielded by the source.
+Locations == {"Nowhere", "Executing", "InTail", "InWaitersPending", "InWaiters", "Completed"}
 
 (* ===========================================================================
    Init
@@ -101,7 +104,6 @@ Init ==
   /\ queueCount = 0
   /\ completedCount = 0
   /\ waiters = <<>>
-  /\ queue = <<>>
   /\ callbackFired = {}
 
 (* ===========================================================================
@@ -111,49 +113,42 @@ Init ==
 WaiterHead == IF Len(waiters) > 0 THEN Head(waiters) ELSE NoItem
 
 (* ===========================================================================
-   External actions: enqueue and task completion
+   External actions: task completion
    =========================================================================== *)
-
-\* Enqueue from the producer thread.
-Enqueue(i) ==
-  /\ loc[i] = "Nowhere"
-  /\ loc' = [loc EXCEPT ![i] = "InQueue"]
-  /\ queue' = Append(queue, i)
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters,
-                 taskDone, activations, callbackFired, waiters>>
 
 \* Test thread sets pipelineTask result.
 CompleteTask(i) ==
   /\ i \notin taskDone
   /\ loc[i] \in {"Executing", "InTail", "InWaitersPending", "InWaiters"}
   /\ taskDone' = taskDone \cup {i}
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, queues,
-                 loc, activations, callbackFired>>
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters,
+                 loc, activations, callbackFired, waiters>>
 
 (* ===========================================================================
-   Executor actions: dequeue + activation decision
+   Executor actions: source yield + activation decision
    =========================================================================== *)
 
-\* Executor dequeues with no existing waiters - inline activation.
-ExecDequeueInline ==
-  /\ Len(queue) > 0
+\* Source yields next item with no existing waiters - inline activation.
+\* The source's MoveNextAsync is the wait; when it returns, we're already in the
+\* executor with an item ready to dispatch. No queue, no wake signal.
+SourceYieldInline ==
   /\ queueCount = 0
-  /\ ~hasTail  \* tail must be committed before next dequeue
-  /\ \A i \in Item : loc[i] # "Executing"  \* executor is sequential, one item in flight at a time
-  /\ LET i == Head(queue) IN
+  /\ ~hasTail  \* tail must be committed before next yield
+  /\ \A i \in Item : loc[i] # "Executing"  \* executor is sequential
+  /\ \E i \in Item :
+       /\ loc[i] = "Nowhere"  \* item not yet yielded by source
        /\ loc' = [loc EXCEPT ![i] = "Executing"]
        /\ activations' = [activations EXCEPT ![i] = @ + 1]
-       /\ queue' = Tail(queue)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters,
                  taskDone, callbackFired, waiters>>
 
-\* Executor dequeues with existing waiters - deferred publish.
-ExecDequeueDeferred ==
-  /\ Len(queue) > 0
+\* Source yields next item with existing waiters - deferred publish.
+SourceYieldDeferred ==
   /\ queueCount > 0
   /\ ~hasTail
   /\ \A i \in Item : loc[i] # "Executing"
-  /\ LET i == Head(queue) IN
+  /\ \E i \in Item :
+       /\ loc[i] = "Nowhere"
        /\ loc' = [loc EXCEPT ![i] = "Executing"]
        \* Reference write: ref-T gets GC barrier release (fenced); value-T gets plain STR (relaxed).
        /\ IF IsReferenceT
@@ -162,7 +157,6 @@ ExecDequeueDeferred ==
        /\ IF WeakHasExecutingPublish
             THEN WeakWriteOk(hasExecuting', hasExecutingVisible', TRUE, hasExecutingVisible)
             ELSE FencedWriteOk(hasExecuting', hasExecutingVisible', TRUE)
-       /\ queue' = Tail(queue)
   /\ UNCHANGED <<tail_vars, adv_vars, counters,
                  taskDone, activations, callbackFired, waiters>>
 
@@ -173,7 +167,7 @@ ExecSetTail ==
     /\ loc' = [loc EXCEPT ![i] = "InTail"]
     /\ tailWaiter' = i
     /\ hasTail' = TRUE
-    /\ UNCHANGED <<publish_vars, adv_vars, counters, queues,
+    /\ UNCHANGED <<publish_vars, adv_vars, counters, waiters,
                    taskDone, activations, callbackFired>>
 
 (* ===========================================================================
@@ -206,7 +200,7 @@ ExecCommitTailExecutorWins ==
                               THEN [activations EXCEPT ![i] = @ + 1]
                               ELSE activations
             /\ completedCount' = completedCount
-  /\ UNCHANGED <<adv_vars, taskDone, queue, callbackFired>>
+  /\ UNCHANGED <<adv_vars, taskDone, callbackFired>>
 
 \* CommitTailWaiter, advancer won (alreadyActivated = true). Executor skips _executingItem clear.
 ExecCommitTailExecutorLoses ==
@@ -228,7 +222,7 @@ ExecCommitTailExecutorLoses ==
             /\ queueCount' = queueCount + 1
             /\ activations' = activations
             /\ completedCount' = completedCount
-  /\ UNCHANGED <<publish_vars, adv_vars, taskDone, queue, callbackFired>>
+  /\ UNCHANGED <<publish_vars, adv_vars, taskDone, callbackFired>>
 
 (* Inline-callback race in EnqueueWaiter: at the post-Enqueue check, if task is already done
    the executor fires OnWaiterTaskCompleted inline; otherwise it registers a callback that
@@ -240,7 +234,7 @@ ExecutorRegistersCallback ==
     /\ loc[i] = "InWaitersPending"
     /\ i \notin taskDone
     /\ loc' = [loc EXCEPT ![i] = "InWaiters"]
-    /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, queues,
+    /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, waiters,
                    taskDone, activations, callbackFired>>
 
 ExecutorInlineCallbackBecomesAdvancer ==
@@ -254,7 +248,7 @@ ExecutorInlineCallbackBecomesAdvancer ==
     /\ completedCount' = completedCount + 1
     /\ advancing' = TRUE
     /\ advancingVisible' = TRUE
-    /\ UNCHANGED <<publish_vars, tail_vars, queues,
+    /\ UNCHANGED <<publish_vars, tail_vars, waiters,
                    taskDone, activations, queueCount>>
 
 ExecutorInlineCallbackBailsOut ==
@@ -266,7 +260,7 @@ ExecutorInlineCallbackBailsOut ==
     /\ loc' = [loc EXCEPT ![i] = "InWaiters"]
     /\ callbackFired' = callbackFired \cup {i}
     /\ completedCount' = completedCount + 1
-    /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, queues,
+    /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, waiters,
                    taskDone, activations, queueCount>>
 
 (* ===========================================================================
@@ -284,7 +278,7 @@ CallbackBecomesAdvancer ==
     /\ advancingVisible' = TRUE
     /\ completedCount' = completedCount + 1
     /\ callbackFired' = callbackFired \cup {i}
-    /\ UNCHANGED <<publish_vars, tail_vars, queues,
+    /\ UNCHANGED <<publish_vars, tail_vars, waiters,
                    loc, taskDone, activations, queueCount>>
 
 CallbackBailsOut ==
@@ -295,7 +289,7 @@ CallbackBailsOut ==
     /\ advancingVisible
     /\ completedCount' = completedCount + 1
     /\ callbackFired' = callbackFired \cup {i}
-    /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, queues,
+    /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, waiters,
                    loc, taskDone, activations, queueCount>>
 
 (* ===========================================================================
@@ -318,7 +312,7 @@ AdvancerDrainHead ==
                          THEN [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
                          ELSE activations
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars,
-                 taskDone, queue, callbackFired>>
+                 taskDone, callbackFired>>
 
 \* Advancer at count=0, executes C-path activation under lock.
 AdvancerCPath ==
@@ -333,7 +327,7 @@ AdvancerCPath ==
        /\ hasExecutingVisible' = FALSE
        /\ executingItem' = NoItem
        /\ executingItemVisible' = NoItem
-  /\ UNCHANGED <<tail_vars, adv_vars, counters, queues,
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, waiters,
                  loc, taskDone, callbackFired>>
 
 \* Advancer release (line 736 or TryReclaim's line 753). Toggle picks Volatile.Write vs Exchange.
@@ -345,7 +339,7 @@ AdvancerRelease ==
   /\ IF WeakAdvancerRelease
        THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
        ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
-  /\ UNCHANGED <<publish_vars, tail_vars, counters, queues,
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, waiters,
                  loc, taskDone, activations, callbackFired>>
 
 \* TryReclaimAdvancerForWork's acquire: Interlocked.Exchange (seq-cst).
@@ -356,7 +350,7 @@ AdvancerReclaim ==
   /\ Head(waiters) \in taskDone
   /\ advancing' = TRUE
   /\ advancingVisible' = TRUE
-  /\ UNCHANGED <<publish_vars, tail_vars, counters, queues,
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, waiters,
                  loc, taskDone, activations, callbackFired>>
 
 \* Visibility-propagation transitions for the *Visible shadow fields. Only fire when the
@@ -364,19 +358,19 @@ AdvancerReclaim ==
 PropagateAdvancing ==
   /\ advancing # advancingVisible
   /\ PropagateOk(advancing, advancingVisible')
-  /\ UNCHANGED <<publish_vars, tail_vars, counters, queues,
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, waiters,
                  loc, taskDone, activations, advancing, callbackFired>>
 
 PropagateHasExecuting ==
   /\ hasExecuting # hasExecutingVisible
   /\ PropagateOk(hasExecuting, hasExecutingVisible')
-  /\ UNCHANGED <<tail_vars, adv_vars, counters, queues,
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, waiters,
                  loc, taskDone, activations, executingItem, executingItemVisible, hasExecuting, callbackFired>>
 
 PropagateExecutingItem ==
   /\ executingItem # executingItemVisible
   /\ PropagateOk(executingItem, executingItemVisible')
-  /\ UNCHANGED <<tail_vars, adv_vars, counters, queues,
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, waiters,
                  loc, taskDone, activations, executingItem, hasExecuting, hasExecutingVisible, callbackFired>>
 
 (* ===========================================================================
@@ -384,10 +378,9 @@ PropagateExecutingItem ==
    =========================================================================== *)
 
 Next ==
-  \/ \E i \in Item : Enqueue(i)
   \/ \E i \in Item : CompleteTask(i)
-  \/ ExecDequeueInline
-  \/ ExecDequeueDeferred
+  \/ SourceYieldInline
+  \/ SourceYieldDeferred
   \/ ExecSetTail
   \/ ExecCommitTailExecutorWins
   \/ ExecCommitTailExecutorLoses
@@ -406,7 +399,7 @@ Next ==
 
 Spec == Init /\ [][Next]_vars
         \* Fairness: assume the executor and advancer chain make progress.
-        /\ WF_vars(ExecDequeueInline \/ ExecDequeueDeferred)
+        /\ WF_vars(SourceYieldInline \/ SourceYieldDeferred)
         /\ WF_vars(ExecSetTail)
         /\ WF_vars(ExecCommitTailExecutorWins \/ ExecCommitTailExecutorLoses)
         /\ WF_vars(AdvancerDrainHead)
@@ -448,15 +441,23 @@ NoTripleActivation ==
 WaitersConsistent ==
   /\ \A i \in Item : (loc[i] \in {"InWaitersPending", "InWaiters"}) <=> (\E k \in 1..Len(waiters) : waiters[k] = i)
 
+\* Combined safety invariants. Single name keeps the .cfg simple and makes adding a new
+\* invariant a one-file change rather than a two-file change.
+Invariants ==
+  /\ TypeOK
+  /\ QueueCountConsistency
+  /\ NoTripleActivation
+  /\ WaitersConsistent
+
 (* ===========================================================================
    Liveness
    =========================================================================== *)
 
-\* Every item that gets enqueued and has its task completed should eventually
+\* Every item that gets yielded and has its task completed should eventually
 \* reach Completed. (For items whose task is never completed, no expectation.)
 EventuallyCompleted ==
   \A i \in Item :
-    (loc[i] \in {"InQueue", "Executing", "InTail", "InWaitersPending", "InWaiters"} /\ i \in taskDone)
+    (loc[i] \in {"Executing", "InTail", "InWaitersPending", "InWaiters"} /\ i \in taskDone)
       ~> (loc[i] = "Completed")
 
 (* ===========================================================================
@@ -474,8 +475,11 @@ EventuallyCompleted ==
    3. Multiple concurrent callback firings - the model fires one at a time;
       real callbacks can interleave with each other and with the advancer.
 
-   4. WakeSignal park/wake mechanics - currently the executor can fire any
-      transition any time; real code requires queue non-empty or signal pending.
+   4. Source-side gating and pacing - the source's MoveNextAsync can defer
+      yielding for reasons the pipeline doesn't see (backpressure, transaction
+      state, connection state). Modeling this as a SourceGate predicate that
+      blocks SourceYield* would let us verify properties like "the pipeline
+      makes progress whenever the source is willing to yield."
 
    5. Recovery flow (RecoverWaiter, _waiterRecoveryItem) - significant added
       state but covers a real bug class.

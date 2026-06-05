@@ -5,8 +5,10 @@ using System.Runtime.CompilerServices;
 namespace Draghi.Pipelining;
 
 /// <summary>
-/// Single-producer, single-consumer pipelined request/response coordinator. The class is not
-/// thread-safe. All public instance methods (<see cref="Enqueue"/>, <see cref="CompleteAsync"/>,
+/// Source-driven pipelined request/response coordinator. Consumes items from an
+/// <see cref="IPipelineSource{T,TEnumerator}"/> via <c>await foreach</c> and processes each
+/// through the policy's lifecycle (execute/activate/complete/recover). The class is not
+/// thread-safe. All public instance methods (<see cref="CompleteAsync"/>,
 /// <see cref="GetEnumerator"/>, the <see cref="Depth"/> getter,
 /// <see cref="CompletionToken"/>) must be invoked from a single caller at a time. Concurrent
 /// calls produce undefined results (stale signals, missed completions). Callers needing
@@ -21,15 +23,17 @@ namespace Draghi.Pipelining;
 /// Adding piecemeal thread safety to individual methods is worse than committing to either pure
 /// stance, so we don't.
 /// </remarks>
-public sealed class Pipeline<T, TPolicy>
+public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     where TPolicy : IPipelinePolicy<T>
+    where TSource : IPipelineSource<T, TEnumerator>
+    where TEnumerator : struct, IAsyncEnumerator<T>
 {
     TPolicy _policy;
+    TSource _source;
+    TEnumerator _enumerator;
 
     // Execution.
-    readonly SingleProducerSingleConsumerQueue<Element> _queue;
-    bool _notEmpty; // Set by Enqueue before the queue write, checked by the executor under the wake lock.
-    readonly Pipeline.WakeSignal _wakeSignal;
+    readonly CancellationTokenSource _completionCts;
     readonly Task _executionTask;
     // Pipeline state.
     bool _completing; // First-writer guard for CompleteAsync.
@@ -59,16 +63,25 @@ public sealed class Pipeline<T, TPolicy>
 
     // Activation.
     readonly Action _onWaiterTaskCompletedAction;
+    readonly Action _incrementDepthAction;
 
-    internal Pipeline(TPolicy policy)
+    internal Pipeline(TPolicy policy, TSource source)
     {
         _policy = policy;
-        _queue = new();
+        _source = source;
+        _completionCts = new();
         _waiters = new();
-        _wakeSignal = new(policy.RunEnqueueAsynchronously, policy.ExecutionScheduler ?? PipelineScheduler.ThreadPool);
         _onWaiterTaskCompletedAction = OnWaiterTaskCompleted;
-        _executionTask = ExecuteQueue();
+        _incrementDepthAction = IncrementDepth;
+        // AttachDepthHook before GetAsyncEnumerator: a source could legally start producing items
+        // (or accept producer enqueues) the moment an enumerator exists, and we need the hook
+        // wired so the very first admission lands in _depthState.
+        _source.AttachDepthHook(_incrementDepthAction);
+        _enumerator = _source.GetAsyncEnumerator(_completionCts.Token);
+        _executionTask = ExecuteSource();
     }
+
+    void IncrementDepth() => _depthState.IncrementDepth();
 
     // Off the hot path (advancer/recovery handoff), so OS handoff on contention is preferable.
     readonly Lock _activationLock = new();
@@ -79,47 +92,23 @@ public sealed class Pipeline<T, TPolicy>
     /// to abort them on shutdown. The same token is delivered to <see cref="IPipelinePolicy{T}.ExecuteItemAsync"/>
     /// and <see cref="IPipelinePolicy{T}.OnExecutionIdleAsync"/>. Policies should observe it to allow shutdown to proceed.
     /// </summary>
-    public CancellationToken CompletionToken => _wakeSignal.CompletionToken;
+    public CancellationToken CompletionToken => _completionCts.Token;
 
     /// <summary>Current count of items in the pipeline (queued + in flight + waiting). Lock-free read,
     /// may be stale by the time the caller observes it. Use <see cref="WaitForEmptyAsync"/> to await depth zero.</summary>
     public int Depth => _depthState.Depth;
 
     /// <summary>
-    /// Enqueues an item for processing. Returns an <see cref="Pipeline.EnqueueResult"/> whose
-    /// <see cref="Pipeline.EnqueueResult.Execute"/> must be invoked (outside any held lock) to signal
-    /// the execution loop. Discarding the result strands the item until the next enqueue/wake.
-    /// </summary>
-    /// <exception cref="InvalidOperationException">Thrown if the pipeline has already been completed via <see cref="CompleteAsync"/>.</exception>
-    public Pipeline.EnqueueResult Enqueue(T item)
-    {
-        if (_wakeSignal.IsCompleted)
-            ThrowCompleted();
-
-        // IncrementDepth BEFORE _queue.Enqueue keeps depth a strict upper bound. Otherwise the
-        // executor could dequeue and decrement first, producing a negative remainingDepth in
-        // CompleteItem and skipping OnDepthReachedZero's fire.
-        _depthState.IncrementDepth();
-        // Plain write, ordered by the SPSC queue's volatile write of _last. The executor's
-        // wake-lock acquire is the cross-thread fence on the reading side.
-        _notEmpty = true;
-        _queue.Enqueue(new(item));
-
-        return new(_wakeSignal);
-    }
-
-    /// <summary>
     /// Waits for the pipeline depth to reach zero (all items have received
-    /// <see cref="IPipelinePolicy{T}.CompleteItem"/>). Does not prevent new items from being enqueued.
-    /// The caller is responsible for that.
+    /// <see cref="IPipelinePolicy{T}.CompleteItem"/>). Does not prevent new items from being yielded
+    /// by the source.
     /// </summary>
     /// <remarks>
     /// This is a pipeline-state query, not an executor-quiescence guarantee. The signal fires from
     /// inside <see cref="IPipelinePolicy{T}.CompleteItem"/>, so the executor may still be inside its
     /// inner drain loop and threadpool-resident advancer continuations may still be unwinding when
-    /// this returns. Callers needing executor-side quiescence (e.g. asserting on per-batch policy
-    /// callbacks) should observe <see cref="IPipelinePolicy{T}.OnExecutionIdleAsync"/> via the policy
-    /// itself. For strict "fully quiet" GC-collectability semantics use <see cref="CompleteAsync"/>.
+    /// this returns. For strict "fully quiet" GC-collectability semantics use
+    /// <see cref="CompleteAsync"/>.
     /// </remarks>
     internal ValueTask WaitForEmptyAsync(CancellationToken cancellationToken = default)
         => _depthState.GetIdleTask(cancellationToken);
@@ -146,7 +135,7 @@ public sealed class Pipeline<T, TPolicy>
             return new(_executionTask);
 
         _completionException = exception;
-        _wakeSignal.Complete();
+        _completionCts.Cancel();
 
         // The executor drains remaining items on exit. Await it for full completion.
         return new(_executionTask);
@@ -163,38 +152,32 @@ public sealed class Pipeline<T, TPolicy>
     /// </remarks>
     public Enumerator GetEnumerator() => new(this);
 
-    async Task ExecuteQueue()
+    async Task ExecuteSource()
     {
-        var needsYieldAfterFirst = true;
-        // Promoted out of the inner loop so the pre-idle clear below can null them out.
-        // Roslyn won't properly clear them when leaving scope via a goto otherwise.
-        Element element;
+        // Promoted out of the loop so the post-loop clear below can null them out.
         T item;
         PipelineItemResult itemResult;
-        while (!_wakeSignal.IsCompleted)
+        try
         {
-            _wakeSignal.AcquireWakeLock();
-            _notEmpty = false;
-            if (_queue.IsEmpty && !_notEmpty)
+            // The CTS-cancelled check belongs to the source's MoveNextAsync, not here: even after
+            // CompleteAsync fires, items admitted before Complete() must still be processed. The
+            // source returns false once its queue is empty and its wake signal is completed.
+            while (true)
             {
-                // Lock held through OnCompleted which releases it after storing the continuation.
-                if (!await _wakeSignal.WaitUnsynchronized())
-                    break;
-            }
-            else
-            {
-                _wakeSignal.ReleaseWakeLock();
-            }
-
-            while (!_wakeSignal.IsCompleted && _queue.TryDequeue(out element))
-            {
-                // Commit the previous iteration's pending tail to the waiter queue. CommitTailWaiter
-                // is sync in all paths except trailing recovery, where it returns a Task to await.
+                // Commit the previous iteration's pending tail to the waiter queue BEFORE parking
+                // on MoveNextAsync. If the source has nothing more to yield, the tail would
+                // otherwise sit in _tailWaiter forever with no UnsafeOnCompleted callback wired,
+                // and a producer that completes its pipeline task would have nobody listening.
+                // CommitTailWaiter is sync in all paths except trailing recovery, where it
+                // returns a Task to await.
                 var commitWork = CommitTailWaiter();
                 if (commitWork is not null)
                     await commitWork.ConfigureAwait(false);
 
-                item = element.Value;
+                if (!await _enumerator.MoveNextAsync().ConfigureAwait(false))
+                    break;
+
+                item = _enumerator.Current;
 
                 var activated = false;
                 if (Volatile.Read(ref _waiterQueueCount) is 0)
@@ -214,12 +197,12 @@ public sealed class Pipeline<T, TPolicy>
 
                 try
                 {
-                    itemResult = await _policy.ExecuteItemAsync(item, _wakeSignal.CompletionToken).ConfigureAwait(false);
+                    itemResult = await _policy.ExecuteItemAsync(item, _completionCts.Token).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     ClearExecutingItem(activated);
-                    await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), activated, _wakeSignal.CompletionToken).ConfigureAwait(false);
+                    await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), activated, _completionCts.Token).ConfigureAwait(false);
                     goto afterItem;
                 }
 
@@ -239,7 +222,7 @@ public sealed class Pipeline<T, TPolicy>
                     }
                     catch (Exception ex)
                     {
-                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), activated, _wakeSignal.CompletionToken).ConfigureAwait(false);
+                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), activated, _completionCts.Token).ConfigureAwait(false);
                         goto afterItem;
                     }
 
@@ -265,68 +248,37 @@ public sealed class Pipeline<T, TPolicy>
                     {
                         if (_hasTailWaiter)
                         {
-                            await RecoverTrailingFailure(item, activated, ex, _wakeSignal.CompletionToken).ConfigureAwait(false);
+                            await RecoverTrailingFailure(item, activated, ex, _completionCts.Token).ConfigureAwait(false);
                         }
                     }
                 }
 
                 afterItem:
-                if (needsYieldAfterFirst)
-                {
-                    needsYieldAfterFirst = false;
-                    if (_queue.IsEmpty)
-                        break;
-
-                    var yieldTask = _policy.YieldAfterFirstItem();
-                    if (yieldTask != default)
-                        await yieldTask.ConfigureAwait(false);
-                }
+                ;
             }
 
             // Clear the locals so the executor's async state machine box does not
-            // retain the last-processed item and its tasks across the park.
+            // retain the last-processed item and its tasks across termination.
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-            {
                 item = default!;
-                element = default;
-            }
             itemResult = default;
-
-            // Commit any remaining tail before going idle. If the tail needs recovery, the
-            // executor awaits the inline recovery flow here. OnExecutionIdleAsync below
-            // observes a fully-drained tail state, idle truly means idle.
-            var preIdleCommit = CommitTailWaiter();
-            if (preIdleCommit is not null)
-                await preIdleCommit.ConfigureAwait(false);
-
-            // No pre-idle queue probe: the wake signal is the floor for every drain/park race,
-            // so any extra check would be redundant work that the signal catches anyway.
-            // Callers needing strict ordering with idle handoff must synchronize externally.
-            try
-            {
-                var idleTask = _policy.OnExecutionIdleAsync(_wakeSignal.CompletionToken);
-                if (idleTask != default)
-                    await idleTask.ConfigureAwait(false);
-            }
-            catch (Exception ex)
-            {
-                _ = CompleteAsync(ex);
-                // Drain, then throw so _executionTask faults and callers observe the failure.
-                await DrainOnCompletionAsync();
-                throw;
-            }
-
-            needsYieldAfterFirst = true;
+            // No post-loop CommitTailWaiter needed: the top-of-loop commit already ran before the
+            // MoveNextAsync that returned false.
+        }
+        catch (OperationCanceledException) when (_completionCts.IsCancellationRequested)
+        {
+            // Source's MoveNextAsync threw OCE on shutdown, expected.
         }
 
         await DrainOnCompletionAsync();
+        await _enumerator.DisposeAsync().ConfigureAwait(false);
     }
 
     /// Drains remaining items after the execution loop exits. Waits for the advancer chain to
     /// quiesce via a TCS that DrainReadyWaiters / BailoutRecoveryOnShutdown signal on release of
     /// _advancing. Recovery continuations always complete their own items (via CompleteRecoveryWaiter
     /// or BailoutRecoveryOnShutdown), so drain doesn't compete, it just waits for the chain to
-    /// finish. After advancer-idle, drains _waiters and _queue.
+    /// finish. After advancer-idle, drains _waiters.
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask DrainOnCompletionAsync()
     {
@@ -348,8 +300,6 @@ public sealed class Pipeline<T, TPolicy>
         var exception = _completionException;
         while (_waiters.TryDequeue(out var item))
             CompleteWaiter(item.Waiter, exception);
-        while (_queue.TryDequeue(out var item))
-            CompleteWaiter(item.Value, exception);
     }
 
     /// Handles execution-phase or pipeline-task failures, including recovery.
@@ -367,7 +317,7 @@ public sealed class Pipeline<T, TPolicy>
         ActivateHeadItem(recoveryItem, preferAsync: false);
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
                 await result.TrailingExecutionTask.ConfigureAwait(false);
@@ -437,7 +387,7 @@ public sealed class Pipeline<T, TPolicy>
 
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
             {
@@ -553,7 +503,7 @@ public sealed class Pipeline<T, TPolicy>
         }
 
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, exception);
-        if (!_policy.TryRecoverItemFailure(context, item, _wakeSignal.CompletionToken, out var recoveryItem))
+        if (!_policy.TryRecoverItemFailure(context, item, _completionCts.Token, out var recoveryItem))
         {
             CompleteWaiter(item, exception);
             return;
@@ -564,7 +514,7 @@ public sealed class Pipeline<T, TPolicy>
         PipelineItemResult result;
         try
         {
-            result = await _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken).ConfigureAwait(false);
+            result = await _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token).ConfigureAwait(false);
         }
         catch (Exception recoveryEx)
         {
@@ -599,7 +549,7 @@ public sealed class Pipeline<T, TPolicy>
             }
             CompleteWaiter(recoveryItem, pipelineException);
         }
-        else if (_wakeSignal.IsCompleted)
+        else if (_completionCts.IsCancellationRequested)
         {
             // Pipeline shutdown while recovery's async work was in flight. EnqueueWaiter at this
             // point would leak: OnWaiterTaskCompleted bails on wake completion, and DrainOnCompletionAsync
@@ -656,7 +606,7 @@ public sealed class Pipeline<T, TPolicy>
 
         // Try to become the advancer, only one thread processes completions at a time.
         // Don't acquire if completed, CompleteAsync will drain remaining items.
-        if (_wakeSignal.IsCompleted || !_advancing.TryAcquire())
+        if (_completionCts.IsCancellationRequested || !_advancing.TryAcquire())
             return;
 
         DrainReadyWaiters();
@@ -742,7 +692,7 @@ public sealed class Pipeline<T, TPolicy>
             // is safe: sandwiched between this release and TryReclaimAdvancerForWork's acquire,
             // both full barriers via Latch's underlying Interlocked.Exchange.
             _advancing.Release();
-        } while (!_wakeSignal.IsCompleted && _waiterCompletedCount > 0 && TryReclaimAdvancerForWork());
+        } while (!_completionCts.IsCancellationRequested && _waiterCompletedCount > 0 && TryReclaimAdvancerForWork());
 
         SignalAdvancerIdleIfWaiting();
 
@@ -782,7 +732,7 @@ public sealed class Pipeline<T, TPolicy>
         }
 
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTaskWaiter, ex);
-        if (!_policy.TryRecoverItemFailure(context, failedItem, _wakeSignal.CompletionToken, out var recoveryItem))
+        if (!_policy.TryRecoverItemFailure(context, failedItem, _completionCts.Token, out var recoveryItem))
         {
             CompleteWaiter(failedItem, ex);
             return true;
@@ -794,7 +744,7 @@ public sealed class Pipeline<T, TPolicy>
         ValueTask<PipelineItemResult> executeTask;
         try
         {
-            executeTask = _policy.ExecuteItemAsync(recoveryItem, _wakeSignal.CompletionToken);
+            executeTask = _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token);
         }
         catch (Exception recoveryEx)
         {
@@ -817,7 +767,7 @@ public sealed class Pipeline<T, TPolicy>
         executeTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
         {
             // Bailout: wake signal completed while recovery's executeTask was in flight.
-            if (_wakeSignal.IsCompleted)
+            if (_completionCts.IsCancellationRequested)
             {
                 try { executeTask.GetAwaiter().GetResult(); }
                 catch { /* shutdown in progress, exception observed and discarded */ }
@@ -871,7 +821,7 @@ public sealed class Pipeline<T, TPolicy>
                     catch (Exception ex) { trailingEx = ex; }
 
                     // Bailout: wake signal completed while recovery's trailing task was in flight.
-                    if (_wakeSignal.IsCompleted)
+                    if (_completionCts.IsCancellationRequested)
                     {
                         BailoutRecoveryOnShutdown();
                         return;
@@ -926,7 +876,7 @@ public sealed class Pipeline<T, TPolicy>
             {
                 pipelineException = ex;
             }
-            if (_wakeSignal.IsCompleted)
+            if (_completionCts.IsCancellationRequested)
             {
                 // Bailout: wake signal completed while recovery's pipeline task was in flight.
                 BailoutRecoveryOnShutdown();
@@ -1051,13 +1001,12 @@ public sealed class Pipeline<T, TPolicy>
 
     public struct Enumerator
     {
-        readonly Pipeline<T, TPolicy> _pipeline;
+        readonly Pipeline<T, TPolicy, TSource, TEnumerator> _pipeline;
         SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)>.Enumerator _waitersEnumerator;
-        SingleProducerSingleConsumerQueue<Element>.Enumerator _queueEnumerator;
-        // 0: init waiters, 1: enumerate waiters, 2: tail waiter, 3: init queue, 4: enumerate queue, 5: done
+        // 0: init waiters, 1: enumerate waiters, 2: tail waiter, 3: done
         int _phase;
 
-        internal Enumerator(Pipeline<T, TPolicy> pipeline)
+        internal Enumerator(Pipeline<T, TPolicy, TSource, TEnumerator> pipeline)
         {
             _pipeline = pipeline;
         }
@@ -1094,158 +1043,31 @@ public sealed class Pipeline<T, TPolicy>
                         Current = tail;
                         return true;
                     }
-                    goto case 3;
-                case 3:
-                    _queueEnumerator = new(_pipeline._queue);
-                    _phase = 4;
-                    goto case 4;
-                case 4:
-                    while (_queueEnumerator.MoveNext())
-                    {
-                        if (_queueEnumerator.Current.Value is { } queued)
-                        {
-                            Current = queued;
-                            return true;
-                        }
-                    }
-                    _phase = 5;
                     return false;
                 default:
                     return false;
             }
         }
     }
-
-    // Used as the array element type to remove array variance checks.
-    readonly struct Element(T value)
-    {
-        public T Value { get; } = value;
-    }
 }
 
 public static class Pipeline
 {
-    public static Pipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy)
+    /// <summary>Construct a source-driven pipeline against a caller-supplied source.</summary>
+    public static Pipeline<T, TPolicy, TSource, TEnumerator> Create<T, TPolicy, TSource, TEnumerator>(TPolicy policy, TSource source)
         where TPolicy : IPipelinePolicy<T>
-        => new(policy);
+        where TSource : IPipelineSource<T, TEnumerator>
+        where TEnumerator : struct, IAsyncEnumerator<T>
+        => new(policy, source);
 
-    /// <summary>
-    /// Represents a deferred enqueue completion returned by <see cref="Pipeline{T,TPolicy}.Enqueue"/>.
-    /// The item is already in the queue. Calling <see cref="Execute"/> may signal the execution loop to process it.
-    /// This two-step design exists because the signal may synchronously run the execution loop on the caller's
-    /// thread (when <see cref="IPipelinePolicy{T}.RunEnqueueAsynchronously"/> is false),
-    /// so it must be invoked outside any held lock.
-    /// </summary>
-    public readonly struct EnqueueResult
+    /// <summary>Construct a queue-backed pipeline. Returns a <see cref="QueuedPipeline{T,TPolicy}"/> that
+    /// exposes <see cref="QueuedPipeline{T,TPolicy}.Enqueue"/> directly.</summary>
+    public static QueuedPipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy, bool runContinuationsAsynchronously = true, PipelineScheduler? scheduler = null)
+        where TPolicy : IPipelinePolicy<T>
     {
-        readonly WakeSignal? _signal;
-        internal EnqueueResult(WakeSignal? signal) => _signal = signal;
-
-        /// <summary>Signals the execution loop, which may run the executor inline on the calling thread.</summary>
-        public void Execute() => _signal?.Signal();
-    }
-
-    /// Single-consumer single-producer wake signal for suspending and waking execution.
-    /// Doubles as its own awaitable and awaiter (GetAwaiter returns this).
-    /// The wake lock is held from WaitUnsynchronized through OnCompleted, which stores
-    /// the continuation and releases the lock. Signal re-acquires the lock to claim the continuation.
-    /// A spinlock is used instead of Lock because the critical section is a few field reads/writes
-    /// with at most two threads contending (execution loop and Signal caller).
-    /// No code under the lock re-enters or is user code that may, so reentrancy support is not needed either.
-    internal sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineScheduler executionScheduler)
-        : IThreadPoolWorkItem
-    {
-        readonly CancellationTokenSource _cts = new();
-        Action? _continuation;
-        bool _pending;
-        int _wakeLock;
-
-        public PipelineScheduler Scheduler { get; } = executionScheduler;
-        public CancellationToken CompletionToken => _cts.Token;
-        public bool IsCompleted => _cts.IsCancellationRequested;
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void AcquireWakeLock()
-        {
-            if (Interlocked.Exchange(ref _wakeLock, 1) != 0)
-                AcquireWakeLockSlow();
-
-            [MethodImpl(MethodImplOptions.NoInlining)]
-            void AcquireWakeLockSlow()
-            {
-                var spinner = new SpinWait();
-                while (Interlocked.Exchange(ref _wakeLock, 1) != 0)
-                    spinner.SpinOnce();
-            }
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public void ReleaseWakeLock() => Volatile.Write(ref _wakeLock, 0);
-
-        /// Prepares the signal for a new wait. Must be called under the wake lock.
-        /// Returns an awaiter that holds the lock through OnCompleted.
-        public Awaiter WaitUnsynchronized()
-        {
-            Debug.Assert(!_pending, "Concurrent wait calls.");
-            _pending = true;
-            return new(this);
-        }
-
-        public void Signal() => SignalCore(runContinuationsAsynchronously);
-
-        void SignalCore(bool runContinuationsAsynchronously)
-        {
-            AcquireWakeLock();
-            try
-            {
-                if (!_pending)
-                    return;
-                _pending = false;
-            }
-            finally
-            {
-                ReleaseWakeLock();
-            }
-
-            if (runContinuationsAsynchronously)
-            {
-                Scheduler.SubmitDetached(this, preferLocal: true);
-            }
-            else
-                _continuation!();
-        }
-
-        void IThreadPoolWorkItem.Execute() => _continuation!();
-
-        /// Marks the source as completed, wakes any pending wait.
-        public void Complete()
-        {
-            _cts.Cancel();
-            SignalCore(runContinuationsAsynchronously: true);
-        }
-
-        internal readonly struct Awaiter(WakeSignal signal) : ICriticalNotifyCompletion
-        {
-            public Awaiter GetAwaiter() => this;
-
-            // Always false so OnCompleted always runs and releases the lock.
-            public bool IsCompleted => false;
-
-            public bool GetResult() => !signal.IsCompleted;
-
-            public void OnCompleted(Action continuation) => UnsafeOnCompleted(continuation);
-
-            public void UnsafeOnCompleted(Action continuation)
-            {
-                if (!ReferenceEquals(signal._continuation, continuation))
-                    signal._continuation = continuation;
-                signal.ReleaseWakeLock();
-
-                // If completed while we were setting up the wait, wake ourselves.
-                if (signal.IsCompleted)
-                    signal.SignalCore(runContinuationsAsynchronously: true);
-            }
-        }
+        var source = UnboundedQueueSource<T>.Create(runContinuationsAsynchronously, scheduler ?? policy.ExecutionScheduler);
+        var pipeline = new Pipeline<T, TPolicy, UnboundedQueueSource<T>, UnboundedQueueSource<T>.Enumerator>(policy, source);
+        return new QueuedPipeline<T, TPolicy>(pipeline, source);
     }
 
     /// <summary>

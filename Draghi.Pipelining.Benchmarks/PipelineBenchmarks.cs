@@ -14,7 +14,7 @@ namespace Draghi.Pipelining.Benchmarks;
 [MemoryDiagnoser]
 public class PipelineBenchmarks
 {
-    Pipeline<BareItem, BarePolicy> _pipeline = null!;
+    QueuedPipeline<BareItem, BarePolicy> _pipeline = null!;
     BareItem _item = null!;
 
     [Params(false, true)]

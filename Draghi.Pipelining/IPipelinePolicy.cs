@@ -1,31 +1,39 @@
 using System.Diagnostics.CodeAnalysis;
-using System.Runtime.CompilerServices;
 
 namespace Draghi.Pipelining;
 
+/// <summary>
+/// Per-item lifecycle contract for a pipeline. The pipeline consumes items from an
+/// <see cref="IPipelineSource{T,TEnumerator}"/> and invokes these methods at each lifecycle
+/// transition (execute, activate, complete, recover).
+/// </summary>
 /// <remarks>
 /// Exception robustness: policy callbacks other than <see cref="ExecuteItemAsync"/> (i.e.,
-/// <see cref="ActivateHeadItem"/>, <see cref="CompleteItem"/>, <see cref="TryRecoverItemFailure"/>,
-/// <see cref="OnExecutionIdleAsync"/>, <see cref="YieldAfterFirstItem"/>) MUST NOT throw. The
-/// framework does not wrap them in try/catch and an escaping exception will propagate into
-/// whichever context invoked it (executor loop, advancer continuation, drain path), leaving the
-/// pipeline in an undefined state. Same contract as <c>IThreadPoolWorkItem.Execute</c> or async
-/// continuations: the runtime expects callback authors to handle their own exception domains.
-/// Exceptions from <see cref="ExecuteItemAsync"/> and from the returned pipeline/trailing tasks
-/// are first-class and flow through <see cref="TryRecoverItemFailure"/>; that is the supported
-/// way to surface failure from an item.
+/// <see cref="ActivateHeadItem"/>, <see cref="CompleteItem"/>, <see cref="TryRecoverItemFailure"/>)
+/// MUST NOT throw. The framework does not wrap them in try/catch and an escaping exception will
+/// propagate into whichever context invoked it (executor loop, advancer continuation, drain path),
+/// leaving the pipeline in an undefined state. Same contract as <c>IThreadPoolWorkItem.Execute</c>
+/// or async continuations: the runtime expects callback authors to handle their own exception
+/// domains. Exceptions from <see cref="ExecuteItemAsync"/> and from the returned pipeline/trailing
+/// tasks are first-class and flow through <see cref="TryRecoverItemFailure"/>. That is the
+/// supported way to surface failure from an item.
+/// <para>
+/// Production-side concerns (when items arrive, how the executor parks while waiting, dispatch
+/// scheduling between enqueue and execute) live on the source, not the policy. The policy is
+/// purely about what to do with each item as it flows through the pipeline.
+/// </para>
 /// </remarks>
 public interface IPipelinePolicy<T>
 {
     /// Runs the item's work and returns its pipeline and trailing execution tasks.
     /// <remarks>
     /// Cancellation contract: implementations MUST observe <paramref name="cancellationToken"/>.
-    /// The token is the pipeline's shutdown signal (cancelled by <see cref="Pipeline{T,TPolicy}.CompleteAsync"/>).
-    /// The executor awaits this call inline during the recovery flows
-    /// (<c>RecoverItem</c>, <c>RecoverTrailingFailure</c>, <c>RecoverCommittedTailWaiterAsync</c>);
-    /// if an implementation ignores the token, the executor cannot exit its main loop and
-    /// <c>CompleteAsync</c>'s returned task will never complete. Idiomatic handling is to either
-    /// throw <see cref="OperationCanceledException"/> on cancellation or return a faulted task.
+    /// The token is the pipeline's shutdown signal. The executor awaits this call inline during
+    /// the recovery flows (<c>RecoverItem</c>, <c>RecoverTrailingFailure</c>,
+    /// <c>RecoverCommittedTailWaiterAsync</c>). If an implementation ignores the token, the
+    /// executor cannot exit its main loop and the pipeline's completion task will never complete.
+    /// Idiomatic handling is to either throw <see cref="OperationCanceledException"/> on
+    /// cancellation or return a faulted task.
     /// </remarks>
     ValueTask<PipelineItemResult> ExecuteItemAsync(T item, CancellationToken cancellationToken);
 
@@ -70,27 +78,6 @@ public interface IPipelinePolicy<T>
     /// The scheduler used for the execution loop.
     /// When null, falls back to ThreadPool.
     PipelineScheduler? ExecutionScheduler => null;
-
-    /// When true, Enqueue dispatches to the scheduler. When false, runs the executor inline on the caller's thread.
-    bool RunEnqueueAsynchronously => true;
-
-    /// Called when the executor is idle, before waiting for more work.
-    /// Waiters may still be active, use <see cref="Pipeline{T,TPolicy}.CompleteAsync"/> for full pipeline drain.
-    /// The executor awaits the returned task before parking. <paramref name="cancellationToken"/>
-    /// is the pipeline's shutdown signal (same as <see cref="ExecuteItemAsync"/>); implementations
-    /// must observe it so the executor can exit when <see cref="Pipeline{T,TPolicy}.CompleteAsync"/>
-    /// is called.
-    ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-
-    /// Called after the executor processes the first item of a resumed batch, when there are more items.
-    /// The policy can yield to the scheduler (e.g. to free a caller's thread) or return default to continue inline.
-    /// Default: when RunEnqueueAsynchronously is false, yield to the current scheduler.
-    /// NOTE: struct policies should override this to avoid DIM boxing.
-    ValueTask YieldAfterFirstItem() => RunEnqueueAsynchronously ? default : DefaultYieldAsync();
-
-    [AsyncMethodBuilder(typeof(PoolingAsyncValueTaskMethodBuilder))]
-    private static async ValueTask DefaultYieldAsync()
-        => await PipelineScheduler.ThreadPool.ContinueOnAsync(forceYielding: true);
 }
 
 /// <summary>

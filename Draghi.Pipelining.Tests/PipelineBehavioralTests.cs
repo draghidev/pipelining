@@ -6,6 +6,7 @@ namespace Draghi.Pipelining.Tests;
 public class PipelineBehavioralTests
 {
     [TestMethod]
+    [Ignore("YieldAfterFirstItem hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task YieldAfterFirstItem_CalledOncePerBatch_WhenMoreItemsQueued()
     {
         var counter = new Counter();
@@ -34,6 +35,7 @@ public class PipelineBehavioralTests
     }
 
     [TestMethod]
+    [Ignore("YieldAfterFirstItem hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task YieldAfterFirstItem_NotCalled_WhenQueueEmptyAfterFirstItem()
     {
         var counter = new Counter();
@@ -51,6 +53,7 @@ public class PipelineBehavioralTests
     }
 
     [TestMethod]
+    [Ignore("YieldAfterFirstItem hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task YieldAfterFirstItem_CalledAgainOnNewBatch()
     {
         var counter = new Counter();
@@ -137,6 +140,7 @@ public class PipelineBehavioralTests
     }
 
     [TestMethod]
+    [Ignore("OnExecutionIdleAsync hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task OnExecutionIdleAsync_Throws_PropagatesViaCompleteAsync()
     {
         var idleException = new InvalidOperationException("idle handler exploded");
@@ -375,7 +379,7 @@ public class PipelineBehavioralTests
     {
         var follower = new TestPipelineItem();
         var enqueued = false;
-        Pipeline<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>? pipelineRef = null;
+        QueuedPipeline<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>? pipelineRef = null;
 
         var pipeline = Pipeline.Create<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>(
             new ReentrantEnqueueOnActivatePolicy(_ =>
@@ -402,6 +406,7 @@ public class PipelineBehavioralTests
     /// enqueues the next batch, executor picks it up on the outer loop's next iteration without
     /// parking (queue is non-empty). Gated by a counter to avoid infinite refilling.
     [TestMethod]
+    [Ignore("OnExecutionIdleAsync hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task ReentrantEnqueueFromOnExecutionIdleAsync_RefillsBatchUntilGated()
     {
         var refills = new TestPipelineItem[3];
@@ -409,7 +414,7 @@ public class PipelineBehavioralTests
             refills[i] = new TestPipelineItem();
 
         var refillIdx = 0;
-        Pipeline<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>? pipelineRef = null;
+        QueuedPipeline<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>? pipelineRef = null;
 
         var pipeline = Pipeline.Create<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>(
             new ReentrantEnqueueOnIdlePolicy(() =>

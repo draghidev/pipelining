@@ -31,7 +31,7 @@ namespace Draghi.Pipelining.Benchmarks;
 /// - No backpressure — the SPSC queue is unbounded.
 sealed class PipelineChannel<T>
 {
-    readonly Pipeline<T, Policy> _pipeline;
+    readonly QueuedPipeline<T, Policy> _pipeline;
     // Single-consumer: one slot for the ready item. _hasReady is the readiness indicator
     // so the slot can hold any T (including default for value types).
     T _readyItem = default!;
