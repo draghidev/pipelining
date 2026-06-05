@@ -1,6 +1,10 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using Draghi.Pipelining.Internal;
+
+// Pipeline composes the Internal-namespace SPSC queue primitive.
+#pragma warning disable DRAGHI001
 
 namespace Draghi.Pipelining;
 

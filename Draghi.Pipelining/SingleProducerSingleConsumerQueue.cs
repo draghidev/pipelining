@@ -7,7 +7,7 @@ using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 
-namespace Draghi.Pipelining;
+namespace Draghi.Pipelining.Internal;
 
 /// <summary>A placeholder class for common padding constants and eventually routines.</summary>
 static class PaddingHelpers
@@ -26,9 +26,16 @@ struct PaddingFor32
 /// Provides a producer/consumer queue safe to be used by only one producer and one consumer concurrently.
 /// </summary>
 /// <typeparam name="T">Specifies the type of data contained in the queue.</typeparam>
+/// <remarks>
+/// Exposed under <see cref="Draghi.Pipelining.Internal"/> as a building block for callers
+/// composing their own <see cref="IPipelineSource{T,TEnumerator}"/> implementations. The
+/// single-producer / single-consumer contract is load-bearing. Using this from multiple producers
+/// or consumers concurrently produces undefined results.
+/// </remarks>
+[Experimental("DRAGHI001")]
 [DebuggerDisplay("Count = {Count}")]
 [DebuggerTypeProxy(typeof(SingleProducerSingleConsumerQueue<>.SingleProducerSingleConsumerQueue_DebugView))]
-sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
+public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
 {
     // Design:
     //

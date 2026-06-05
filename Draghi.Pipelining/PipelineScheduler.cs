@@ -7,7 +7,8 @@ public abstract class PipelineScheduler
 {
     static readonly Action<object?> ThreadPoolWorkItemAction = static item => ((IThreadPoolWorkItem)item!).Execute();
 
-    internal static PipelineScheduler ThreadPool { get; } = new ThreadPoolScheduler();
+    /// <summary>Default scheduler that dispatches work via <see cref="System.Threading.ThreadPool"/>.</summary>
+    public static PipelineScheduler ThreadPool { get; } = new ThreadPoolScheduler();
 
     /// <summary>
     /// Submits work, capturing the caller's ExecutionContext and restoring it before invoking the callback.
