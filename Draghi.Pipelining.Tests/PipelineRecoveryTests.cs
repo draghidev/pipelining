@@ -514,7 +514,7 @@ public class PipelineRecoveryTests
             item.Complete(exception);
         }
 
-        public bool TryRecoverItemFailure(PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
             recoveryItem = _recoveryFactory?.Invoke(context);
             return recoveryItem is not null;

@@ -721,7 +721,7 @@ public class PipelineConcurrencyTests
 
         public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
         public ValueTask YieldAfterFirstItem() => default;
-        public bool TryRecoverItemFailure(PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
             recoveryItem = null;
             return false;
@@ -733,7 +733,7 @@ public class PipelineConcurrencyTests
         public ValueTask<PipelineItemResult> ExecuteItemAsync(ActivationOrderingItem item, CancellationToken cancellationToken) => item.RunExecute();
         public void ActivateHeadItem(ActivationOrderingItem item, bool preferAsync = true) => item.RunActivate();
         public void CompleteItem(ActivationOrderingItem item, int remainingDepth, Exception? exception) => item.RunComplete();
-        public bool TryRecoverItemFailure(PipelineItemFailureContext context, ActivationOrderingItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ActivationOrderingItem? recoveryItem)
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, ActivationOrderingItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ActivationOrderingItem? recoveryItem)
         {
             recoveryItem = null;
             return false;
@@ -1285,7 +1285,7 @@ public class PipelineConcurrencyTests
             item.Complete(exception);
         }
 
-        public bool TryRecoverItemFailure(PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
             recoveryItem = null;
             return false;
@@ -1364,7 +1364,7 @@ public class PipelineConcurrencyTests
         public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
             => item.Complete(exception);
 
-        public bool TryRecoverItemFailure(PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
             recoveryItem = _recoveryFactory?.Invoke(context);
             return recoveryItem is not null;

@@ -70,7 +70,7 @@ public interface IPipelinePolicy<T>
     /// Attempts to recover from a failed item. Returns a recovery item that supplants the failed item in the pipeline,
     /// or null if recovery is not possible. When non-null the pipeline will not complete the failed item.
     /// NOTE: struct policies should override this to avoid DIM boxing.
-    bool TryRecoverItemFailure(PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out T? recoveryItem)
+    bool TryRecoverItemFailure(in PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out T? recoveryItem)
     {
         recoveryItem = default;
         return false;

@@ -222,7 +222,7 @@ readonly struct ValueItemPolicy(ValueItemPool pool, TaskCompletionSource? idleTc
 
     public void CompleteItem(ValueItem item, int remainingDepth, Exception? exception) => pool.Get(item.Id).Complete();
 
-    public bool TryRecoverItemFailure(PipelineItemFailureContext context, ValueItem failedItem, CancellationToken cancellationToken, out ValueItem recoveryItem)
+    public bool TryRecoverItemFailure(in PipelineItemFailureContext context, ValueItem failedItem, CancellationToken cancellationToken, out ValueItem recoveryItem)
     {
         recoveryItem = default;
         return false;
@@ -256,7 +256,7 @@ readonly struct LargeValueItemPolicy(ValueItemPool pool, TaskCompletionSource? i
         pool.Get((int)item.A).Complete();
     }
 
-    public bool TryRecoverItemFailure(PipelineItemFailureContext context, LargeValueItem failedItem, CancellationToken cancellationToken, out LargeValueItem recoveryItem)
+    public bool TryRecoverItemFailure(in PipelineItemFailureContext context, LargeValueItem failedItem, CancellationToken cancellationToken, out LargeValueItem recoveryItem)
     {
         recoveryItem = default;
         return false;
