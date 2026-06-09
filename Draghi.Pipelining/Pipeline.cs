@@ -62,8 +62,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     bool _hasExecutingItem;
 
     // Cross-thread atomics, touched by the executor, advancer, enqueuer, and completion callbacks.
-    readonly SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)> _waiters;
-    int _waiterQueueCount; // Authoritative count. Interlocked by executor and advancer.
+    // The store has a single inline slot (zero alloc) for the common one-pending-waiter case. The
+    // SPSC queue inside it is lazy-allocated only on true overlap (a second waiter arrives while
+    // the first is still pending). See WaiterStore<T>.
+    WaiterStore<T> _waiters;
     int _waiterCompletedCount; // Number of completed waiter tasks not yet processed by the advancer.
     Latch _advancing; // Held while a thread is currently the advancer. See Latch.cs for semantics.
     T _waiterRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
@@ -71,12 +73,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     // Activation.
     readonly Action _onWaiterTaskCompletedAction;
+    readonly Action _onCommittedTaskCompletedAction;
     readonly Action _incrementDepthAction;
 
     internal Pipeline(TPolicy policy, TSource source)
     {
-        _waiters = new();
+        // Delegate references bind to `this` and don't change.
         _onWaiterTaskCompletedAction = OnWaiterTaskCompleted;
+        _onCommittedTaskCompletedAction = OnCommittedTaskCompleted;
         _incrementDepthAction = IncrementDepth;
         Initialize(policy, source);
     }
@@ -108,7 +112,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     void IncrementDepth() => _depthState.IncrementDepth();
 
     // Off the hot path (advancer/recovery handoff), so OS handoff on contention is preferable.
-    readonly Lock _activationLock = new();
+    // Lazy-allocated alongside _waiters at first escalation. Stays null while no advancer can
+    // exist (advancers require waiters), and the few lock sites that may run pre-escalation
+    // null-guard.
+    Lock? _activationLock;
 
 
     /// <summary>Current count of items in the pipeline (queued + in flight + waiting). Lock-free read,
@@ -200,7 +207,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 item = _enumerator.Current;
 
                 var activated = false;
-                if (Volatile.Read(ref _waiterQueueCount) is 0)
+                if (_waiters.Count is 0)
                 {
                     ActivateHeadItem(item, preferAsync: false);
                     activated = true;
@@ -340,8 +347,17 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
 
         var exception = _completionException;
+        // Drain slot first (FIFO) then queue. Both are no-ops if the corresponding tier is empty.
+        if (_waiters.TryClaimSlotForDrain(out var slotItem, out _))
+        {
+            _waiters.DecrementCount();
+            CompleteWaiter(slotItem, exception);
+        }
         while (_waiters.TryDequeue(out var item))
+        {
+            _waiters.DecrementCount();
             CompleteWaiter(item.Waiter, exception);
+        }
     }
 
     /// Handles execution-phase or pipeline-task failures, including recovery.
@@ -402,7 +418,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             _tailWaiterTask = default;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _tailWaiter = default!;
-            EnqueueWaiter(item, activated, new(pipelineTask));
+            CommitWaiter(item, activated, new(pipelineTask));
             return;
         }
 
@@ -410,17 +426,36 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // so the advancer's count==0 claim can't observe partial state and double-activate.
         // On inline activation also clear the published slots so a later advancer claim cannot
         // re-read recovery and activate it twice.
+        // If _activationLock is still null we never escalated, so no advancer can be running and
+        // the lock body runs uncontended without it.
         bool recoveryActivated;
-        lock (_activationLock)
+        if (_activationLock is { } activationLock)
+        {
+            lock (activationLock)
+            {
+                _executingItem = recoveryItem;
+                recoveryActivated = !Interlocked.Exchange(ref _hasExecutingItem, true);
+                if (recoveryActivated)
+                {
+                    ActivateHeadItem(recoveryItem, preferAsync: false);
+                    // Inside _activationLock. Plain write suffices: all readers of _hasExecutingItem
+                    // are Interlocked.Exchange (acquire-semantics, sees latest committed value), and
+                    // the lock exit's release fence orders this write w.r.t. anyone acquiring next.
+                    _hasExecutingItem = false;
+                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                        _executingItem = default!;
+                }
+            }
+        }
+        else
         {
             _executingItem = recoveryItem;
             recoveryActivated = !Interlocked.Exchange(ref _hasExecutingItem, true);
             if (recoveryActivated)
             {
                 ActivateHeadItem(recoveryItem, preferAsync: false);
-                // Inside _activationLock. Plain write suffices: all readers of _hasExecutingItem
-                // are Interlocked.Exchange (acquire-semantics, sees latest committed value), and
-                // the lock exit's release fence orders this write w.r.t. anyone acquiring next.
+                // No-lock path: a null _activationLock means no escalation ever happened, so no
+                // advancer exists to read this flag. Single writer, plain write suffices.
                 _hasExecutingItem = false;
                 if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                     _executingItem = default!;
@@ -506,8 +541,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         // Fence-acquire so CompleteWaiter below cannot fire CompleteItem before the advancer's
         // in-progress ActivateHeadItem finishes. Same pattern as ClearExecutingItem's deferred branch.
-        if (alreadyActivated)
-            lock (_activationLock) { }
+        // alreadyActivated also covers the "never published" case (inline activation took the
+        // count==0 branch and never set _hasExecutingItem). When _activationLock is still null no
+        // advancer has ever run, so the fence has nothing to synchronize with and the skip is safe.
+        if (alreadyActivated && _activationLock is { } activationLock)
+            lock (activationLock) { }
 
         if (task.IsCompleted)
         {
@@ -521,7 +559,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return RecoverCommittedTailWaiterAsync(item, task).AsTask();
         }
 
-        EnqueueWaiter(item, activated: alreadyActivated, task);
+        CommitWaiter(item, activated: alreadyActivated, task);
         return null;
     }
 
@@ -600,26 +638,45 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         else
         {
-            EnqueueWaiter(recoveryItem, activated: true, pipelineTask);
+            CommitWaiter(recoveryItem, activated: true, pipelineTask);
         }
     }
 
     void CompleteWaiter(T item, Exception? exception)
     {
-        var depth = _depthState.DecrementDepth();
-        _policy.CompleteItem(item, depth, exception);
-
-        if (depth is 0)
+        if (CompleteWaiterDeferred(item, exception))
             _depthState.OnDepthReachedZero();
     }
 
-    /// Enqueues as a waiter and coordinates activation with the execution loop. All call sites
-    /// run on the executor's logical thread (direct or via the executor's await chain), preserving
-    /// the SPSC single-producer contract on _waiters without a lock.
-    void EnqueueWaiter(T item, bool activated, ValueTask waiterTask)
+    /// Same as <see cref="CompleteWaiter"/> but skips the <see cref="DepthState.OnDepthReachedZero"/>
+    /// signal so the caller can defer it (returns true iff depth reached 0). Drain paths holding the
+    /// advancer latch or _activationLock use this: firing OnDepthReachedZero there would resume external
+    /// WaitForEmptyAsync awaiters while internal sync is still held. Defer until the drainer releases.
+    bool CompleteWaiterDeferred(T item, Exception? exception)
     {
-        _waiters.Enqueue((item, waiterTask));
-        var wasEmpty = Interlocked.Increment(ref _waiterQueueCount) is 1;
+        var depth = _depthState.DecrementDepth();
+        _policy.CompleteItem(item, depth, exception);
+        return depth is 0;
+    }
+
+    /// Commits a waiter to the store and coordinates activation with the execution loop. The
+    /// store routes to the inline slot when empty (zero alloc), otherwise it escalates to the
+    /// SPSC queue (allocates queue + lock on first overlap). The wired completion callback is
+    /// chosen accordingly: the slot path uses _onCommittedTaskCompletedAction (which morphs into
+    /// the advancer-wake path after a later escalation, since the slot contents get moved to
+    /// queue head and the callback's drain still finds them as the head item). The queue path
+    /// uses _onWaiterTaskCompletedAction directly. All call sites run on the executor's logical
+    /// thread, preserving the SPSC single-producer contract.
+    void CommitWaiter(T item, bool activated, ValueTask waiterTask)
+    {
+        // Allocate the activation lock on first commit (slot or queue): the count==0 handoff
+        // serializes against the executor's deferred-publish + ClearExecutingItem fence-acquire,
+        // and deferred-publish kicks in for any subsequent iter once Count > 0. One small Lock
+        // allocation per Pipeline lifetime, amortized across all subsequent commits and runs.
+        _activationLock ??= new Lock();
+
+        var count = _waiters.TryEscalateOrEnqueue(item, waiterTask, out var isSlot, out var slotWasMoved);
+        var wasEmpty = count is 1;
 
         // The atomic _hasExecutingItem claim already happened in CommitTailWaiter /
         // ClearExecutingItem. Just clear for hygiene and inline-activate if we're the head.
@@ -635,8 +692,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
         }
 
+        var callback = isSlot ? _onCommittedTaskCompletedAction : _onWaiterTaskCompletedAction;
         if (waiterTask.IsCompleted)
-            OnWaiterTaskCompleted();
+            callback();
         else
             waiterTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(callback);
 
@@ -661,10 +719,110 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         DrainReadyWaiters();
     }
 
+    /// Wired on the slot-tier UnsafeOnCompleted. The same callback covers both pre- and
+    /// post-escalation: if the store has not escalated when this fires, the slot drain happens
+    /// inline. If escalation moved the slot contents to queue head before this fired, the
+    /// callback functions as OnWaiterTaskCompleted and the standard advancer drains the queue.
+    void OnCommittedTaskCompleted()
+    {
+        Interlocked.Increment(ref _waiterCompletedCount);
+
+        if (_enumerator.CompletionToken.IsCancellationRequested || !_advancing.TryAcquire())
+            return;
+
+        if (_waiters.IsEscalated)
+        {
+            // The slot's (item, task) was moved to queue head by EscalateAndEnqueue, and head's
+            // task is the one that just completed. Standard drain picks it up.
+            DrainReadyWaiters();
+            return;
+        }
+
+        DrainSlotInline();
+    }
+
+    /// Slot-mode drain. Advancer latch is held by the caller. CAS-claims the slot and processes
+    /// the (item, task). A concurrent escalation that won the CAS leaves nothing here to drain
+    /// and we re-route to the queue drain.
+    void DrainSlotInline()
+    {
+        if (!_waiters.TryClaimSlotForDrain(out var item, out var task))
+        {
+            // Escalation got there first, and head of queue is our item now.
+            if (_waiters.IsEscalated)
+            {
+                DrainReadyWaiters();
+                return;
+            }
+            // Slot already drained elsewhere. Shouldn't happen given single-callback wiring.
+            Interlocked.Decrement(ref _waiterCompletedCount);
+            _advancing.Release();
+            SignalAdvancerIdleIfWaiting();
+            return;
+        }
+
+        Interlocked.Decrement(ref _waiterCompletedCount);
+        var count = _waiters.DecrementCount();
+        Debug.Assert(count == 0);
+
+        bool advance;
+        bool emptyReached;
+        if (task.IsCompletedSuccessfully)
+        {
+            task.GetAwaiter().GetResult();
+            emptyReached = CompleteWaiterDeferred(item, null);
+            advance = true;
+        }
+        else
+        {
+            advance = RecoverWaiter(item, task, out emptyReached);
+        }
+
+        if (!advance)
+        {
+            // Recovery item taking over. Advancer flag stays held, recovery continuation releases.
+            return;
+        }
+
+        // count is 0. Same lock-guarded claim+activate as DrainReadyWaiters' count==0 branch:
+        // the executor may have deferred-published a next item against our Count==1 read. If so,
+        // claim and activate under the lock so its ClearExecutingItem fence-acquire sees us done.
+        lock (_activationLock!)
+        {
+            if (Interlocked.Exchange(ref _hasExecutingItem, false))
+            {
+                if (_waiters.Count is 0)
+                {
+                    var executing = _executingItem;
+                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                        _executingItem = default!;
+                    ActivateHeadItem(executing, preferAsync: true);
+                }
+                else if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                {
+                    _executingItem = default!;
+                }
+            }
+        }
+
+        _advancing.Release();
+        // Signal AFTER advancer release: prevents a WaitForEmptyAsync awaiter from resuming and
+        // committing a new slot waiter whose callback would then race the still-held advancer
+        // (TryAcquire fails, callback bails, count stranded - exactly the slot-drain stranding
+        // case the queue path's do-while reclaim recovers from but DrainSlotInline can't).
+        if (emptyReached)
+            _depthState.OnDepthReachedZero();
+        SignalAdvancerIdleIfWaiting();
+    }
+
     /// The advancer loop: processes completed waiters from the head of the queue in order.
     /// Only one thread runs this at a time, ensuring head-first processing and ordered completion.
+    /// Reachable only after a waiter was committed and escalated to the queue (slot-mode drains
+    /// run inline in OnCommittedTaskCompleted), so _activationLock is non-null and _waiters.Queue
+    /// is non-null on every code path here.
     void DrainReadyWaiters()
     {
+        var emptyReached = false;
         do
         {
             while (_waiters.TryPeek(out var item) && item.WaiterTask.IsCompleted)
@@ -678,12 +836,15 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 if (item.WaiterTask.IsCompletedSuccessfully)
                 {
                     item.WaiterTask.GetAwaiter().GetResult();
-                    CompleteWaiter(waiter, null);
+                    // Accumulate the idle signal across the do-while: depth can reach 0 mid-loop
+                    // (last drained item), but the OR captures it for after the final release.
+                    emptyReached |= CompleteWaiterDeferred(waiter, null);
                     advance = true;
                 }
                 else
                 {
-                    advance = RecoverWaiter(waiter, item.WaiterTask);
+                    advance = RecoverWaiter(waiter, item.WaiterTask, out var recoveryEmpty);
+                    emptyReached |= recoveryEmpty;
                 }
 
                 if (!advance)
@@ -691,11 +852,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // Recovery item is occupying this pipeline position. The advancer flag stays
                     // held. The recovery continuation will complete the item, advance via
                     // AdvanceAndDrainRecovery, and release the flag (which signals any waiting drain).
+                    // The recovery continuation also fires the idle signal if applicable, so it is
+                    // safe to forget our local emptyReached here (cannot be true: depth hasn't yet
+                    // hit zero or we wouldn't be doing recovery).
                     return;
                 }
 
                 // Advance: decrement queue count and activate next.
-                var count = Interlocked.Decrement(ref _waiterQueueCount);
+                var count = _waiters.DecrementCount();
                 Debug.Assert(count >= 0);
 
                 if (count is 0)
@@ -704,7 +868,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // ClearExecutingItem fence-acquire blocks until ActivateHeadItem finishes.
                     // Wrapping just the ActivateHeadItem call would leave a TOCTOU where the
                     // executor observes the Exchange and acquires its fence-lock uncontested.
-                    lock (_activationLock)
+                    lock (_activationLock!)
                     {
                         if (Interlocked.Exchange(ref _hasExecutingItem, false))
                         {
@@ -714,7 +878,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                             // double-activate (now via C-path, again via D-path). Skip when count > 0.
                             // Plain read: the Exchange above is a full fence (acquire on the read),
                             // so this read sees the latest committed value without its own LDAR.
-                            if (_waiterQueueCount is 0)
+                            if (_waiters.Count is 0)
                             {
                                 var executing = _executingItem;
                                 if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -743,6 +907,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             _advancing.Release();
         } while (!_enumerator.CompletionToken.IsCancellationRequested && _waiterCompletedCount > 0 && TryReclaimAdvancerForWork());
 
+        // Signal AFTER advancer release for the same reason as DrainSlotInline (external awaiter
+        // must not resume while internal sync is still held).
+        if (emptyReached)
+            _depthState.OnDepthReachedZero();
         SignalAdvancerIdleIfWaiting();
 
         // Re-acquire the advancer latch and check for a ready waiter. Returns true with the latch
@@ -764,10 +932,17 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// Returns true if the advancer should continue (recovery completed or no recovery),
     /// false if recovery is occupying this pipeline position (advancer must stop, recovery will resume knowing it held the advancer flag).
+    /// <paramref name="emptyReached"/> propagates the deferred-empty signal up to the drain caller
+    /// on the sync return-true paths so it fires after _advancing.Release(). The async return-false
+    /// path goes through the continuation chain which still uses CompleteRecoveryWaiter inline
+    /// (residual race window, but DrainReadyWaiters' do-while reclaim downstream catches any
+    /// stranded queue counts; slot-mode stranding from recovery is the case handled here).
     [MethodImpl(MethodImplOptions.NoInlining)]
-    bool RecoverWaiter(T failedItem, ValueTask waiterTask)
+    bool RecoverWaiter(T failedItem, ValueTask waiterTask, out bool emptyReached)
     {
         Debug.Assert(waiterTask.IsCompleted && !waiterTask.IsCompletedSuccessfully);
+
+        emptyReached = false;
 
         Exception ex;
         try
@@ -783,7 +958,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTaskWaiter, ex);
         if (!_policy.TryRecoverItemFailure(context, failedItem, _enumerator.CompletionToken, out var recoveryItem))
         {
-            CompleteWaiter(failedItem, ex);
+            emptyReached = CompleteWaiterDeferred(failedItem, ex);
             return true;
         }
 
@@ -797,7 +972,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         catch (Exception recoveryEx)
         {
-            CompleteWaiter(recoveryItem, recoveryEx);
+            emptyReached = CompleteWaiterDeferred(recoveryItem, recoveryEx);
             return true;
         }
 
@@ -809,7 +984,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         if (executeTask.IsCompletedSuccessfully)
         {
-            return RecoverWaiterResult(recoveryItem, executeTask.Result);
+            return RecoverWaiterResult(recoveryItem, executeTask.Result, out emptyReached);
         }
 
         // Execute is async, hook continuation. Advancer stops, continuation owns the flag.
@@ -836,7 +1011,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 return;
             }
 
-            if (!RecoverWaiterResult(recoveryItem, result))
+            if (!RecoverWaiterResult(recoveryItem, result, out _))
                 return; // pipeline task pending, continuation will resume
 
             AdvanceAndDrainRecovery();
@@ -846,8 +1021,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// Handles a completed recovery execution result. Returns true if the advancer should continue,
     /// false if the recovery's pipeline task is pending (occupying this position).
-    bool RecoverWaiterResult(T recoveryItem, PipelineItemResult result)
+    /// <paramref name="emptyReached"/> propagates the deferred-empty signal on the sync return-true
+    /// paths. Async return-false paths run through the continuation chain (documented gap).
+    bool RecoverWaiterResult(T recoveryItem, PipelineItemResult result, out bool emptyReached)
     {
+        emptyReached = false;
         // Await trailing execution, must observe the result.
         if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
         {
@@ -856,7 +1034,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 try { result.TrailingExecutionTask.GetAwaiter().GetResult(); }
                 catch (Exception ex)
                 {
-                    CompleteRecoveryWaiter(recoveryItem, ex);
+                    emptyReached = CompleteRecoveryWaiterDeferred(recoveryItem, ex);
                     return true;
                 }
             }
@@ -883,7 +1061,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                         return;
                     }
 
-                    if (!RecoverWaiterPipelineTask(recoveryItem, pipelineTask))
+                    if (!RecoverWaiterPipelineTask(recoveryItem, pipelineTask, out _))
                         return; // pipeline task pending, lock still held
 
                     AdvanceAndDrainRecovery();
@@ -892,12 +1070,18 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
         }
 
-        return RecoverWaiterPipelineTask(recoveryItem, result.PipelineTask);
+        return RecoverWaiterPipelineTask(recoveryItem, result.PipelineTask, out emptyReached);
     }
 
     /// Handles the recovery item's pipeline task. Returns true if done, false if pending.
-    bool RecoverWaiterPipelineTask(T recoveryItem, ValueTask pipelineTask)
+    /// <paramref name="emptyReached"/> propagates the deferred-empty signal to the caller on the
+    /// sync return-true path. The async return-false path goes through CompleteRecoveryWaiter
+    /// inline inside the continuation (documented gap, has the same race window but the
+    /// downstream AdvanceAndDrainRecovery -> DrainReadyWaiters' reclaim catches stranded queue
+    /// counts).
+    bool RecoverWaiterPipelineTask(T recoveryItem, ValueTask pipelineTask, out bool emptyReached)
     {
+        emptyReached = false;
         if (pipelineTask.IsCompleted)
         {
             Exception? pipelineException = null;
@@ -909,7 +1093,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             {
                 pipelineException = ex;
             }
-            CompleteRecoveryWaiter(recoveryItem, pipelineException);
+            emptyReached = CompleteRecoveryWaiterDeferred(recoveryItem, pipelineException);
             return true;
         }
 
@@ -977,24 +1161,39 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         CompleteWaiter(recoveryItem, exception);
     }
 
+    /// <see cref="CompleteRecoveryWaiter"/> variant that returns the deferred-empty signal so the
+    /// caller can fire <see cref="DepthState.OnDepthReachedZero"/> after releasing the advancer.
+    /// Used by the sync recovery chain (<see cref="RecoverWaiter"/>, <see cref="RecoverWaiterResult"/>,
+    /// <see cref="RecoverWaiterPipelineTask"/>) to avoid the same stranding window the slot drain fix
+    /// closed: signalling OnDepthReachedZero while the drain caller still holds the advancer would
+    /// let a WaitForEmptyAsync awaiter resume and commit a follow-up slot waiter whose callback
+    /// would bail on TryAcquire.
+    bool CompleteRecoveryWaiterDeferred(T recoveryItem, Exception? exception)
+    {
+        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            _waiterRecoveryItem = default!;
+        return CompleteWaiterDeferred(recoveryItem, exception);
+    }
+
     /// Decrements waiter count, activates the next item, and resumes draining.
     /// Must only be called when the advancer flag is held.
     void AdvanceAndDrain()
     {
-        var count = Interlocked.Decrement(ref _waiterQueueCount);
+        var count = _waiters.DecrementCount();
         Debug.Assert(count >= 0);
 
         if (count is 0)
         {
             // Same lock-guarded claim+activate as DrainReadyWaiters: lock wraps the Exchange so
             // the executor's fence-acquire blocks until ActivateHeadItem finishes.
-            lock (_activationLock)
+            // Advancer chain reachability implies _activationLock is non-null.
+            lock (_activationLock!)
             {
                 if (Interlocked.Exchange(ref _hasExecutingItem, false))
                 {
                     // Re-check count under the lock (see DrainReadyWaiters count==0 branch).
                     // Plain read: the Exchange above provides the acquire fence.
-                    if (_waiterQueueCount is 0)
+                    if (_waiters.Count is 0)
                     {
                         var executing = _executingItem;
                         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -1038,7 +1237,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 // Advancer claimed first and is in ActivateHeadItem under the lock. Empty
                 // acquire/release synchronizes-with that lock release, closing the
                 // activation-after-completion race before the caller proceeds to CompleteWaiter.
-                lock (_activationLock) { }
+                // wasActivated=false means the deferred-publish branch ran, which only triggers
+                // when _waiterQueueCount > 0, so _activationLock is non-null here.
+                lock (_activationLock!) { }
             }
         }
     }
@@ -1052,7 +1253,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         readonly Pipeline<T, TPolicy, TSource, TEnumerator> _pipeline;
         SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)>.Enumerator _waitersEnumerator;
-        // 0: init waiters, 1: enumerate waiters, 2: tail waiter, 3: done
+        // 0: init queue waiters, 1: enumerate queue waiters, 2: slot waiter, 3: tail waiter, 4: done
         int _phase;
 
         internal Enumerator(Pipeline<T, TPolicy, TSource, TEnumerator> pipeline)
@@ -1067,7 +1268,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             switch (_phase)
             {
                 case 0:
-                    _waitersEnumerator = new(_pipeline._waiters);
+                    // Null queue means the pipeline never escalated. Skip to the slot phase.
+                    var queue = _pipeline._waiters.Queue;
+                    if (queue is null)
+                    {
+                        _phase = 2;
+                        goto case 2;
+                    }
+                    _waitersEnumerator = new(queue);
                     _phase = 1;
                     goto case 1;
                 case 1:
@@ -1083,6 +1291,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     goto case 2;
                 case 2:
                     _phase = 3;
+                    if (_pipeline._waiters.TrySnapshotSlot(out var slotItem) && slotItem is { } slot)
+                    {
+                        Current = slot;
+                        return true;
+                    }
+                    goto case 3;
+                case 3:
+                    _phase = 4;
                     // Volatile.Read pairs with the executor's Volatile.Write on _hasTailWaiter:
                     // if observed true, the prior _tailWaiter / _tailWaiterTask writes are visible.
                     // Consistent for any T that fits in a native word (refs, primitives, small
@@ -1110,8 +1326,8 @@ public static class Pipeline
     /// <para>
     /// Flyweight reuse: pass a previously-completed <paramref name="instance"/> to rebind it
     /// against the new <paramref name="policy"/> + <paramref name="source"/> and restart it.
-    /// The shell allocation (waiter queue, delegates, depth/latch machinery) gets reused; the
-    /// per-run state (enumerator, execution task) gets fresh.
+    /// The shell allocation (waiter queue, delegates, depth/latch machinery) gets reused while
+    /// the per-run state (enumerator, execution task) gets fresh.
     /// </para>
     /// <para>
     /// The natural call-site pattern when caller caches a nullable pipeline field:
