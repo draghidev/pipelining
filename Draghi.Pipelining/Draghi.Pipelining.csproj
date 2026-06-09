@@ -5,6 +5,8 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+        <!-- DRAGHI001: in-box composition of the experimental Internal-namespace primitives. -->
+        <NoWarn>$(NoWarn);DRAGHI001</NoWarn>
     </PropertyGroup>
 
     <ItemGroup>

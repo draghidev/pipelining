@@ -1,9 +1,5 @@
 using Draghi.Pipelining.Internal;
 
-// Built on the Internal-namespace SPSC/WakeSignal primitives. The experimental warning is
-// intentional friction for direct consumers, not for this in-box composition.
-#pragma warning disable DRAGHI001
-
 namespace Draghi.Pipelining;
 
 /// <summary>
@@ -33,8 +29,12 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// <param name="runContinuationsAsynchronously">When true, signal continuations dispatch to the scheduler.
     /// When false, signal continuations run inline on the caller's thread.</param>
     /// <param name="executionScheduler">Scheduler used for inline-async dispatch. Falls back to ThreadPool when null.</param>
-    public static UnboundedQueueSource<T> Create(bool runContinuationsAsynchronously = true, PipelineScheduler? executionScheduler = null)
-        => new(new State(runContinuationsAsynchronously, executionScheduler ?? PipelineScheduler.ThreadPool));
+    public static UnboundedQueueSource<T> Create(bool runContinuationsAsynchronously = true, PipelineScheduler? executionScheduler = null, CancellationToken cancellationToken = default)
+        => new(new State(runContinuationsAsynchronously, executionScheduler ?? PipelineScheduler.ThreadPool, cancellationToken));
+
+    /// <summary>The source-level cancellation token (set at <see cref="Create"/>). Stable for the
+    /// source's lifetime. Distinct from the per-enumeration token captured by the enumerator.</summary>
+    public CancellationToken CancellationToken => _state.CancellationToken;
 
     /// <summary>Enqueues an item for processing. Returns an <see cref="EnqueueResult"/>.</summary>
     /// <remarks>
@@ -58,9 +58,6 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         return new(_state.WakeSignal);
     }
 
-    /// <summary>See <see cref="IPipelineSource{T,TEnumerator}.AttachDepthHook"/>.</summary>
-    public void AttachDepthHook(Action onEnqueue) => _state.OnEnqueue = onEnqueue;
-
     /// <summary>Returns a struct enumerator that the pipeline drives via <c>await foreach</c>.</summary>
     /// <remarks>
     /// Registers a callback on <paramref name="cancellationToken"/> that completes the wake signal,
@@ -68,11 +65,10 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// the enumerator would wait forever on the wake signal while the pipeline considers itself
     /// shut down.
     /// </remarks>
-    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken)
+    public Enumerator GetAsyncEnumerator(Action? onEnqueue = null, CancellationToken cancellationToken = default)
     {
-        if (cancellationToken.CanBeCanceled)
-            cancellationToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
-        return new(_state, cancellationToken);
+        _state.OnEnqueue = onEnqueue;
+        return new(_state, cancellationToken);  // Enumerator combines _state.CancellationToken internally.
     }
 
     static void ThrowCompleted() => throw new InvalidOperationException("The source has been completed.");
@@ -92,9 +88,15 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         public readonly WakeSignal WakeSignal;
         public T Current = default!;
         public Action? OnEnqueue;
+        // Source-level cancellation. Per-enumeration CT (passed to GetAsyncEnumerator) gets
+        // linked with this in the Enumerator's CTS construction.
+        public readonly CancellationToken CancellationToken;
 
-        public State(bool runContinuationsAsynchronously, PipelineScheduler scheduler)
-            => WakeSignal = new(runContinuationsAsynchronously, scheduler);
+        public State(bool runContinuationsAsynchronously, PipelineScheduler scheduler, CancellationToken cancellationToken)
+        {
+            WakeSignal = new(runContinuationsAsynchronously, scheduler);
+            CancellationToken = cancellationToken;
+        }
     }
 
     /// <summary>
@@ -114,18 +116,38 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     }
 
     /// <summary>The struct enumerator driven by the pipeline's <c>await foreach</c>.</summary>
-    public struct Enumerator : IAsyncEnumerator<T>
+    public struct Enumerator : IPipelineEnumerator<T>
     {
         readonly State _state;
-        readonly CancellationToken _cancellationToken;
+        readonly CancellationTokenSource _cts;
+        // Captured at construction. CancellationToken is a struct holding a reference to the CTS;
+        // IsCancellationRequested is a passive read of the source's state that works even after
+        // Dispose (the state field retains its Notifying value). Capturing avoids the
+        // ObjectDisposedException that would fire if we read _cts.Token after Dispose.
+        readonly CancellationToken _completionToken;
 
-        internal Enumerator(State state, CancellationToken cancellationToken)
+        internal Enumerator(State state, CancellationToken perCallCt)
         {
             _state = state;
-            _cancellationToken = cancellationToken;
+            var sourceCt = state.CancellationToken;
+            // Combine source-level CT (set at UnboundedQueueSource.Create) and per-call CT
+            // (passed to GetAsyncEnumerator, e.g., from await foreach with WithCancellation).
+            // Linked source forwards cancellation from either.
+            _cts = (sourceCt.CanBeCanceled, perCallCt.CanBeCanceled) switch
+            {
+                (true, true) => CancellationTokenSource.CreateLinkedTokenSource(sourceCt, perCallCt),
+                (true, false) => CancellationTokenSource.CreateLinkedTokenSource(sourceCt),
+                (false, true) => CancellationTokenSource.CreateLinkedTokenSource(perCallCt),
+                (false, false) => new CancellationTokenSource(),
+            };
+            _completionToken = _cts.Token;
+            _completionToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
         }
 
         public T Current => _state.Current;
+        public CancellationToken CompletionToken => _completionToken;
+
+        public void Complete() => _cts.Cancel();
 
         public async ValueTask<bool> MoveNextAsync()
         {
@@ -139,13 +161,14 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
                 _state.WakeSignal.AcquireWakeLock();
                 _state.NotEmpty = false;
 
-                if (_state.Queue.TryDequeue(out _state.Current))
+                if (_state.Queue.TryDequeue(out var current))
                 {
+                    _state.Current = current!;
                     _state.WakeSignal.ReleaseWakeLock();
                     return true;
                 }
 
-                if (_state.WakeSignal.IsCompleted || _cancellationToken.IsCancellationRequested)
+                if (_state.WakeSignal.IsCompleted || _completionToken.IsCancellationRequested)
                 {
                     _state.WakeSignal.ReleaseWakeLock();
                     return false;
@@ -159,7 +182,8 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
 
         public ValueTask DisposeAsync()
         {
-            _state.WakeSignal.Complete();
+            _cts.Cancel();   // idempotent, in case caller skipped Complete()
+            _cts.Dispose();  // releases linked-CTS registration on the external token's source
             return default;
         }
     }

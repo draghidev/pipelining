@@ -11,11 +11,11 @@ public class PipelineLifecycleTests
         var first = pipeline.CompleteAsync();
         var second = pipeline.CompleteAsync();
 
-        // First-writer guard: both calls observe the same underlying execution task.
+        // First-writer guard: both calls observe the same underlying execution task. Both
+        // awaits complete cleanly. CompleteAsync's returned task is the proxy for "pipeline ran
+        // to completion" — CompletionToken doesn't fire on CompleteAsync in the new design.
         await first;
         await second;
-        // Should not throw, both should complete cleanly.
-        Assert.IsTrue(pipeline.CompletionToken.IsCancellationRequested);
     }
 
     /// CompleteAsync() signals the wake signal's CompletionToken. Policies that observe it from
@@ -425,7 +425,6 @@ public class PipelineLifecycleTests
         // Outside-thread CompleteAsync returns the same execution task. Awaiting confirms drain.
         await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
         Assert.IsNull(item.Exception);
-        Assert.IsTrue(pipeline.CompletionToken.IsCancellationRequested);
     }
 
     struct ReentrantCompletePolicy : IPipelinePolicy<TestPipelineItem>

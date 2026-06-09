@@ -3,22 +3,23 @@ using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using Draghi.Pipelining.Internal;
 
-// Pipeline composes the Internal-namespace SPSC queue primitive.
-#pragma warning disable DRAGHI001
-
 namespace Draghi.Pipelining;
 
 /// <summary>
 /// Source-driven pipelined request/response coordinator. Consumes items from an
 /// <see cref="IPipelineSource{T,TEnumerator}"/> via <c>await foreach</c> and processes each
-/// through the policy's lifecycle (execute/activate/complete/recover). The class is not
-/// thread-safe. All public instance methods (<see cref="CompleteAsync"/>,
-/// <see cref="GetEnumerator"/>, the <see cref="Depth"/> getter,
-/// <see cref="CompletionToken"/>) must be invoked from a single caller at a time. Concurrent
-/// calls produce undefined results (stale signals, missed completions). Callers needing
-/// multi-threaded access must serialize externally.
+/// through the policy's lifecycle (execute/activate/complete/recover). Cancellation and
+/// completion are owned by the source's enumerator (see <see cref="IPipelineEnumerator{T}"/>).
+/// <see cref="CompleteAsync"/> drives shutdown by signalling that enumerator.
 /// </summary>
 /// <remarks>
+/// <para>
+/// The class is not thread-safe. <see cref="CompleteAsync"/>, <see cref="GetEnumerator"/>, and
+/// the <see cref="Depth"/> getter must be invoked from a single caller at a time. Concurrent
+/// calls produce undefined results (stale signals, missed completions). Callers needing
+/// multi-threaded access must serialize externally.
+/// </para>
+/// <para>
 /// Internally the class IS concurrent: the execution loop runs on its own scheduler thread, the
 /// advancer can fire on threadpool continuations driven by waiter-task completions, and the
 /// recovery paths span async boundaries. The "not thread-safe" contract applies specifically to
@@ -26,19 +27,22 @@ namespace Draghi.Pipelining;
 /// for the target use case (connection-bound network protocol clients with a single producer).
 /// Adding piecemeal thread safety to individual methods is worse than committing to either pure
 /// stance, so we don't.
+/// </para>
 /// </remarks>
 public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     where TPolicy : IPipelinePolicy<T>
     where TSource : IPipelineSource<T, TEnumerator>
-    where TEnumerator : struct, IAsyncEnumerator<T>
+    where TEnumerator : struct, IPipelineEnumerator<T>
 {
     TPolicy _policy;
     TSource _source;
     TEnumerator _enumerator;
 
-    // Execution.
-    readonly CancellationTokenSource _completionCts;
-    readonly Task _executionTask;
+    // Execution. Field-initialized to a completed sentinel so the first call to Initialize from
+    // the constructor sees a "completed previous run" and proceeds. On run completion, ExecuteSource
+    // swaps the field back to Task.CompletedTask, releasing the prior ExecuteSource task box. The
+    // cached-but-idle Pipeline shell's footprint then shrinks to just its own fields.
+    Task _executionTask = Task.CompletedTask;
     // Pipeline state.
     bool _completing; // First-writer guard for CompleteAsync.
     Pipeline.DepthState _depthState;
@@ -71,18 +75,34 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     internal Pipeline(TPolicy policy, TSource source)
     {
-        _policy = policy;
-        _source = source;
-        _completionCts = new();
         _waiters = new();
         _onWaiterTaskCompletedAction = OnWaiterTaskCompleted;
         _incrementDepthAction = IncrementDepth;
-        // AttachDepthHook before GetAsyncEnumerator: a source could legally start producing items
-        // (or accept producer enqueues) the moment an enumerator exists, and we need the hook
-        // wired so the very first admission lands in _depthState.
-        _source.AttachDepthHook(_incrementDepthAction);
-        _enumerator = _source.GetAsyncEnumerator(_completionCts.Token);
+        Initialize(policy, source);
+    }
+
+    /// Per-run init: sets policy + source, resets transient executor state, creates a fresh enumerator
+    /// and execution task. Called from the constructor and by callers for flyweight reuse. Throws if the
+    /// previous run hasn't fully completed (first call uses a completed sentinel).
+    [System.Diagnostics.CodeAnalysis.MemberNotNull(nameof(_policy), nameof(_source))]
+    internal void Initialize(TPolicy policy, TSource source)
+    {
+        if (!_executionTask.IsCompleted)
+            throw new InvalidOperationException("Cannot (re)initialize a pipeline whose previous run hasn't fully completed. Await CompleteAsync's returned task first.");
+
+        _policy = policy;
+        _source = source;
+        _completing = false;
+
+        // GetAsyncEnumerator takes the depth-increment callback inline. Source binds it before
+        // any item can be admitted, so the very first admission lands in _depthState. Pipeline
+        // doesn't pass a CT here: source owns its own cancellation lifecycle (caller-configured
+        // at source construction).
+        _enumerator = _source.GetAsyncEnumerator(_incrementDepthAction);
         _executionTask = ExecuteSource();
+
+        // Other per-run fields are left at default: field-initialized on first run, or zeroed by the
+        // previous run's ExecuteSource-exit cleanup.
     }
 
     void IncrementDepth() => _depthState.IncrementDepth();
@@ -90,13 +110,6 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // Off the hot path (advancer/recovery handoff), so OS handoff on contention is preferable.
     readonly Lock _activationLock = new();
 
-
-    /// <summary>
-    /// Cancellation token fired by <see cref="CompleteAsync"/>. Can be linked or passed to IO operations
-    /// to abort them on shutdown. The same token is delivered to <see cref="IPipelinePolicy{T}.ExecuteItemAsync"/>
-    /// and <see cref="IPipelinePolicy{T}.OnExecutionIdleAsync"/>. Policies should observe it to allow shutdown to proceed.
-    /// </summary>
-    public CancellationToken CompletionToken => _completionCts.Token;
 
     /// <summary>Current count of items in the pipeline (queued + in flight + waiting). Lock-free read,
     /// may be stale by the time the caller observes it. Use <see cref="WaitForEmptyAsync"/> to await depth zero.</summary>
@@ -139,9 +152,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return new(_executionTask);
 
         _completionException = exception;
-        _completionCts.Cancel();
+        // Complete() signals the enumeration to wind down: cancels CompletionToken (firing policy
+        // CT for in-flight ExecuteItemAsync calls) and signals the source's wake/completion
+        // mechanism via the registered callback. The enumerator stays usable for drain reads.
+        // DisposeAsync runs at the end of the executor's main loop as the terminal cleanup.
+        _enumerator.Complete();
 
-        // The executor drains remaining items on exit. Await it for full completion.
         return new(_executionTask);
     }
 
@@ -201,13 +217,13 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
                 try
                 {
-                    itemResult = await _policy.ExecuteItemAsync(item, _completionCts.Token).ConfigureAwait(false);
+                    itemResult = await _policy.ExecuteItemAsync(item, _enumerator.CompletionToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
                     ClearExecutingItem(activated);
-                    await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), activated, _completionCts.Token).ConfigureAwait(false);
-                    goto afterItem;
+                    await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), activated, _enumerator.CompletionToken).ConfigureAwait(false);
+                    continue;
                 }
 
                 // Sync shortcut: only taken when both tasks are already observed successful at dispatch
@@ -232,8 +248,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     }
                     catch (Exception ex)
                     {
-                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), activated, _completionCts.Token).ConfigureAwait(false);
-                        goto afterItem;
+                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), activated, _enumerator.CompletionToken).ConfigureAwait(false);
+                        continue;
                     }
                 }
                 else
@@ -258,13 +274,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     {
                         if (_hasTailWaiter)
                         {
-                            await RecoverTrailingFailure(item, activated, ex, _completionCts.Token).ConfigureAwait(false);
+                            await RecoverTrailingFailure(item, activated, ex, _enumerator.CompletionToken).ConfigureAwait(false);
                         }
                     }
                 }
-
-                afterItem:
-                ;
             }
 
             // Clear the locals so the executor's async state machine box does not
@@ -275,13 +288,32 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // No post-loop CommitTailWaiter needed: the top-of-loop commit already ran before the
             // MoveNextAsync that returned false.
         }
-        catch (OperationCanceledException) when (_completionCts.IsCancellationRequested)
+        catch (OperationCanceledException) when (_enumerator.CompletionToken.IsCancellationRequested)
         {
             // Source's MoveNextAsync threw OCE on shutdown, expected.
         }
 
         await DrainOnCompletionAsync();
         await _enumerator.DisposeAsync().ConfigureAwait(false);
+
+        // ExecuteSource has fully completed: all items drained, enumerator disposed, advancer
+        // chain quiesced. Default the per-run reference-holding fields so a cached-but-idle
+        // Pipeline shell doesn't hold them across an idle period. Trimmed to the safe minimum:
+        // only reference-typed and reference-containing fields that could be promoted to gen1/2.
+        // _completing is set to true so any racing CompleteAsync first-call returns the (about-
+        // to-be-swapped-to-CompletedTask) execution task without touching the defaulted fields.
+        _completing = true;
+        _completionException = null;
+        _policy = default!;
+        _source = default!;
+        _enumerator = default;
+        _tailWaiter = default!;
+        _tailWaiterTask = default;
+        _executingItem = default!;
+        _waiters.Reset();
+        _waiterRecoveryItem = default!;
+        _advancerIdleTcs = null;
+        _executionTask = Task.CompletedTask;
     }
 
     /// Drains remaining items after the execution loop exits. Waits for the advancer chain to
@@ -327,7 +359,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         ActivateHeadItem(recoveryItem, preferAsync: false);
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
                 await result.TrailingExecutionTask.ConfigureAwait(false);
@@ -397,7 +429,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
             {
@@ -513,7 +545,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
 
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, exception);
-        if (!_policy.TryRecoverItemFailure(context, item, _completionCts.Token, out var recoveryItem))
+        if (!_policy.TryRecoverItemFailure(context, item, _enumerator.CompletionToken, out var recoveryItem))
         {
             CompleteWaiter(item, exception);
             return;
@@ -524,7 +556,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         PipelineItemResult result;
         try
         {
-            result = await _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token).ConfigureAwait(false);
+            result = await _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken).ConfigureAwait(false);
         }
         catch (Exception recoveryEx)
         {
@@ -559,7 +591,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
             CompleteWaiter(recoveryItem, pipelineException);
         }
-        else if (_completionCts.IsCancellationRequested)
+        else if (_enumerator.CompletionToken.IsCancellationRequested)
         {
             // Pipeline shutdown while recovery's async work was in flight. EnqueueWaiter at this
             // point would leak: OnWaiterTaskCompleted bails on wake completion, and DrainOnCompletionAsync
@@ -606,7 +638,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (waiterTask.IsCompleted)
             OnWaiterTaskCompleted();
         else
-            waiterTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(_onWaiterTaskCompletedAction);
+            waiterTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(callback);
+
+        // During first escalation a slot callback can fire after the queue is published but
+        // before the slot contents are moved into it, bumping completedCount without finding
+        // anything to drain. Without this nudge the slot item would wait for the next callback
+        // fire, unbounded when the next item is a long-lived flow (exclusive scope, COPY, LISTEN).
+        if (slotWasMoved && _waiterCompletedCount > 0 && _advancing.TryAcquire())
+            DrainReadyWaiters();
     }
 
     /// Called when a waiter's pipeline task completes. Signals readiness and tries to become the advancer.
@@ -616,7 +655,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         // Try to become the advancer, only one thread processes completions at a time.
         // Don't acquire if completed, CompleteAsync will drain remaining items.
-        if (_completionCts.IsCancellationRequested || !_advancing.TryAcquire())
+        if (_enumerator.CompletionToken.IsCancellationRequested || !_advancing.TryAcquire())
             return;
 
         DrainReadyWaiters();
@@ -702,7 +741,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // is safe: sandwiched between this release and TryReclaimAdvancerForWork's acquire,
             // both full barriers via Latch's underlying Interlocked.Exchange.
             _advancing.Release();
-        } while (!_completionCts.IsCancellationRequested && _waiterCompletedCount > 0 && TryReclaimAdvancerForWork());
+        } while (!_enumerator.CompletionToken.IsCancellationRequested && _waiterCompletedCount > 0 && TryReclaimAdvancerForWork());
 
         SignalAdvancerIdleIfWaiting();
 
@@ -742,7 +781,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
 
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTaskWaiter, ex);
-        if (!_policy.TryRecoverItemFailure(context, failedItem, _completionCts.Token, out var recoveryItem))
+        if (!_policy.TryRecoverItemFailure(context, failedItem, _enumerator.CompletionToken, out var recoveryItem))
         {
             CompleteWaiter(failedItem, ex);
             return true;
@@ -754,7 +793,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         ValueTask<PipelineItemResult> executeTask;
         try
         {
-            executeTask = _policy.ExecuteItemAsync(recoveryItem, _completionCts.Token);
+            executeTask = _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken);
         }
         catch (Exception recoveryEx)
         {
@@ -777,7 +816,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         executeTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
         {
             // Bailout: wake signal completed while recovery's executeTask was in flight.
-            if (_completionCts.IsCancellationRequested)
+            if (_enumerator.CompletionToken.IsCancellationRequested)
             {
                 try { executeTask.GetAwaiter().GetResult(); }
                 catch { /* shutdown in progress, exception observed and discarded */ }
@@ -831,7 +870,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     catch (Exception ex) { trailingEx = ex; }
 
                     // Bailout: wake signal completed while recovery's trailing task was in flight.
-                    if (_completionCts.IsCancellationRequested)
+                    if (_enumerator.CompletionToken.IsCancellationRequested)
                     {
                         BailoutRecoveryOnShutdown();
                         return;
@@ -886,7 +925,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             {
                 pipelineException = ex;
             }
-            if (_completionCts.IsCancellationRequested)
+            if (_enumerator.CompletionToken.IsCancellationRequested)
             {
                 // Bailout: wake signal completed while recovery's pipeline task was in flight.
                 BailoutRecoveryOnShutdown();
@@ -1064,18 +1103,48 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 public static class Pipeline
 {
     /// <summary>Construct a source-driven pipeline against a caller-supplied source.</summary>
-    public static Pipeline<T, TPolicy, TSource, TEnumerator> Create<T, TPolicy, TSource, TEnumerator>(TPolicy policy, TSource source)
+    /// <remarks>
+    /// No CancellationToken parameter: the caller-supplied source owns its own cancellation
+    /// lifecycle (either at source construction or by integrating their CT into the source's
+    /// GetAsyncEnumerator implementation). Threading another CT through here would be redundant.
+    /// <para>
+    /// Flyweight reuse: pass a previously-completed <paramref name="instance"/> to rebind it
+    /// against the new <paramref name="policy"/> + <paramref name="source"/> and restart it.
+    /// The shell allocation (waiter queue, delegates, depth/latch machinery) gets reused; the
+    /// per-run state (enumerator, execution task) gets fresh.
+    /// </para>
+    /// <para>
+    /// The natural call-site pattern when caller caches a nullable pipeline field:
+    /// <code>_cachedPipeline = Pipeline.Create(policy, source, _cachedPipeline);</code>
+    /// First call: <paramref name="instance"/> is null → fresh allocation.
+    /// Subsequent calls: <paramref name="instance"/> is non-null → shell reuse.
+    /// </para>
+    /// <para>
+    /// Throws if <paramref name="instance"/> is non-null but its previous run hasn't fully
+    /// completed (caller must await the previous CompleteAsync's returned task first).
+    /// </para>
+    /// </remarks>
+    public static Pipeline<T, TPolicy, TSource, TEnumerator> Create<T, TPolicy, TSource, TEnumerator>(TPolicy policy, TSource source, Pipeline<T, TPolicy, TSource, TEnumerator>? instance = null)
         where TPolicy : IPipelinePolicy<T>
         where TSource : IPipelineSource<T, TEnumerator>
-        where TEnumerator : struct, IAsyncEnumerator<T>
-        => new(policy, source);
+        where TEnumerator : struct, IPipelineEnumerator<T>
+    {
+        if (instance is null)
+            return new(policy, source);
+        instance.Initialize(policy, source);
+        return instance;
+    }
 
     /// <summary>Construct a queue-backed pipeline. Returns a <see cref="QueuedPipeline{T,TPolicy}"/> that
     /// exposes <see cref="QueuedPipeline{T,TPolicy}.Enqueue"/> directly.</summary>
-    public static QueuedPipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy, bool runContinuationsAsynchronously = true, PipelineScheduler? scheduler = null)
+    /// <remarks>
+    /// The cancellation token is passed to the internally-created source. Pipeline itself stays
+    /// CT-free, and the source owns the cancellation lifecycle.
+    /// </remarks>
+    public static QueuedPipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy, bool runContinuationsAsynchronously = true, PipelineScheduler? scheduler = null, CancellationToken cancellationToken = default)
         where TPolicy : IPipelinePolicy<T>
     {
-        var source = UnboundedQueueSource<T>.Create(runContinuationsAsynchronously, scheduler ?? policy.ExecutionScheduler);
+        var source = UnboundedQueueSource<T>.Create(runContinuationsAsynchronously, scheduler ?? policy.ExecutionScheduler, cancellationToken);
         var pipeline = new Pipeline<T, TPolicy, UnboundedQueueSource<T>, UnboundedQueueSource<T>.Enumerator>(policy, source);
         return new QueuedPipeline<T, TPolicy>(pipeline, source);
     }

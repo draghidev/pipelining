@@ -29,27 +29,24 @@ namespace Draghi.Pipelining;
 /// </para>
 /// </remarks>
 public interface IPipelineSource<T, TEnumerator>
-    where TEnumerator : struct, IAsyncEnumerator<T>
+    where TEnumerator : struct, IPipelineEnumerator<T>
 {
     /// <summary>
     /// Returns a concrete struct enumerator the pipeline drives via <c>await foreach</c>. Called
     /// once per pipeline lifetime when the executor loop starts.
     /// </summary>
     /// <param name="cancellationToken">The pipeline's shutdown signal.</param>
-    TEnumerator GetAsyncEnumerator(CancellationToken cancellationToken);
-
-    /// <summary>
-    /// Called once by the pipeline during construction to deliver the depth-increment callback.
-    /// The source must invoke <paramref name="onEnqueue"/> each time it admits an item that will
+    /// <param name="onEnqueue">
+    /// Depth-increment callback. The source must invoke this each time it admits an item that will
     /// later be returned from <c>MoveNextAsync</c>. The pipeline decrements depth itself once the
     /// policy's <c>CompleteItem</c> fires. Sources that never produce items (pure adapters that
-    /// always wait) can ignore the hook.
-    /// </summary>
-    /// <remarks>
+    /// always wait) can ignore it.
     /// Invariant: every successful (returns true) <c>MoveNextAsync</c> must be preceded by exactly
-    /// one <paramref name="onEnqueue"/> invocation (the item entering the source's buffer or being
-    /// admitted from an external producer). Failing to invoke it leaves <c>Pipeline.Depth</c>
-    /// negative when the item completes.
-    /// </remarks>
-    void AttachDepthHook(Action onEnqueue) { }
+    /// one invocation of this callback (the item entering the source's buffer or being admitted from
+    /// an external producer). Failing to invoke it leaves <c>Pipeline.Depth</c> negative when the
+    /// item completes.
+    /// Scoped to the enumeration: each new enumerator gets its own depth-hook binding, which keeps
+    /// re-enumerable sources cleanly isolated across pipelines.
+    /// </param>
+    TEnumerator GetAsyncEnumerator(Action? onEnqueue = null, CancellationToken cancellationToken = default);
 }

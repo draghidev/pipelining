@@ -129,15 +129,23 @@ public class PipelineTests
     }
 
     [TestMethod]
-    public async Task CompletionTokenFiresOnComplete()
+    public async Task QueuedPipelineCompletionToken_TracksExternalSourceCt()
     {
+        using var externalCts = new CancellationTokenSource();
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true));
+            new(true), cancellationToken: externalCts.Token);
 
+        // QueuedPipeline.CompletionToken is the source-level CT (stable for the queue's
+        // lifetime). It does NOT fire on CompleteAsync — that's what CompleteAsync's task is for.
         Assert.IsFalse(pipeline.CompletionToken.IsCancellationRequested);
 
         await pipeline.CompleteAsync();
 
+        // Still not cancelled — external CT was never fired.
+        Assert.IsFalse(pipeline.CompletionToken.IsCancellationRequested);
+
+        // External cancellation fires the token.
+        externalCts.Cancel();
         Assert.IsTrue(pipeline.CompletionToken.IsCancellationRequested);
     }
 

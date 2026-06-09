@@ -29,8 +29,11 @@ public sealed class QueuedPipeline<T, TPolicy>
         Source = source;
     }
 
-    /// <summary>Cancellation token fired by <see cref="CompleteAsync"/>.</summary>
-    public CancellationToken CompletionToken => Pipeline.CompletionToken;
+    /// <summary>The source-level cancellation token (set when constructing the underlying
+    /// <see cref="UnboundedQueueSource{T}"/>). Stable for the QueuedPipeline's lifetime. Fires only
+    /// when the externally-provided CT is cancelled. <see cref="CompleteAsync"/> does NOT fire it
+    /// (CompleteAsync's returned task is the proxy for "pipeline ran to completion").</summary>
+    public CancellationToken CompletionToken => Source.CancellationToken;
 
     /// <summary>Current pipeline depth.</summary>
     public int Depth => Pipeline.Depth;

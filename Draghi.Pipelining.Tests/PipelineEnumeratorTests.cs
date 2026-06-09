@@ -1,8 +1,40 @@
 namespace Draghi.Pipelining.Tests;
 
+using Draghi.Pipelining.Internal;
+
 [TestClass]
 public class PipelineEnumeratorTests
 {
+    // Verifies that the C# await foreach pattern still binds to GetAsyncEnumerator after the
+    // signature gained an optional Action? onEnqueue parameter. The compiler looks for a
+    // GetAsyncEnumerator method whose only required parameter is a CancellationToken (or none);
+    // optional params with defaults must not prevent binding. Test passes if it compiles.
+    [TestMethod]
+    public async Task AwaitForeach_BindsToSourceGetAsyncEnumerator()
+    {
+        var source = UnboundedQueueSource<int>.Create();
+        source.Enqueue(1);
+        source.Enqueue(2);
+        source.Enqueue(3);
+
+        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+
+        var observed = new List<int>();
+        try
+        {
+            await foreach (var item in source)
+            {
+                observed.Add(item);
+                if (observed.Count == 3)
+                    cts.Cancel();
+                cts.Token.ThrowIfCancellationRequested();
+            }
+        }
+        catch (OperationCanceledException) { }
+
+        CollectionAssert.AreEqual(new[] { 1, 2, 3 }, observed);
+    }
+
     [TestMethod]
     public void Empty_YieldsNothing()
     {
