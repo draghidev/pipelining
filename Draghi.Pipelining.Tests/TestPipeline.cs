@@ -27,6 +27,11 @@ sealed class TestPipelineItem
 
     public Exception? Exception { get; private set; }
     public bool IsCompleted { get; private set; }
+    public bool IsExecuted => _executed.IsSet;
+
+    // Non-asserting waits for stress runners that own their timeout/diagnosis/park handling.
+    public bool TryWaitForExecuted(TimeSpan timeout) => _executed.Wait(timeout);
+    public bool TryWaitForCompleted(TimeSpan timeout) => _completed.Wait(timeout);
     public Exception? ThrowOnExecute { get; init; }
     public Exception? PipelineTaskException { get; init; }
     public Exception? TrailingTaskException { get; init; }
@@ -208,6 +213,13 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
 
     public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
     {
+        // Depth-accounting sentinel: a negative remainingDepth means a double-decrement
+        // (a recovery double-completion door, or depth/count token disagreement). Asserting
+        // here turns every test plus the stress runners into a detector for the whole
+        // accounting family - the policy seam is the contract surface, so this is where
+        // "never report a negative depth" is pinned.
+        if (remainingDepth < 0)
+            Assert.Fail($"CompleteItem observed negative remainingDepth {remainingDepth} for item {item.Name ?? "?"}.");
         item.Complete(exception);
     }
 

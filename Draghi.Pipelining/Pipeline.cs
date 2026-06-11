@@ -78,7 +78,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // SPSC queue inside it is lazy-allocated only on true overlap (a second waiter arrives while
     // the first is still pending). See WaiterStore<T>.
     WaiterStore<T> _waiters;
-    int _waiterCompletedCount; // Number of completed waiter tasks not yet processed by the advancer.
+    // Completions-since-pass-start dirty flag. Callbacks that bail set it (plain write, published by
+    // their TryAcquire's full fence). Drain passes consume it with an Interlocked.Exchange at pass
+    // start, and the post-release recheck closes the lost-wake window - the clear/fence/recheck gate.
+    bool _drainSignal;
     Latch _advancing; // Held while a thread is currently the advancer. See Latch.cs for semantics.
     T _waiterRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
     TaskCompletionSource? _drainWakeupTcs; // Set by DrainOnCompletionAsync while waiting for the advancer chain to release and _waiters to empty. Signaled by callbacks at end-of-cycle so drain can re-check both conditions.
@@ -729,6 +732,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     bool CompleteWaiterDeferred(T item, Exception? exception)
     {
         var depth = _depthState.DecrementDepth();
+        // A negative depth means a double-decrement, which would feed garbage to the policy and let
+        // the zero-signal comparison miss forever (a stranded WaitForEmptyAsync). The comparison stays
+        // `is 0` deliberately: <= would mask the same corruption by double-signaling.
+        Debug.Assert(depth >= 0, "Pipeline depth under-ran: double completion for a single enqueue.");
         _policy.CompleteItem(item, depth, exception);
         return depth is 0;
     }
@@ -789,14 +796,16 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // before the slot contents are moved into it, bumping completedCount without finding
         // anything to drain. Without this nudge the slot item would wait for the next callback
         // fire, unbounded when the next item is a long-lived flow (exclusive scope, COPY, LISTEN).
-        if (slotWasMoved && _waiterCompletedCount > 0 && _advancing.TryAcquire())
+        if (slotWasMoved && Volatile.Read(ref _drainSignal) && _advancing.TryAcquire())
             DrainReadyWaiters();
     }
 
     /// Called when a waiter's pipeline task completes. Signals readiness and tries to become the advancer.
     void OnWaiterTaskCompleted()
     {
-        Interlocked.Increment(ref _waiterCompletedCount);
+        // Plain store: the TryAcquire below is the full fence that publishes it, pairing with
+        // the holder's fenced Release before its signal recheck (the Dekker halves).
+        _drainSignal = true;
 
         // Try to become the advancer, only one thread processes completions at a time.
         // Process even during shutdown: drain's wait-for-advancer-idle is what coordinates with
@@ -815,7 +824,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// callback functions as OnWaiterTaskCompleted and the standard advancer drains the queue.
     void OnCommittedTaskCompleted()
     {
-        Interlocked.Increment(ref _waiterCompletedCount);
+        // Plain store, published by the TryAcquire fence (see OnWaiterTaskCompleted).
+        _drainSignal = true;
 
         // Process even during shutdown (see OnWaiterTaskCompleted).
         if (!_advancing.TryAcquire())
@@ -848,13 +858,16 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 return;
             }
             // Slot already drained elsewhere. Shouldn't happen given single-callback wiring.
-            Interlocked.Decrement(ref _waiterCompletedCount);
+            // (No signal bookkeeping: a stale dirty flag costs one spurious reclaim check.)
             _advancing.Release();
             SignalDrainWakeupIfWaiting();
             return;
         }
 
-        Interlocked.Decrement(ref _waiterCompletedCount);
+        // Pass start: consume the signal (full fence orders the clear before this pass's
+        // reads). Completions that fire during the pass re-set it and the post-release
+        // recheck below catches them - the clear/fence/recheck gate.
+        Interlocked.Exchange(ref _drainSignal, false);
 
         // Consume the waiter task BEFORE DecrementCount publishes the freed position to the
         // executor's Count==0 inline-activation gate. The consume is the release point for
@@ -874,7 +887,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
 
         var count = _waiters.DecrementCount();
-        Debug.Assert(count >= 0);
+        // -1 floor, not 0: a claimable-but-uncounted commit (fields/flag precede the increment)
+        // consumed here sends the count transiently negative, bounded at -1 by the single producer.
+        Debug.Assert(count >= -1);
         // No count==0 assertion: TryClaimSlotForDrain already emptied the slot, so a successor's
         // commit can CAS into it (or first-escalate) before our decrement lands - the store's
         // _hasSlot CAS is the ownership contract, not the count. The returned count is the
@@ -944,7 +959,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // count increment, so whichever Exchange wins owns that item's activation exactly once.
             lock (_activationLock!)
             {
-                if (_waiters.Count is 0 && Interlocked.Exchange(ref _hasExecutingItem, false))
+                // <= 0, not == 0: a negative count means the in-flight commit's entry was already
+                // completed-and-consumed (skew bound -1), so the deferred publish is the only live
+                // responsibility and this claim is correct. The committer's own late increment returns
+                // <= 0 (wasEmpty false) and its IsCompleted guard skips, so without this arm both sides
+                // skip and the publish strands.
+                if (_waiters.Count <= 0 && Interlocked.Exchange(ref _hasExecutingItem, false))
                 {
                     var executing = _executingItem;
                     if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -965,14 +985,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Reclaim, mirroring the queue drain's do-while: a successor's waiter that completed
         // while we held the advancer had its callback TryAcquire-fail and bail - with no
         // reclaim the activation chain dies there (field signature: "Operation timed out
-        // waiting for activation"). In non-escalated slot mode, completedCount > 0 implies
+        // waiting for activation"). In non-escalated slot mode, a set drain signal implies
         // the bailed waiter IS the current slot occupant with a completed task (a commit
         // against an occupied slot escalates instead), so looping back to the claim is safe.
         // Verified: Pipeline.tla SlotDrainerReclaim / Pipeline_StrandWitness.cfg
         // (SlotReclaimEnabled=FALSE reproduces the lost-activation liveness violation; TRUE
         // holds EventuallyCompleted and NoTripleActivation across the full state space).
         if (!_enumerator.CompletionToken.IsCancellationRequested
-            && Volatile.Read(ref _waiterCompletedCount) > 0
+            && Volatile.Read(ref _drainSignal)
             && _advancing.TryAcquire())
         {
             if (_waiters.IsEscalated)
@@ -996,10 +1016,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         var emptyReached = false;
         do
         {
+            // Sub-pass start: consume the signal (full fence orders the clear before the pass's queue
+            // reads). Completions firing mid-pass re-set it and the do-while's post-release recheck
+            // catches them - the clear/fence/recheck gate.
+            Interlocked.Exchange(ref _drainSignal, false);
+
             while (_waiters.TryPeek(out var item) && item.WaiterTask.IsCompleted)
             {
                 _waiters.TryDequeue(out _);
-                Interlocked.Decrement(ref _waiterCompletedCount);
 
                 // Process the completed waiter. The consume here already precedes this
                 // path's DecrementCount below - the queue drain has always had the
@@ -1042,9 +1066,16 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
                 // Advance: decrement queue count and activate next.
                 var count = _waiters.DecrementCount();
-                Debug.Assert(count >= 0);
+                // -1 floor, not 0: consuming a visible-but-uncounted entry (the committer is between
+                // its enqueue and its increment, its task completed at commit) sends the count
+                // transiently negative, bounded at -1 by the single producer.
+                Debug.Assert(count >= -1);
 
-                if (count is 0)
+                // <= 0, not == 0: the C-path must also own the skewed -1 case. The consumed entry was
+                // the in-flight commit (already completed, so its wasEmpty/IsCompleted guards skip),
+                // leaving the deferred publish as the only live responsibility. Routing -1 to the
+                // D-path arm instead activates default(T) through the unchecked peek (an NRE).
+                if (count <= 0)
                 {
                     // Last waiter drained. Hold the lock around claim+activate so the executor's
                     // ClearExecutingItem fence-acquire blocks until ActivateHeadItem finishes.
@@ -1058,9 +1089,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                             // Decrement and here can enqueue waiters and re-publish _executingItem.
                             // The latest publish is no longer the head, so activating here would
                             // double-activate (now via C-path, again via D-path). Skip when count > 0.
+                            // <= 0 like the outer test: the skewed -1 is a C-path state too.
                             // Plain read: the Exchange above is a full fence (acquire on the read),
                             // so this read sees the latest committed value without its own LDAR.
-                            if (_waiters.Count is 0)
+                            if (_waiters.Count <= 0)
                             {
                                 var executing = _executingItem;
                                 if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -1077,17 +1109,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 else
                 {
                     // More waiters remain, activate the next one (different item from _executingItem
-                    // so no executor-completion race, no activation lock needed).
-                    _waiters.TryPeek(out var nextItem);
-                    ActivateHeadItem(nextItem.Waiter, preferAsync: true);
+                    // so no executor-completion race, no activation lock needed). count > 0 implies a
+                    // peekable head (the count under-promises the queue, never over-promises), so the
+                    // failed peek is a canary, not a case.
+                    if (_waiters.TryPeek(out var nextItem))
+                        ActivateHeadItem(nextItem.Waiter, preferAsync: true);
+                    else
+                        Debug.Assert(false, "count > 0 with no peekable queue head.");
                 }
             }
 
-            // Release latch, then re-check for late arrivals. Plain read of _waiterCompletedCount
-            // is safe: sandwiched between this release and TryReclaimAdvancerForWork's acquire,
+            // Release latch, then re-check for late signals. Plain read of _drainSignal is
+            // safe: sandwiched between this release and TryReclaimAdvancerForWork's acquire,
             // both full barriers via Latch's underlying Interlocked.Exchange.
             _advancing.Release();
-        } while (!_enumerator.CompletionToken.IsCancellationRequested && _waiterCompletedCount > 0 && TryReclaimAdvancerForWork());
+        } while (!_enumerator.CompletionToken.IsCancellationRequested && _drainSignal && TryReclaimAdvancerForWork());
 
         // Signal AFTER advancer release for the same reason as DrainSlotInline (external awaiter
         // must not resume while internal sync is still held).
@@ -1362,9 +1398,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     void AdvanceAndDrain()
     {
         var count = _waiters.DecrementCount();
-        Debug.Assert(count >= 0);
+        Debug.Assert(count >= -1); // -1 floor, see DrainReadyWaiters.
 
-        if (count is 0)
+        // <= 0 partition + checked peek, mirroring DrainReadyWaiters (this advance is the
+        // recovery path's drain step and shares the count-skew exposure).
+        if (count <= 0)
         {
             // Same lock-guarded claim+activate as DrainReadyWaiters: lock wraps the Exchange so
             // the executor's fence-acquire blocks until ActivateHeadItem finishes.
@@ -1375,7 +1413,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 {
                     // Re-check count under the lock (see DrainReadyWaiters count==0 branch).
                     // Plain read: the Exchange above provides the acquire fence.
-                    if (_waiters.Count is 0)
+                    if (_waiters.Count <= 0)
                     {
                         var executing = _executingItem;
                         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -1389,10 +1427,13 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 }
             }
         }
+        else if (_waiters.TryPeek(out var nextItem))
+        {
+            ActivateHeadItem(nextItem.Waiter);
+        }
         else
         {
-            _waiters.TryPeek(out var nextItem);
-            ActivateHeadItem(nextItem.Waiter);
+            Debug.Assert(false, "count > 0 with no peekable queue head.");
         }
 
         // Continue draining ready items, we already hold the advancer flag.

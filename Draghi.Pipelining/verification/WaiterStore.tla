@@ -8,7 +8,19 @@
    pattern as WeakMemory.tla). Operators below model the store's API:
 
      StoreSlotCommit / StoreQueueEnqueue      TryEscalateOrEnqueue, slot / post-escalation
-                                              queue paths (single-step in code).
+                                              queue paths. StoreQueueEnqueue is the LEGACY
+                                              FUSED fiction (enqueue + increment atomic).
+     StoreQueueEnqueueVisible /               The queue commit's REAL two steps (June 2026
+       StoreCommitCount                       count-skew find): queue.Enqueue makes the entry
+                                              visible/consumable, Interlocked.Increment lands
+                                              later. A drain consuming the entry in between
+                                              sends the count NEGATIVE (StoreCountNonNegative,
+                                              the field NRE at DrainReadyWaiters' D-arm).
+                                              Enabled by Pipeline's SplitCountCommit.
+     StoreEscalateEnqueueTail                 First escalation's tail append split from its
+                                              count increment (same code lines 83-85; the
+                                              split escalation routes through StoreCommitCount
+                                              with the compensate/idle next-phase).
      StoreEscalatePublish / ClaimSlot /       TryEscalateOrEnqueue's first-escalation steps,
        Move / Enqueue                         split because callbacks interleave with them
                                               (publish queue -> Exchange slot -> move pair ->
@@ -90,11 +102,38 @@ StoreSlotCommit(i) ==
   /\ UNCHANGED <<escalated, waiters, escPhase, escTail, escSlotClaimed, escMoved>>
 
 \* Post-escalation queue path (loosened CAS: no slot touch - PostEscalationSlotEmpty).
+\* LEGACY FUSED fiction: enqueue + increment as one atomic step. The code is two steps;
+\* use the Visible/CommitCount pair below for the truthful model (SplitCountCommit).
 StoreQueueEnqueue(i) ==
   /\ escalated
   /\ waiters' = Append(waiters, i)
   /\ storeCount' = storeCount + 1
   /\ UNCHANGED <<hasSlot, slotItem, escalated, escPhase, escTail, escSlotClaimed, escMoved>>
+
+\* Truthful queue commit, step 1: queue.Enqueue - the entry is visible and consumable from
+\* this state on, while _count still excludes it. escPhase doubles as TryEscalateOrEnqueue's
+\* program counter for the steady-state call too (single producer = one in-flight call);
+\* ph carries the caller's activation variant to the count step ("q_enq_act"/"q_enq_noact").
+StoreQueueEnqueueVisible(i, ph) ==
+  /\ escalated
+  /\ escPhase = "idle"
+  /\ waiters' = Append(waiters, i)
+  /\ escTail' = i
+  /\ escPhase' = ph
+  /\ UNCHANGED <<hasSlot, slotItem, escalated, storeCount, escSlotClaimed, escMoved>>
+
+\* Truthful queue commit, step 2 (shared by the steady-state and split-escalation paths):
+\* Interlocked.Increment(_count) - the return value is the caller's wasEmpty partition.
+\* nextPhase routes the split escalation to "compensate" (slotWasMoved chain handoff) or
+\* "idle"; steady-state callers always pass "idle".
+StoreCommitCount(nextPhase) ==
+  /\ escPhase \in {"q_enq_act", "q_enq_noact", "esc_enqueued"}
+  /\ storeCount' = storeCount + 1
+  /\ escPhase' = nextPhase
+  /\ escTail' = NoItem
+  /\ escSlotClaimed' = FALSE
+  /\ escMoved' = IF nextPhase = "compensate" THEN escMoved ELSE NoItem
+  /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters>>
 
 (* ===========================================================================
    First escalation (TryEscalateOrEnqueue, slot occupied), four steps
@@ -147,6 +186,16 @@ StoreEscalateEnqueue(nextPhase) ==
   /\ escMoved' = IF nextPhase = "compensate" THEN escMoved ELSE NoItem
   /\ UNCHANGED <<hasSlot, slotItem, escalated>>
 
+\* Truthful split of Step 4's append half: enqueue the new tail, count untouched. The
+\* increment lands separately via StoreCommitCount (escSlotClaimed survives until then so
+\* the count step can compute the compensate routing). Same count-skew window as the
+\* steady-state pair: the tail is consumable from here while still uncounted.
+StoreEscalateEnqueueTail ==
+  /\ escPhase = "move_done"
+  /\ waiters' = Append(waiters, escTail)
+  /\ escPhase' = "esc_enqueued"
+  /\ UNCHANGED <<hasSlot, slotItem, escalated, storeCount, escTail, escSlotClaimed, escMoved>>
+
 \* TakeMovedSlotPair: the caller copies the moved identity (read escMoved unprimed) and
 \* the deferred fields clear; the escalation call site returns to idle.
 StoreTakeMoved ==
@@ -187,14 +236,37 @@ StoreDequeueHead ==
    =========================================================================== *)
 
 StoreTypeOK ==
-  /\ storeCount \in 0..NumItems
+  \* Range admits negatives: under the truthful split commit a drain can consume a
+  \* visible-but-uncounted entry and decrement past zero (the June 2026 count-skew bug).
+  \* The named witness for that state is StoreCountNonNegative, not TypeOK, so traces
+  \* stay attributable.
+  /\ storeCount \in -NumItems..NumItems
   /\ hasSlot \in BOOLEAN
   /\ slotItem \in Item \cup {NoItem}
   /\ escalated \in BOOLEAN
-  /\ escPhase \in {"idle", "publish_done", "cas_done", "move_done", "compensate"}
+  /\ escPhase \in {"idle", "publish_done", "cas_done", "move_done", "esc_enqueued",
+                   "q_enq_act", "q_enq_noact", "compensate"}
   /\ escTail \in Item \cup {NoItem}
   /\ escSlotClaimed \in BOOLEAN
   /\ escMoved \in Item \cup {NoItem}
+
+\* The count never observes a value below zero. EXPECTED FALSE under SplitCountCommit with
+\* the shipped drain (the queue drain's DecrementCount on a visible-but-uncounted entry,
+\* proven in the field June 2026: Debug.Assert(count >= 0) fired in DrainReadyWaiters under
+\* DeferredActivationUnderSustainedLoad_Stress). Must HOLD again once the commit/drain
+\* partition is redesigned against the split.
+StoreCountNonNegative ==
+  storeCount >= 0
+
+\* The single-producer skew bound: the executor has at most ONE commit in flight between
+\* its enqueue and its increment, so the count under-runs residency by at most 1 and a
+\* drain's decrement bottoms out at -1. This is physics (commit protocol + single producer),
+\* not a fix: it holds with or without SkewTolerantPartition, and it is the keystone of the
+\* partition repair's soundness argument - count <= 0 at the drain means "no committed
+\* positions remain except possibly one already-consumed in-flight entry", which is exactly
+\* the C-path case. Checked in Pipeline_Contract.cfg over the full split state space.
+BoundedCountSkew ==
+  storeCount >= -1
 
 \* THE invariant justifying the loosened CAS in TryEscalateOrEnqueue: outside of
 \* mid-escalation, the slot is definitively empty once escalated. No code path refills the
@@ -208,7 +280,8 @@ PostEscalationSlotEmpty ==
 \* Escalation program-counter coherence (store-internal part; the loc[escTail] clauses
 \* stay in Pipeline.tla).
 StoreEscalationConsistent ==
-  /\ (escTail # NoItem) <=> (escPhase \in {"publish_done", "cas_done", "move_done"})
+  /\ (escTail # NoItem) <=> (escPhase \in {"publish_done", "cas_done", "move_done",
+                                           "esc_enqueued", "q_enq_act", "q_enq_noact"})
   /\ (escPhase # "idle") => escalated
   /\ (escPhase = "compensate") => (escMoved # NoItem)
 

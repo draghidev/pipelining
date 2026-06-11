@@ -973,6 +973,88 @@ public class PipelineConcurrencyTests
         }
     }
 
+    /// In-proc stress runner for DeferredActivationUnderSustainedLoad (one observed field
+    /// timeout, June 2026: the tail item executed and its pipeline task was completed, but
+    /// item completion never fired; 25 isolated runs + 24 contended suite runs clean).
+    /// Rolls the drain-vs-tail-enqueue race per iteration with a minimal pile so the tail's
+    /// enqueue still sees waiters present (the deferred-activation branch). Iterations via
+    /// DRAGHI_STRESS_ITERATIONS (default 200); on a hang it reports WHICH stage stuck plus
+    /// every item's executed/completed state - the localizing facts a bare timeout hides.
+    /// DRAGHI_STRESS_PARK_ON_HANG=1 parks (after a GC shed) for live dump capture.
+    [TestMethod]
+    public async Task DeferredActivationUnderSustainedLoad_Stress()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 200;
+        const int pileSize = 4;
+        var stageTimeout = TimeSpan.FromSeconds(5);
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+            var pile = new TestPipelineItem[pileSize];
+            for (var i = 0; i < pileSize; i++)
+            {
+                pile[i] = new TestPipelineItem { CompleteAsync = true };
+                pipeline.Enqueue(pile[i]).Execute();
+            }
+            foreach (var item in pile)
+            {
+                if (!await Task.Run(() => item.TryWaitForExecuted(stageTimeout)))
+                    await HangAsync(iter, "pile-executed", pipeline, pile, tail: null);
+            }
+
+            // Drain the pile back-to-back from a parallel thread while the tail enqueues
+            // through the waiter-queue path - the racing pair under test.
+            var drainTask = Task.Run(() =>
+            {
+                foreach (var item in pile)
+                    item.CompletePipelineTask();
+            });
+
+            var tail = new TestPipelineItem { CompleteAsync = true };
+            pipeline.Enqueue(tail).Execute();
+
+            if (!await Task.Run(() => tail.TryWaitForExecuted(stageTimeout)))
+                await HangAsync(iter, "tail-executed", pipeline, pile, tail);
+
+            tail.CompletePipelineTask();
+            await drainTask;
+
+            if (!await Task.Run(() => tail.TryWaitForCompleted(stageTimeout)))
+                await HangAsync(iter, "tail-completed", pipeline, pile, tail);
+
+            foreach (var item in pile)
+            {
+                if (!await Task.Run(() => item.TryWaitForCompleted(stageTimeout)))
+                    await HangAsync(iter, "pile-completed", pipeline, pile, tail);
+            }
+        }
+
+        static async Task HangAsync(
+            int iter, string stage,
+            QueuedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline,
+            TestPipelineItem[] pile, TestPipelineItem? tail)
+        {
+            var states = new System.Text.StringBuilder();
+            foreach (var item in pile)
+                states.Append(item.IsExecuted ? 'E' : 'e').Append(item.IsCompleted ? 'C' : 'c').Append(',');
+            var diagnosis = $"iter {iter}: hang at {stage} - depth={pipeline.Depth}, pile=[{states}] " +
+                $"tail={(tail is null ? "-" : $"{(tail.IsExecuted ? "E" : "e")}{(tail.IsCompleted ? "C" : "c")}")}";
+            if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_PARK_ON_HANG") == "1")
+            {
+                // Shed accumulated per-iteration garbage so a dump of the parked process
+                // contains only the hang's live object graph.
+                GC.Collect(2, GCCollectionMode.Forced);
+                GC.WaitForPendingFinalizers();
+                GC.Collect(2, GCCollectionMode.Forced);
+                Console.WriteLine($"PARKED: {diagnosis}");
+                await Task.Delay(Timeout.Infinite);
+            }
+            Assert.Fail(diagnosis);
+        }
+    }
+
     /// Regression guard for the executor's pre-idle local clears. ExecuteQueue promotes
     /// `item`, `element`, `itemResult` out of the inner loop and explicitly defaults them
     /// before going idle. Without those clears Roslyn would leave the state-machine fields

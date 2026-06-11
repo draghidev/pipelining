@@ -93,7 +93,7 @@ CONSTANTS
                              \* Count==0 inline-activation gate dispatches a successor against a
                              \* still-held tenure (Slon's observed ThrowAlreadyStarted at
                              \* CommandFlow.DispatchPipelinedRead). TRUE must satisfy it.
-  SlotChainActivation        \* The slot-mode D-path under design (June 2026, lost-activation
+  SlotChainActivation,       \* The slot-mode D-path under design (June 2026, lost-activation
                              \* round 2). The queue drain partitions activation responsibility on
                              \* the value its atomic DecrementCount returns: count > 0 means a
                              \* successor's commit landed before the decrement, observed a
@@ -118,6 +118,44 @@ CONSTANTS
                              \* place when Count > 0 (the old clear-without-activate branch was
                              \* itself a loss: the cleared publish's item had no remaining
                              \* activator in slot mode). EventuallyActivated must HOLD.
+  SplitCountCommit,          \* FIDELITY toggle (June 2026, count-skew round). The code's queue
+                             \* commit is TWO steps: `queue.Enqueue(entry); Interlocked.Increment
+                             \* (ref _count)` (TryEscalateOrEnqueue, both the steady-state path
+                             \* and the first escalation's tail). The model historically FUSED
+                             \* them (StoreQueueEnqueue / StoreEscalateEnqueue), hiding the window
+                             \* where the entry is visible and consumable while the count excludes
+                             \* it. Field-proven consequence (dump crash_22130.dmp + Debug assert,
+                             \* DeferredActivationUnderSustainedLoad_Stress): a drain consumes the
+                             \* uncounted entry (its task completed at commit time - e.g. the
+                             \* tail's CompletePipelineTask racing its own commit), DecrementCount
+                             \* returns -1, and the C/D partition built for {0, >0} misroutes:
+                             \* loud face = D-arm peeks an empty queue and activates default(T)
+                             \* (NRE, exit 134, NoNullActivation); quiet face = C-path skipped at
+                             \* -1 AND the late increment returns 0 so the committer's wasEmpty
+                             \* (count == 1) is FALSE - both sides skip activation, the deferred
+                             \* publish's item strands (the 2s field timeout). TRUE models the
+                             \* real split (VERIFIED June 2026: StoreCountNonNegative and
+                             \* NoNullActivation violated, 15-state trace - see
+                             \* Pipeline_CountSkewWitness.cfg; EventuallyActivated does NOT
+                             \* counterexample because AdvancerCPath is modeled as a standing
+                             \* fair action while the code's C-path check runs once per drain
+                             \* pass - the quiet face needs that granularity modeled, fix-round
+                             \* backlog). FALSE keeps the legacy fused fiction so the
+                             \* pre-existing green configs stay meaningful.
+  SkewTolerantPartition      \* The count-skew FIX (June 2026, designed against
+                             \* SplitCountCommit = TRUE). The drain's C/D activation partition
+                             \* treats the decremented count's `<= 0` as the C-path case instead
+                             \* of `== 0`. Soundness rests on BoundedCountSkew (single producer
+                             \* => skew bound 1 => decrement bottoms at -1) plus the implication
+                             \* that a negative count means the in-flight entry was already
+                             \* completed-and-consumed (the drain only consumes completed heads),
+                             \* so the producer's existing wasEmpty/IsCompleted skips are correct
+                             \* and the only live responsibility is the deferred publish - which
+                             \* the C-path claims. The producer side needs NO change. Under the
+                             \* fix, count > 0 implies a peekable head (under-promise direction),
+                             \* so the D-arm's checked peek becomes a canary (NoNullActivation
+                             \* must HOLD). FALSE models shipped code (the witness). TRUE is the
+                             \* design target (Pipeline_Contract.cfg, with SplitCountCommit on).
 
 VARIABLES
   loc,                  \* [Item -> Location] - per-item bucket.
@@ -144,9 +182,14 @@ VARIABLES
   advancing,
   advancingVisible,
 
-  \* Completed-but-not-drained tally (Pipeline._waiterCompletedCount; the store's count
-  \* and tiers live in WaiterStore.tla).
-  completedCount,
+  \* Completions-since-pass-start dirty flag (June 2026 retype of the old
+  \* _waiterCompletedCount tally: every consumer read it as a boolean, the magnitude was
+  \* unused, and the counter could transiently under-run when a drain consumed a
+  \* visible-but-uncounted entry whose inline callback had not yet bumped it). Callbacks
+  \* that bail set it; acquisitions (pass starts: callback-wins, reclaims, the nudge)
+  \* consume it; the post-release recheck closes the lost-wake window - the IOQueue-style
+  \* clear-fence-recheck gate.
+  drainSignal,
 
   \* TRUE while a drainer chain (DrainReadyWaiters' do-while loop) is in progress: set when
   \* a callback acquires advancer or the nudge fires, kept TRUE through AdvancerRelease
@@ -194,28 +237,35 @@ VARIABLES
   \* TRUE when the slot drain's post-decrement count was non-zero - the code's
   \* Debug.Assert(count == 0) firing (observed as exit-134 in Slon.Tests runs 12/25,
   \* June 2026). Bug witness for the stale invariant.
-  assertFailed
+  assertFailed,
+
+  \* TRUE when the queue drain's D-arm fired with nothing peekable - the code's unchecked
+  \* `_waiters.TryPeek(out var nextItem)` at DrainReadyWaiters ~1124 activating default(T):
+  \* the NullReferenceException / exit-134 abort proven June 2026 (crash_22130.dmp,
+  \* DeferredActivationUnderSustainedLoad_Stress). Reachable only when the decremented
+  \* count skews against the queue (SplitCountCommit). Bug witness.
+  nullActivation
 
 \* Variable groupings - used as `UNCHANGED group_name` in action bodies for compactness.
 publish_vars == <<executingItem, executingItemVisible, hasExecuting, hasExecutingVisible>>
 tail_vars    == <<tailWaiter, hasTail>>
 adv_vars     == <<advancing, advancingVisible>>
-counters     == <<storeCount, completedCount>>
+counters     == <<storeCount, drainSignal>>
 \* slot_vars / esc_vars / store_vars come from WaiterStore.tla.
 drainer_vars == <<drainerActive>>
 item_vars    == <<loc, taskDone, activations, callbackFired, failed>>
 \* June 2026 additions (slot-drain split + tenure). Actions that predate them and don't
 \* interact get UNCHANGED aux_vars applied at the Next relation rather than per-body.
 aux_vars     == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                  tenure, tenureClash, assertFailed>>
+                  tenure, tenureClash, assertFailed, nullActivation>>
 
 vars == <<loc, taskDone, activations, callbackFired, failed,
           executingItem, executingItemVisible, hasExecuting, hasExecutingVisible,
-          tailWaiter, hasTail, advancing, advancingVisible, storeCount, completedCount,
+          tailWaiter, hasTail, advancing, advancingVisible, storeCount, drainSignal,
           hasSlot, slotItem, escalated, waiters,
           escPhase, escTail, escSlotClaimed, escMoved, drainerActive,
           drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-          tenure, tenureClash, assertFailed>>
+          tenure, tenureClash, assertFailed, nullActivation>>
 
 \* Item / NoItem come from WaiterStore.tla.
 \* InWaitersPending: transient state inside CommitWaiter's queue path between waiters.Enqueue
@@ -256,7 +306,7 @@ Init ==
   /\ hasTail = FALSE
   /\ advancing = FALSE
   /\ advancingVisible = FALSE
-  /\ completedCount = 0
+  /\ drainSignal = FALSE
   /\ callbackFired = {}
   /\ drainerActive = FALSE
   /\ failed = {}
@@ -267,6 +317,7 @@ Init ==
   /\ tenure = NoItem
   /\ tenureClash = FALSE
   /\ assertFailed = FALSE
+  /\ nullActivation = FALSE
 
 (* ===========================================================================
    External actions: task completion
@@ -327,7 +378,7 @@ SourceYieldInline ==
        /\ tenure' = i
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
                  taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
 
 \* Bug witness: the executor's Count==0 gate passed but the previous inline tenure is still
 \* held - the dispatch's TryStart lands on a started shared promise. Real-world signature:
@@ -346,7 +397,7 @@ SourceYieldInlineClash ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
                  taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
                  loc, activations, drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                 tenure, assertFailed>>
+                 tenure, assertFailed, nullActivation>>
 
 \* Source yields next item with existing waiters - deferred publish.
 SourceYieldDeferred ==
@@ -422,7 +473,7 @@ ExecCommitTailExecutorWins ==
           THEN \* sync-success: CompleteWaiter inline, store untouched.
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
-            /\ completedCount' = completedCount
+            /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
             IF ~escalated /\ ~hasSlot
@@ -432,17 +483,20 @@ ExecCommitTailExecutorWins ==
                 /\ activations' = IF storeCount = 0
                                   THEN [activations EXCEPT ![i] = @ + 1]
                                   ELSE activations
-                /\ completedCount' = completedCount
+                /\ drainSignal' = drainSignal
               ELSE \* Post-escalation queue path (escalated guard inside the operator).
                    \* Loosened CAS: no slot manipulation (PostEscalationSlotEmpty).
+                   \* Fused fiction only; the split pair (ExecCommitQueueVisible*/Count*)
+                   \* covers this case under SplitCountCommit.
+                /\ ~SplitCountCommit
                 /\ StoreQueueEnqueue(i)
                 /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
                 /\ activations' = IF storeCount = 0
                                   THEN [activations EXCEPT ![i] = @ + 1]
                                   ELSE activations
-                /\ completedCount' = completedCount
+                /\ drainSignal' = drainSignal
   /\ UNCHANGED <<adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
 
 \* CommitTailWaiter, advancer won (alreadyActivated = true). Executor skips _executingItem clear.
 ExecCommitTailExecutorLoses ==
@@ -460,7 +514,7 @@ ExecCommitTailExecutorLoses ==
           THEN
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
-            /\ completedCount' = completedCount
+            /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
             IF ~escalated /\ ~hasSlot
@@ -468,14 +522,81 @@ ExecCommitTailExecutorLoses ==
                 /\ StoreSlotCommit(i)
                 /\ loc' = [loc EXCEPT ![i] = "InSlot"]
                 /\ activations' = activations
-                /\ completedCount' = completedCount
+                /\ drainSignal' = drainSignal
               ELSE \* Post-escalation queue path (loosened CAS, escalated guard in the operator).
+                   \* Fused fiction only (see ExecCommitTailExecutorWins's queue arm).
+                /\ ~SplitCountCommit
                 /\ StoreQueueEnqueue(i)
                 /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
                 /\ activations' = activations
-                /\ completedCount' = completedCount
+                /\ drainSignal' = drainSignal
   /\ UNCHANGED <<publish_vars, adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+
+(* ===========================================================================
+   Truthful queue commit (SplitCountCommit): TryEscalateOrEnqueue's post-
+   escalation path as the TWO steps the code actually performs -
+   `queue.Enqueue(entry)` (visible/consumable immediately) then
+   `Interlocked.Increment(ref _count)`. A drain consuming the entry between
+   them is the count-skew window (June 2026, dump crash_22130.dmp): the
+   consumer's DecrementCount returns -1 and the C/D activation partition,
+   built for {0, >0}, misroutes on both sides.
+   =========================================================================== *)
+
+\* Step 1, executor won the publish Exchange (alreadyActivated = false). The Exchange claim
+\* precedes the enqueue in code (CommitTailWaiter claims before calling CommitWaiter), so
+\* the publish clears here; the activation variant rides the phase token to the count step.
+ExecCommitQueueVisibleWins ==
+  /\ SplitCountCommit
+  /\ hasTail
+  /\ hasExecuting  \* Exchange reads own write; TRUE = wins (see ExecCommitTailExecutorWins)
+  /\ LET i == tailWaiter IN
+       /\ i \notin taskDone  \* sync-success never reaches the store; stays on the fused action
+       /\ StoreQueueEnqueueVisible(i, "q_enq_act")
+       /\ hasExecuting' = FALSE
+       /\ hasExecutingVisible' = FALSE
+       /\ executingItem' = NoItem
+       /\ executingItemVisible' = NoItem
+       /\ tailWaiter' = NoItem
+       /\ hasTail' = FALSE
+       /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
+  /\ UNCHANGED <<adv_vars, drainSignal, taskDone, activations, callbackFired, failed,
+                 drainer_vars>>
+
+\* Step 1, executor lost (alreadyActivated = true): no publish touch, no activation later.
+ExecCommitQueueVisibleLoses ==
+  /\ SplitCountCommit
+  /\ hasTail
+  /\ ~hasExecuting
+  /\ LET i == tailWaiter IN
+       /\ i \notin taskDone
+       /\ StoreQueueEnqueueVisible(i, "q_enq_noact")
+       /\ tailWaiter' = NoItem
+       /\ hasTail' = FALSE
+       /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
+  /\ UNCHANGED <<publish_vars, adv_vars, drainSignal, taskDone, activations,
+                 callbackFired, failed, drainer_vars>>
+
+\* Step 2: the increment. The wasEmpty partition (post-increment count == 1, i.e.
+\* pre-increment 0) and the activation's IsCompleted skip both live HERE, where the code
+\* reads them - the entry's task completing between the steps changes both answers. The
+\* quiet face of the count-skew: at a skewed pre-increment count of -1 the post value is 0,
+\* wasEmpty is FALSE, and the committer skips an activation no drain will perform either.
+ExecCommitQueueCountWins ==
+  /\ escPhase = "q_enq_act"
+  /\ LET i == escTail IN
+       activations' = IF storeCount = 0 /\ i \notin taskDone
+                      THEN [activations EXCEPT ![i] = @ + 1]
+                      ELSE activations
+  /\ StoreCommitCount("idle")
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
+                 callbackFired, failed, drainer_vars>>
+
+ExecCommitQueueCountLoses ==
+  /\ escPhase = "q_enq_noact"
+  /\ StoreCommitCount("idle")
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars>>
 
 (* ===========================================================================
    First-escalation entry + multi-step escalation flow.
@@ -514,7 +635,7 @@ ExecCommitTailPublishQueueExecutorWins ==
        /\ hasTail' = FALSE
        /\ StoreEscalatePublish(i)
        /\ loc' = [loc EXCEPT ![i] = "InEscalation"]
-  /\ UNCHANGED <<adv_vars, completedCount,
+  /\ UNCHANGED <<adv_vars, drainSignal,
                  taskDone, activations, callbackFired, failed, drainer_vars>>
 
 \* Step 1: PublishQueue, executor-loses variant.
@@ -529,7 +650,7 @@ ExecCommitTailPublishQueueExecutorLoses ==
        /\ hasTail' = FALSE
        /\ StoreEscalatePublish(i)
        /\ loc' = [loc EXCEPT ![i] = "InEscalation"]
-  /\ UNCHANGED <<publish_vars, adv_vars, completedCount,
+  /\ UNCHANGED <<publish_vars, adv_vars, drainSignal,
                  taskDone, activations, callbackFired, failed, drainer_vars>>
 
 \* Step 2: CASSlot. Atomic Interlocked.Exchange(_hasSlot, 0). The race outcome with the
@@ -538,7 +659,7 @@ ExecCommitTailPublishQueueExecutorLoses ==
 \* records the loss; otherwise the executor wins and the slot fields are still populated.
 ExecEscalationCASSlot ==
   /\ StoreEscalateClaimSlot
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, completedCount,
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  loc, taskDone, activations, callbackFired, failed, drainer_vars>>
 
 \* Step 3: MoveSlot. If the CAS won, append the slot item to waiters head and clear the slot
@@ -547,7 +668,7 @@ ExecEscalationCASSlot ==
 ExecEscalationMoveSlot ==
   /\ StoreEscalateMove
   /\ loc' = IF escSlotClaimed THEN [loc EXCEPT ![slotItem] = "InWaiters"] ELSE loc
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, completedCount,
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  taskDone, activations, callbackFired, failed, drainer_vars>>
 
 \* Step 4: EnqueueNew. Append escTail to waiters tail; increment count; loc → InWaitersPending.
@@ -556,14 +677,37 @@ ExecEscalationMoveSlot ==
 \* (slotWasMoved) proceeds to the compensation check (CommitWaiter's post-escalation
 \* `slotWasMoved && Exchange(_pendingHeadActivation, false)`); otherwise back to "idle".
 ExecEscalationEnqueueNew ==
+  /\ ~SplitCountCommit  \* fused fiction; the EnqueueTail/CommitCount pair is the truth
   /\ LET i == escTail IN
        /\ StoreEscalateEnqueue(IF SlotChainActivation /\ escSlotClaimed THEN "compensate" ELSE "idle")
        /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
        /\ activations' = IF storeCount = 0
                          THEN [activations EXCEPT ![i] = @ + 1]
                          ELSE activations
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, completedCount,
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  taskDone, callbackFired, failed, drainer_vars>>
+
+\* Split Step 4a (SplitCountCommit): the tail append alone. loc moves to InWaitersPending
+\* here (the entry is in waiters - WaitersConsistent); the count follows in 4b. Same
+\* count-skew window as the steady-state pair.
+ExecEscalationEnqueueTail ==
+  /\ SplitCountCommit
+  /\ StoreEscalateEnqueueTail
+  /\ loc' = [loc EXCEPT ![escTail] = "InWaitersPending"]
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
+                 taskDone, activations, callbackFired, failed, drainer_vars>>
+
+\* Split Step 4b: the increment, the wasEmpty activation (with the truthful IsCompleted
+\* skip), and the compensate/idle routing the fused Step 4 performed.
+ExecEscalationCommitCount ==
+  /\ escPhase = "esc_enqueued"
+  /\ LET i == escTail IN
+       activations' = IF storeCount = 0 /\ i \notin taskDone
+                      THEN [activations EXCEPT ![i] = @ + 1]
+                      ELSE activations
+  /\ StoreCommitCount(IF SlotChainActivation /\ escSlotClaimed THEN "compensate" ELSE "idle")
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
+                 callbackFired, failed, drainer_vars>>
 
 \* The escalating commit's compensation check, FIX only (CommitWaiter, right where the
 \* slotWasMoved nudge already lives): consume the handoff flag if set and activate the moved
@@ -583,9 +727,9 @@ ExecEscalationCompensate ==
          ELSE
            /\ pendingHeadActivation' = pendingHeadActivation
            /\ activations' = activations
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, completedCount,
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  loc, taskDone, callbackFired, failed, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, tenure, tenureClash, assertFailed>>
+                 drainPhase, drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation>>
 
 (* Inline-callback race in CommitWaiter queue path: at the post-Enqueue check, if task is
    already done the executor fires the wired callback inline; otherwise it registers it for
@@ -596,6 +740,7 @@ ExecEscalationCompensate ==
 ExecutorRegistersCallback ==
   \E i \in Item :
     /\ loc[i] = "InWaitersPending"
+    /\ i # escTail  \* registration runs after the commit's increment (split-commit phases)
     /\ i \notin taskDone
     /\ loc' = [loc EXCEPT ![i] = "InWaiters"]
     /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
@@ -604,12 +749,15 @@ ExecutorRegistersCallback ==
 ExecutorInlineCallbackBecomesAdvancer ==
   \E i \in Item :
     /\ loc[i] = "InWaitersPending"
+    /\ i # escTail  \* the inline callback() call is post-increment (split-commit phases)
     /\ i \in taskDone
     /\ i \notin callbackFired
     /\ ~advancingVisible
     /\ loc' = [loc EXCEPT ![i] = "InWaiters"]
     /\ callbackFired' = callbackFired \cup {i}
-    /\ completedCount' = completedCount + 1
+    \* Set-then-acquire-then-pass-top-clear, fused: the winner's own signal (and any bailed
+    \* sibling's) is consumed by the pass it is about to run exhaustively.
+    /\ drainSignal' = FALSE
     /\ advancing' = TRUE
     /\ advancingVisible' = TRUE
     /\ drainerActive' = TRUE
@@ -619,12 +767,13 @@ ExecutorInlineCallbackBecomesAdvancer ==
 ExecutorInlineCallbackBailsOut ==
   \E i \in Item :
     /\ loc[i] = "InWaitersPending"
+    /\ i # escTail  \* post-increment, see ExecutorInlineCallbackBecomesAdvancer
     /\ i \in taskDone
     /\ i \notin callbackFired
     /\ advancingVisible
     /\ loc' = [loc EXCEPT ![i] = "InWaiters"]
     /\ callbackFired' = callbackFired \cup {i}
-    /\ completedCount' = completedCount + 1
+    /\ drainSignal' = TRUE
     /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters,
                    taskDone, activations, storeCount, esc_vars, drainer_vars, failed>>
 
@@ -633,7 +782,7 @@ ExecutorInlineCallbackBailsOut ==
 
    Slot callbacks (item still in InSlot when task completes) have two outcomes:
      - Drain inline: slot CAS wins, processes item directly.
-     - Bail out: advancer already held, just bump completedCount.
+     - Bail out: advancer already held, just set drainSignal.
 
    The slot callback also handles the post-escalation case where the slot was
    moved to queue head before the task completed: it falls through to the
@@ -661,7 +810,7 @@ SlotCallbackBailsDuringEscalation ==
     /\ i \notin callbackFired
     /\ ~advancingVisible
     /\ callbackFired' = callbackFired \cup {i}
-    /\ completedCount' = completedCount + 1
+    /\ drainSignal' = TRUE
     /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters,
                    storeCount, loc, taskDone, activations, esc_vars, drainer_vars, failed>>
 
@@ -673,10 +822,9 @@ SlotCallbackBailsDuringEscalation ==
 \*       decrement - the code's Debug.Assert(count == 0) is FALSE under it (exit-134 aborts
 \*       on shipped code; see assertFailed / DrainCountAssertHolds);
 \*   (b) the consume-vs-republish ordering for per-item resources (see tenure).
-\* completedCount net change across the three steps is -1 here + the callback's earlier +1
-\* having happened in the same real method; modeled as the fused bump+decrement = net zero,
-\* preserved by doing nothing to completedCount in this action (matches the old atomic
-\* action's accounting).
+\* Signal accounting: the callback's set and the pass-start clear happen in the same real
+\* method, so the fused action lands drainSignal = FALSE (the flag retype's equivalent of
+\* the old counter's bump+decrement net zero).
 \*
 \* Consume timing: ConsumeBeforeRepublish = TRUE folds the consume (tenure release) into
 \* the claim step - the proposed contract, release happens-before the count republish.
@@ -700,9 +848,12 @@ SlotDrainClaim ==
     /\ drainPhase' = "claimed"
     /\ drainItem' = i
     /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
-    /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, counters,
+    \* Set-then-acquire-then-pass-top-clear, fused (slot pass start). Replaces the old
+    \* counter's "bump + decrement = net zero" accounting.
+    /\ drainSignal' = FALSE
+    /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                    taskDone, activations, esc_vars, failed, drainRemaining, pendingHeadActivation,
-                   tenureClash, assertFailed>>
+                   tenureClash, assertFailed, nullActivation>>
 
 \* Slot drain, step 2 of 3: DecrementCount - the position republish. The executor's Count==0
 \* inline-activation gate (SourceYieldInline's storeCount = 0) can pass the instant this
@@ -717,9 +868,9 @@ SlotDrainCount ==
   \* DrainSlotInline discards it - see SlotChainActivation).
   /\ drainRemaining' = storeCount - 1
   /\ drainPhase' = "counted"
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, completedCount,
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, drainSignal,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, pendingHeadActivation, tenure, tenureClash>>
+                 drainItem, pendingHeadActivation, tenure, tenureClash, nullActivation>>
 
 \* Slot drain, step 3 of 3, SHIPPED code (~SlotChainActivation): CompleteWaiter + the
 \* lock-guarded C-path. The lock block consumes the publish whenever held; it re-checks the
@@ -754,7 +905,7 @@ SlotDrainCompleteLegacy ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed>>
+                 pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
 
 \* Slot drain, step 3 of 3, FIX, chain arm, slot-visible case (drainRemaining > 0,
 \* ~escalated): a successor's commit landed before our decrement, so it observed count >= 2
@@ -792,7 +943,7 @@ SlotDrainCompleteChainSlot ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed>>
+                 pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
 
 \* Chain arm, escalation-raced case: the peek saw IsEscalated - a first escalation is (or
 \* finished) relocating the head slot -> queue, so the head cannot be named from the slot
@@ -813,7 +964,7 @@ SlotDrainCompleteChainHandoff ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 tenureClash, assertFailed>>
+                 tenureClash, assertFailed, nullActivation>>
 
 \* Handoff resolution, drainer reclaims: the one-shot re-peek found the head visible (the
 \* escalation's move landed), so the drainer claims its own obligation back (Exchange wins)
@@ -830,7 +981,7 @@ SlotDrainHandoffReclaim ==
   /\ drainPhase' = "idle"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, drainRemaining, tenure, tenureClash, assertFailed>>
+                 drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation>>
 
 \* Handoff resolution, drainer trusts the escalator: the re-peek found no visible head (the
 \* move hasn't landed). The flag's full fence makes this safe: had the escalator's
@@ -846,7 +997,7 @@ SlotDrainHandoffTrust ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed>>
+                 assertFailed, nullActivation>>
 
 \* Slot drain, step 3 of 3, FIX, C-path arm (drainRemaining = 0): no successor preceded our
 \* decrement, so any LATER commit observes count 1 = wasEmpty and self-activates - the
@@ -879,7 +1030,7 @@ SlotDrainCompleteCPath ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed>>
+                 pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
 
 \* Drainer's release step. Mirrors DrainSlotInline's _advancing.Release() tail. Between
 \* SlotCallbackDrains and this release, the slot is empty but the advancer is still held.
@@ -901,14 +1052,14 @@ SlotDrainerRelease ==
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
 
 \* The slot-mode reclaim (the strand fix under design): post-release, the drainer re-checks
-\* for a waiter whose callback bailed against its hold (counted in completedCount, callback
+\* for a waiter whose callback bailed against its hold (recorded in drainSignal, callback
 \* one-shot spent) and re-acquires to drain it. Fused TryAcquire + TryClaimSlotForDrain,
 \* entering the standard three-step drain at "claimed". Mirrors TryReclaimAdvancerForWork.
 SlotDrainerReclaim ==
   /\ SlotReclaimEnabled
   /\ drainerActive
   /\ ~advancingVisible
-  /\ completedCount > 0
+  /\ drainSignal
   /\ ~escalated
   /\ drainPhase = "idle"
   /\ \E i \in Item :
@@ -918,7 +1069,9 @@ SlotDrainerReclaim ==
        /\ i \in callbackFired  \* the bailed waiter: callback spent, undrained
        /\ advancing' = TRUE
        /\ advancingVisible' = TRUE
-       /\ completedCount' = completedCount - 1
+       \* Re-acquire = sub-pass start: the signal is consumed; anything fired during the
+       \* reclaimed drain re-sets it and the post-release recheck catches it.
+       /\ drainSignal' = FALSE
        /\ StoreClaimSlotForDrain
        /\ loc' = [loc EXCEPT ![i] = "Draining"]
        /\ drainPhase' = "claimed"
@@ -926,11 +1079,11 @@ SlotDrainerReclaim ==
        /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
   /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainRemaining, pendingHeadActivation, tenureClash, assertFailed>>
+                 drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
 
 \* The race the originally-atomic SlotCallbackDrains hid: a follow-up slot callback fires
 \* while the previous drain still holds the advancer (between SlotDrainerDrains and
-\* SlotDrainerRelease). TryAcquire fails, the callback bumps completedCount and exits
+\* SlotDrainerRelease). TryAcquire fails, the callback sets drainSignal and exits
 \* without draining its slot item. Pre-fix, no mechanism reclaims this stranded count in
 \* slot mode (DrainSlotInline has no do-while equivalent of DrainReadyWaiters' TryReclaim).
 \* TLC will surface this as a liveness violation: the stranded slot item never reaches
@@ -952,7 +1105,7 @@ SlotCallbackBailsOut ==
        /\ i \notin callbackFired
        /\ advancingVisible
        /\ callbackFired' = callbackFired \cup {i}
-       /\ completedCount' = completedCount + 1
+       /\ drainSignal' = TRUE
        /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters,
                       storeCount, loc, taskDone, activations, esc_vars, drainer_vars, failed>>
 
@@ -965,7 +1118,8 @@ CallbackBecomesAdvancer ==
     /\ ~advancingVisible
     /\ advancing' = TRUE
     /\ advancingVisible' = TRUE
-    /\ completedCount' = completedCount + 1
+    \* Set-then-acquire-then-pass-top-clear, fused (see ExecutorInlineCallbackBecomesAdvancer).
+    /\ drainSignal' = FALSE
     /\ callbackFired' = callbackFired \cup {i}
     /\ drainerActive' = TRUE
     /\ UNCHANGED <<publish_vars, tail_vars, slot_vars, waiters,
@@ -977,7 +1131,7 @@ CallbackBailsOut ==
     /\ loc[i] = "InWaiters"
     /\ i \notin callbackFired
     /\ advancingVisible
-    /\ completedCount' = completedCount + 1
+    /\ drainSignal' = TRUE
     /\ callbackFired' = callbackFired \cup {i}
     /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters,
                    loc, taskDone, activations, storeCount, esc_vars, drainer_vars, failed>>
@@ -993,18 +1147,40 @@ AdvancerDrainHead ==
   /\ drainPhase = "idle"  \* the latch holder is one thread in one method: not mid-slot-drain
   /\ Len(waiters) > 0
   /\ Head(waiters) \in taskDone
-  /\ LET i == Head(waiters) IN
+  /\ LET i == Head(waiters)
+         \* The code's `var count = _waiters.DecrementCount()` - the partition input is the
+         \* COUNT, not the queue length. Under the fused commit they coincide (newCount = 0
+         \* iff Len(waiters) = 1 here); under SplitCountCommit a visible-but-uncounted entry
+         \* skews them and newCount can go NEGATIVE (StoreCountNonNegative).
+         newCount == storeCount - 1 IN
        /\ StoreDequeueHead
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
-       /\ completedCount' = completedCount - 1
+       \* No per-item signal bookkeeping: the dirty flag was cleared at pass start and the
+       \* pass drains exhaustively (the counter's per-dequeue decrement - and its transient
+       \* negative when consuming a visible-but-uncounted entry whose inline callback hasn't
+       \* fired yet - is retired with the retype).
        \* The queue drain consumes at dequeue, before its DecrementCount - already the
        \* contract ordering, no toggle. Tenure (if this head ever held it: a slot-tier item
        \* moved to queue head by escalation) releases with the consume.
        /\ tenure' = IF tenure = i THEN NoItem ELSE tenure
-       /\ \* D-path activate the next head, if any.
-          activations' = IF Len(waiters) > 1
-                         THEN [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
-                         ELSE activations
+       /\ UNCHANGED drainSignal  \* pass-scoped flag: cleared at acquisition, not per item
+       /\ \* The partition. Shipped (~SkewTolerantPartition): `count is 0` takes the C-path
+          \* lock block (separate actions); anything else - INCLUDING a skewed -1 - takes
+          \* the D-arm, whose TryPeek return is UNCHECKED (Pipeline.cs ~1124): with an empty
+          \* remainder it activates default(T), the proven NRE/exit-134 (nullActivation).
+          \* Fix (SkewTolerantPartition): `count <= 0` routes to the C-path (correct per the
+          \* BoundedCountSkew argument: a negative count's in-flight entry is already
+          \* consumed); count > 0 implies a peekable head in the under-promise direction, so
+          \* the D-arm's checked peek is a canary - the null arm stays as the detector and
+          \* NoNullActivation must HOLD.
+          IF (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
+            THEN /\ activations' = activations
+                 /\ nullActivation' = nullActivation
+          ELSE IF Len(waiters) > 1
+            THEN /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
+                 /\ nullActivation' = nullActivation
+            ELSE /\ activations' = activations
+                 /\ nullActivation' = TRUE
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed>>
@@ -1013,7 +1189,11 @@ AdvancerDrainHead ==
 AdvancerCPath ==
   /\ advancing
   /\ drainPhase = "idle"  \* see AdvancerDrainHead
-  /\ storeCount = 0
+  \* The fix widens the C-path to count <= 0: a negative count means the in-flight commit's
+  \* entry was already completed-and-consumed (BoundedCountSkew bounds it at -1), so the
+  \* deferred publish is the only live responsibility and this claim is correct. Shipped
+  \* code's == 0 is the quiet-face skip.
+  /\ IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0
   /\ hasExecutingVisible
   /\ Len(waiters) = 0
   /\ ~hasSlot
@@ -1051,12 +1231,14 @@ AdvancerRelease ==
 AdvancerReclaim ==
   /\ drainerActive
   /\ ~advancingVisible
-  /\ completedCount > 0
+  /\ drainSignal
   /\ Len(waiters) > 0
   /\ Head(waiters) \in taskDone
   /\ advancing' = TRUE
   /\ advancingVisible' = TRUE
-  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
+  \* Re-acquire = sub-pass start, signal consumed (see SlotDrainerReclaim).
+  /\ drainSignal' = FALSE
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
 
 \* The drainer chain exits when, post-release, the do-while's TryReclaim preconditions don't
@@ -1065,10 +1247,10 @@ AdvancerReclaim ==
 DrainerChainExit ==
   /\ drainerActive
   /\ ~advancing
-  /\ ~(completedCount > 0 /\ Len(waiters) > 0 /\ Head(waiters) \in taskDone)
+  /\ ~(drainSignal /\ Len(waiters) > 0 /\ Head(waiters) \in taskDone)
   \* Slot-mode reclaim precondition must also not hold (the slot drainer's do-while keeps
   \* going while a bailed slot waiter is reclaimable).
-  /\ ~(SlotReclaimEnabled /\ completedCount > 0 /\ ~escalated /\ hasSlot
+  /\ ~(SlotReclaimEnabled /\ drainSignal /\ ~escalated /\ hasSlot
        /\ slotItem \in taskDone /\ slotItem \in callbackFired)
   /\ drainerActive' = FALSE
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
@@ -1082,7 +1264,7 @@ DrainerChainExit ==
 \* disabled, stranded counts must wait for the next callback fire to be drained.
 \*
 \* Precondition models the runtime check: just exited escalation (escPhase = "idle"), there
-\* IS a stranded count (completedCount > 0), and TryAcquire succeeds (~advancingVisible).
+\* IS a stranded signal (drainSignal), and TryAcquire succeeds (~advancingVisible).
 \* The body matches a successful TryAcquire + DrainReadyWaiters entry: claim advancer,
 \* mark drainerActive so subsequent AdvancerReclaim transitions can fire.
 ExecPostEscalationNudge ==
@@ -1090,11 +1272,13 @@ ExecPostEscalationNudge ==
   /\ escPhase = "idle"
   /\ escalated      \* nudge is only meaningful after escalation has happened in this run
   /\ ~advancingVisible
-  /\ completedCount > 0
+  /\ drainSignal
   /\ advancing' = TRUE
   /\ advancingVisible' = TRUE
   /\ drainerActive' = TRUE
-  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
+  \* Acquire = pass start, signal consumed (the nudge enters DrainReadyWaiters).
+  /\ drainSignal' = FALSE
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars>>
 
 \* Visibility-propagation transitions for the *Visible shadow fields. Only fire when the
@@ -1166,7 +1350,7 @@ ExecItemFailure ==
          ELSE UNCHANGED publish_vars
     /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                    taskDone, activations, callbackFired, esc_vars, drainer_vars,
-                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed>>
+                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
 
 \* RecoverItem wins-path: no prior waiter in flight (_waiters.Count is 0), inline-activate
 \* the substitute. Mirrors the post-fix code at the new RecoverItem in Pipeline.cs. The
@@ -1220,6 +1404,12 @@ SourceYieldDeferredW == SourceYieldDeferred /\ UNCHANGED aux_vars
 ExecSetTailW == ExecSetTail /\ UNCHANGED aux_vars
 RecoverItemWinsW == RecoverItemWins /\ UNCHANGED aux_vars
 RecoverItemLosesW == RecoverItemLoses /\ UNCHANGED aux_vars
+ExecCommitQueueVisibleWinsW == ExecCommitQueueVisibleWins /\ UNCHANGED aux_vars
+ExecCommitQueueVisibleLosesW == ExecCommitQueueVisibleLoses /\ UNCHANGED aux_vars
+ExecCommitQueueCountWinsW == ExecCommitQueueCountWins /\ UNCHANGED aux_vars
+ExecCommitQueueCountLosesW == ExecCommitQueueCountLoses /\ UNCHANGED aux_vars
+ExecEscalationEnqueueTailW == ExecEscalationEnqueueTail /\ UNCHANGED aux_vars
+ExecEscalationCommitCountW == ExecEscalationCommitCount /\ UNCHANGED aux_vars
 ExecCommitTailPublishQueueExecutorWinsW == ExecCommitTailPublishQueueExecutorWins /\ UNCHANGED aux_vars
 ExecCommitTailPublishQueueExecutorLosesW == ExecCommitTailPublishQueueExecutorLoses /\ UNCHANGED aux_vars
 ExecEscalationCASSlotW == ExecEscalationCASSlot /\ UNCHANGED aux_vars
@@ -1254,6 +1444,12 @@ Next ==
   \/ RecoverItemLosesW
   \/ ExecCommitTailExecutorWins
   \/ ExecCommitTailExecutorLoses
+  \/ ExecCommitQueueVisibleWinsW
+  \/ ExecCommitQueueVisibleLosesW
+  \/ ExecCommitQueueCountWinsW
+  \/ ExecCommitQueueCountLosesW
+  \/ ExecEscalationEnqueueTailW
+  \/ ExecEscalationCommitCountW
   \/ ExecCommitTailPublishQueueExecutorWinsW
   \/ ExecCommitTailPublishQueueExecutorLosesW
   \/ ExecEscalationCASSlotW
@@ -1298,7 +1494,13 @@ Spec == Init /\ [][Next]_vars
         \* be installed via one of the two paths; WF on the disjunction so liveness still
         \* holds when the gate's storeCount value toggles between branches.
         /\ WF_vars(RecoverItemWinsW \/ RecoverItemLosesW)
-        /\ WF_vars(ExecCommitTailExecutorWins \/ ExecCommitTailExecutorLoses)
+        /\ WF_vars(ExecCommitTailExecutorWins \/ ExecCommitTailExecutorLoses
+                   \/ ExecCommitQueueVisibleWinsW \/ ExecCommitQueueVisibleLosesW)
+        \* The split commit's count step is the executor finishing TryEscalateOrEnqueue -
+        \* an unconditional program step once the enqueue landed.
+        /\ WF_vars(ExecCommitQueueCountWinsW \/ ExecCommitQueueCountLosesW)
+        /\ WF_vars(ExecEscalationEnqueueTailW)
+        /\ WF_vars(ExecEscalationCommitCountW)
         /\ WF_vars(ExecCommitTailPublishQueueExecutorWinsW \/ ExecCommitTailPublishQueueExecutorLosesW)
         /\ WF_vars(ExecEscalationCASSlotW)
         /\ WF_vars(ExecEscalationMoveSlotW)
@@ -1350,7 +1552,7 @@ TypeOK ==
   /\ StoreTypeOK
   /\ loc \in [Item -> Locations]
   /\ activations \in [Item -> 0..5]  \* bounded for TLC; recovery cycle adds up to 2 more
-  /\ completedCount \in -NumItems..NumItems
+  /\ drainSignal \in BOOLEAN
   /\ drainerActive \in BOOLEAN
   /\ failed \subseteq Item
   /\ drainPhase \in {"idle", "claimed", "counted", "handoff"}
@@ -1360,6 +1562,7 @@ TypeOK ==
   /\ tenure \in Item \cup {NoItem}
   /\ tenureClash \in BOOLEAN
   /\ assertFailed \in BOOLEAN
+  /\ nullActivation \in BOOLEAN
 
 \* WaiterStore count = (slot contribution) + (queue length). Use slotItem # NoItem rather than
 \* hasSlot for the slot contribution: during the cas_done phase the executor has CAS'd hasSlot
@@ -1371,9 +1574,14 @@ TypeOK ==
 \* to storeCount with no slot/queue residency. The code-level echo of the uncorrected
 \* invariant was DrainSlotInline's Debug.Assert(count == 0), which a successor commit into
 \* the freed slot falsifies (see DrainCountAssertHolds).
+\* The escPhase enqueued-term is the June 2026 count-skew correction: under SplitCountCommit
+\* an entry is appended to waiters one step before its increment lands, so a mid-commit
+\* state carries one visible-but-uncounted entry. Mirrors the drainPhase = "claimed" term's
+\* shape (counted-but-not-resident vs here resident-but-not-counted).
 CountConsistency ==
   storeCount = (IF slotItem # NoItem THEN 1 ELSE 0) + Len(waiters)
                + (IF drainPhase = "claimed" THEN 1 ELSE 0)
+               - (IF escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact"} THEN 1 ELSE 0)
 
 \* Drain-phase bookkeeping coherence. Note mid-drain commits are LEGAL: a successor can
 \* reuse the freed slot and even trigger first escalation while the drainer is between its
@@ -1403,7 +1611,16 @@ WaitersConsistent ==
 \* (if any), and escPhase tracks which step we're at.
 EscalationConsistent ==
   /\ StoreEscalationConsistent
-  /\ (escTail # NoItem) => (loc[escTail] = "InEscalation")
+  \* Mid-escalation phases keep the tail in InEscalation; the split-commit enqueued phases
+  \* have it appended to waiters already (InWaitersPending per WaitersConsistent) with only
+  \* its count outstanding. Registration/inline-callback actions exclude the mid-commit
+  \* item (i # escTail guards), so it cannot move to InWaiters - but the DRAIN can consume
+  \* the visible-but-uncounted entry and complete it mid-commit (that consumability is the
+  \* count-skew bug itself), so Completed is admitted.
+  /\ (escTail # NoItem /\ escPhase \in {"publish_done", "cas_done", "move_done"})
+       => (loc[escTail] = "InEscalation")
+  /\ (escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact"})
+       => (loc[escTail] \in {"InWaitersPending", "Completed"})
   /\ \A i \in Item : (loc[i] = "InEscalation") => (escTail = i)
 
 \* Slot occupancy consistency. The slotItem field and the InSlot location always agree
@@ -1469,6 +1686,21 @@ DrainCountAssertHolds ==
 NoTenureClash ==
   ~tenureClash
 
+\* The queue drain's D-arm never fires with nothing to peek (the unchecked
+\* `_waiters.TryPeek` at DrainReadyWaiters ~1124 activating default(T) - the proven
+\* NRE/exit-134, June 2026, dump crash_22130.dmp). EXPECTED FALSE with SplitCountCommit =
+\* TRUE against the shipped partition (Pipeline_CountSkewWitness.cfg): a drain consumes a
+\* visible-but-uncounted entry, DecrementCount returns -1, and the `count is 0` test
+\* misroutes to the D-arm over an empty queue. StoreCountNonNegative (WaiterStore.tla) is
+\* the companion witness for the skewed count itself. The quiet face (both commit and drain
+\* sides skip the deferred publish's activation - the 2s field completion timeout) is NOT
+\* yet TLC-visible: AdvancerCPath is a standing fair action where the code checks once per
+\* drain pass (see Pipeline_CountSkewWitness.cfg). Both witnesses must hold once the
+\* partition is redesigned against the split. Until then the unchecked TryPeek sites
+\* (~1124 and the recovery advance ~1436) stay as known sharp edges.
+NoNullActivation ==
+  ~nullActivation
+
 (* ===========================================================================
    Liveness
    =========================================================================== *)
@@ -1480,7 +1712,7 @@ NoTenureClash ==
 \* Violated under EmptySignalDeferred = FALSE (models pre-fix code): TLC produces a
 \* SlotCallbackBailsOut counterexample where a slot waiter committed during the previous
 \* drainer's post-drain pre-release window has its callback bail TryAcquire, strand a
-\* completedCount bump, and never get drained.
+\* drainSignal bump, and never get drained.
 EventuallyCompleted ==
   \A i \in Item :
     (loc[i] \in {"Executing", "InTail", "InSlot", "InEscalation", "InWaitersPending", "InWaiters", "Draining"} /\ i \in taskDone)
