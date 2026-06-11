@@ -93,6 +93,9 @@ WaiterHead == IF Len(waiters) > 0 THEN Head(waiters) ELSE NoItem
    =========================================================================== *)
 
 \* Slot path: pre-escalation CAS-claim of the empty slot, fields written, count incremented.
+\* LEGACY FUSED fiction: the code is CAS-then-fields-then-increment; use the
+\* StoreSlotCommitCAS/Fields + StoreCommitCount steps for the truthful model
+\* (Pipeline's SplitSlotFieldOps).
 StoreSlotCommit(i) ==
   /\ ~escalated
   /\ ~hasSlot
@@ -100,6 +103,54 @@ StoreSlotCommit(i) ==
   /\ slotItem' = i
   /\ storeCount' = storeCount + 1
   /\ UNCHANGED <<escalated, waiters, escPhase, escTail, escSlotClaimed, escMoved>>
+
+\* Truthful slot commit, step 1 (SplitSlotFieldOps): the CAS alone. _hasSlot flips while the
+\* fields still hold the previous tenure's residue (NoItem after a claim's clear). The slot
+\* is CLAIMABLE from this state on - the license bit precedes the data, the inverse of the
+\* SPSC discipline (fields-then-index). A drain Exchange winning in this window reads
+\* whatever the fields hold NOW: the unlicensed-read window of backlog #7. ph carries the
+\* caller's activation variant to the count step ("slot_cas_act"/"slot_cas_noact").
+StoreSlotCommitCAS(i, ph) ==
+  /\ ~escalated
+  /\ ~hasSlot
+  /\ escPhase = "idle"
+  /\ hasSlot' = TRUE
+  /\ escTail' = i
+  /\ escPhase' = ph
+  /\ UNCHANGED <<slotItem, escalated, waiters, storeCount, escSlotClaimed, escMoved>>
+
+\* Step 2: the field writes land. Only sound while the commit still owns the slot - a
+\* concurrent claim's Exchange transfers ownership of the FLAG but nothing stops these
+\* writes from landing in the claimed window (the code has no such guard either; the
+\* model writes unconditionally to mirror it).
+StoreSlotCommitFields ==
+  /\ escPhase \in {"slot_cas_act", "slot_cas_noact"}
+  /\ slotItem' = escTail
+  /\ escPhase' = (IF escPhase = "slot_cas_act" THEN "slot_f_act" ELSE "slot_f_noact")
+  /\ UNCHANGED <<hasSlot, escalated, waiters, storeCount, escTail, escSlotClaimed, escMoved>>
+
+\* TriStateSlotClaim commit, step 1: the field writes FIRST - data, then license, the SPSC
+\* discipline. Sound because flag-0 fields are executor-exclusive under the tri-state
+\* protocol: claims never write fields (the consume clears under the owned state, never
+\* after release), so the only flag-0 writers are this thread's commits and the
+\* escalation's executor-side move.
+StoreSlotCommitFieldsFirst(i, ph) ==
+  /\ ~escalated
+  /\ ~hasSlot
+  /\ escPhase = "idle"
+  /\ slotItem' = i
+  /\ escTail' = i
+  /\ escPhase' = ph
+  /\ UNCHANGED <<hasSlot, escalated, waiters, storeCount, escSlotClaimed, escMoved>>
+
+\* TriStateSlotClaim commit, step 2: the publish (Volatile.Write(_slotState, 1) - the CAS
+\* is deletable: nobody else can raise the word, and the flag-0 exclusivity above means
+\* nobody else writes while we do). Flag 1 now PROVES the fields are complete.
+StoreSlotCommitPublish ==
+  /\ escPhase \in {"slot_w_act", "slot_w_noact"}
+  /\ hasSlot' = TRUE
+  /\ escPhase' = (IF escPhase = "slot_w_act" THEN "slot_f_act" ELSE "slot_f_noact")
+  /\ UNCHANGED <<slotItem, escalated, waiters, storeCount, escTail, escSlotClaimed, escMoved>>
 
 \* Post-escalation queue path (loosened CAS: no slot touch - PostEscalationSlotEmpty).
 \* LEGACY FUSED fiction: enqueue + increment as one atomic step. The code is two steps;
@@ -127,7 +178,7 @@ StoreQueueEnqueueVisible(i, ph) ==
 \* nextPhase routes the split escalation to "compensate" (slotWasMoved chain handoff) or
 \* "idle"; steady-state callers always pass "idle".
 StoreCommitCount(nextPhase) ==
-  /\ escPhase \in {"q_enq_act", "q_enq_noact", "esc_enqueued"}
+  /\ escPhase \in {"q_enq_act", "q_enq_noact", "esc_enqueued", "slot_f_act", "slot_f_noact"}
   /\ storeCount' = storeCount + 1
   /\ escPhase' = nextPhase
   /\ escTail' = NoItem
@@ -213,11 +264,29 @@ StoreTakeMoved ==
 
 \* TryClaimSlotForDrain: Exchange-claim wins, fields read+cleared. Count untouched - the
 \* claimed-but-uncounted window is the caller's (CountConsistency's in-flight-claim term).
+\* LEGACY FUSED fiction: the code is Exchange-then-read-then-clear; use the split pair
+\* below for the truthful model (Pipeline's SplitSlotFieldOps; the read step lives in
+\* Pipeline.tla because it writes drainItem).
 StoreClaimSlotForDrain ==
   /\ hasSlot
   /\ hasSlot' = FALSE
   /\ slotItem' = NoItem
   /\ UNCHANGED <<escalated, waiters, storeCount, escPhase, escTail, escSlotClaimed, escMoved>>
+
+\* Truthful claim, step 1: the Exchange alone. The flag transfers; the fields are whatever
+\* they are - the committed pair, the previous claim's clear, or a successor commit's
+\* writes racing in (its CAS can succeed the instant this lands).
+StoreClaimSlotExchange ==
+  /\ hasSlot
+  /\ hasSlot' = FALSE
+  /\ UNCHANGED <<slotItem, escalated, waiters, storeCount, escPhase, escTail, escSlotClaimed, escMoved>>
+
+\* Truthful claim, step 3: the field clear. Unconditional, like the code: if a successor
+\* commit's CAS re-occupied the flag and its field writes already landed, this WIPES them
+\* under _hasSlot = 1 (the second face of backlog #7).
+StoreClaimSlotClear ==
+  /\ slotItem' = NoItem
+  /\ UNCHANGED <<hasSlot, escalated, waiters, storeCount, escPhase, escTail, escSlotClaimed, escMoved>>
 
 \* DecrementCount: the position republish (the caller captures the returned value as its
 \* activation-responsibility partition).
@@ -248,7 +317,9 @@ StoreTypeOK ==
   /\ slotItem \in Item \cup {NoItem}
   /\ escalated \in BOOLEAN
   /\ escPhase \in {"idle", "publish_done", "cas_done", "move_done", "esc_enqueued",
-                   "q_enq_act", "q_enq_noact", "compensate", "nudge_check"}
+                   "q_enq_act", "q_enq_noact", "compensate", "nudge_check",
+                   "slot_cas_act", "slot_cas_noact", "slot_f_act", "slot_f_noact",
+                   "slot_w_act", "slot_w_noact"}
   /\ escTail \in Item \cup {NoItem}
   /\ escSlotClaimed \in BOOLEAN
   /\ escMoved \in Item \cup {NoItem}
@@ -284,8 +355,15 @@ PostEscalationSlotEmpty ==
 \* stay in Pipeline.tla).
 StoreEscalationConsistent ==
   /\ (escTail # NoItem) <=> (escPhase \in {"publish_done", "cas_done", "move_done",
-                                           "esc_enqueued", "q_enq_act", "q_enq_noact"})
-  /\ (escPhase # "idle") => escalated
+                                           "esc_enqueued", "q_enq_act", "q_enq_noact",
+                                           "slot_cas_act", "slot_cas_noact",
+                                           "slot_f_act", "slot_f_noact",
+                                           "slot_w_act", "slot_w_noact"})
+  \* The slot-split commit phases (SplitSlotFieldOps) are the one pre-escalation use of
+  \* the executor PC; every other non-idle phase implies the queue tier exists.
+  /\ (escPhase \notin {"idle", "slot_cas_act", "slot_cas_noact",
+                       "slot_f_act", "slot_f_noact",
+                       "slot_w_act", "slot_w_noact"}) => escalated
   /\ (escPhase = "compensate") => (escMoved # NoItem)
 
 =============================================================================

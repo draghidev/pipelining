@@ -867,13 +867,13 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 DrainReadyWaiters();
                 return;
             }
-            // Slot already drained elsewhere. Shouldn't happen given single-callback wiring.
+            // Empty, a still-running occupant (tri-state peek bail), or claimed elsewhere.
             // (No signal bookkeeping: a stale dirty flag costs one spurious reclaim check.)
-            var serveDeposit = _advancing.ReleaseAndCheckPending();
+            var failServeDeposit = _advancing.ReleaseAndCheckPending();
             SignalDrainWakeupIfWaiting();
             // A deposit during our hold transfers the obligation here; re-enter the claim
             // loop to serve it. Losing the re-acquire re-deposits on the winner.
-            if (serveDeposit && _advancing.TryAcquireOrFlagPending())
+            if (failServeDeposit && _advancing.TryAcquireOrFlagPending())
             {
                 continue;
             }
@@ -990,12 +990,16 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
         }
 
-        // The slot path consumes a deposit at the release but delegates serving to the
-        // flag-driven reclaim below rather than re-acquiring directly: a deposit implies the
-        // depositor set _drainSignal during our hold, and nothing can consume that flag while
-        // we hold the latch (a pass-top clear requires the latch), so the reclaim's read
-        // finds it. Verified: Pipeline.tla SlotDrainerRelease (PendingWordLatch arm).
-        _advancing.ReleaseAndCheckPending();
+        // Capture the deposit consumed by the release: a contended acquirer (a callback, the
+        // nudge) that bailed against this hold flagged the latch word. The obligation must be
+        // SERVED, not delegated to the flag - the slot drain's own claim cleared _drainSignal at
+        // consume time, so a deposit whose companion flag the claim ate would vanish if the
+        // reclaim below read only the flag (the tri-state round's liveness counterexample: a
+        // queue inline-callback bail's deposit consumed by a slot release that then read the
+        // self-cleared flag and exited, stranding the queue head). OR-ing the deposit into the
+        // reclaim gate carries the obligation past the flag's self-consumption. Verified:
+        // Pipeline.tla SlotDrainerRelease + SlotServeReacq* (PendingWordLatch arm).
+        var serveDeposit = _advancing.ReleaseAndCheckPending();
         // Signal AFTER advancer release: prevents a WaitForEmptyAsync awaiter from resuming and
         // committing a new slot waiter whose callback would then race the still-held advancer
         // (the callback's failed acquire deposits, costing the holder a serve pass).
@@ -1013,7 +1017,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // (SlotReclaimEnabled=FALSE reproduces the lost-activation liveness violation; TRUE
         // holds EventuallyCompleted and NoTripleActivation across the full state space).
         if (!_enumerator.CompletionToken.IsCancellationRequested
-            && Volatile.Read(ref _drainSignal)
+            && (serveDeposit || Volatile.Read(ref _drainSignal))
             && _advancing.TryAcquireOrFlagPending())
         {
             if (_waiters.IsEscalated)

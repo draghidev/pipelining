@@ -214,6 +214,49 @@ CONSTANTS
                              \* the materializing-token role (count-gated conservation, served
                              \* by the materializer's own tail checks). TRUE = the fix; FALSE =
                              \* shipped two-cell code (the strand witness).
+  ,
+  SplitSlotFieldOps          \* Fidelity toggle (June 2026, backlog #7): the slot tier's field
+                             \* ops as the code's real instruction sequences. Commit is
+                             \* CAS-then-fields-then-increment (the license bit precedes the
+                             \* data - the inverse of the SPSC fields-then-index discipline);
+                             \* claim is Exchange-then-read-then-clear. The fused operators hid
+                             \* the windows: a claim Exchange winning between a successor
+                             \* commit's CAS and its field writes reads the PREVIOUS tenure's
+                             \* cleared fields (default claim - the NRE face), or reads the
+                             \* successor's half-landed pair (torn claim), or its clear WIPES
+                             \* the successor's written fields under _hasSlot = 1 (the lost-
+                             \* item face). Torn reads per se are expected (SPSC tears the
+                             \* same way) - the property under test is that every claim
+                             \* returning TRUE is LICENSED: ordered after the fields of the
+                             \* pair it returns. The slot callback path is licensed by
+                             \* construction (fields -> wiring -> fire -> claim); the suspect
+                             \* is the reclaim path, whose stale-token gate orders nothing.
+                             \* NoDefaultSlotClaim is the witness invariant.
+  ,
+  TriStateSlotClaim          \* THE backlog #7 fix (June 2026, Nino's call - the slot gets the
+                             \* same medicine as the latch: a third word state). _hasSlot
+                             \* becomes 0 empty / 1 occupied / 2 consuming, with the SPSC
+                             \* data-then-license discipline on the commit side:
+                             \*   commit: fields first (flag-0 fields are executor-exclusive:
+                             \*     claims never write fields under this protocol), then
+                             \*     publish 1 (plain volatile - the slot CAS is DELETED, a
+                             \*     perf refund; flag 1 PROVES fields complete);
+                             \*   claim: peek the task under stable flag 1 (a 1->0->1 cycle
+                             \*     is impossible: the only droppers are the latch-serialized
+                             \*     claimer and the escalation, which drops permanently) -
+                             \*     LIVE task = bail with NO state change (no claim, no
+                             \*     un-claim, no GetResult block); completed = CAS 1->2,
+                             \*     consume (read + clear + release 2->0) under exclusive
+                             \*     ownership - no ghosts, no torn reads;
+                             \*   escalation: move-claim becomes CAS(1->0), quiescent-only -
+                             \*     a consuming 2 reads as not-moved (the occupant completes
+                             \*     under the latch and exits, FIFO preserved). The Exchange
+                             \*     it replaces could zero state 2 and strand the occupant.
+                             \* State 2 is modeled as hasSlot /\ drainPhase = "cl_own" (the
+                             \* word's third state rides the drainer's PC; no new variable).
+                             \* Meaningful only under SplitSlotFieldOps. TRUE = the fix
+                             \* (Contract); FALSE = shipped two-phase ops
+                             \* (Pipeline_SlotTearWitness.cfg pins the tear).
 
 VARIABLES
   loc,                  \* [Item -> Location] - per-item bucket.
@@ -368,7 +411,10 @@ vars == <<loc, taskDone, activations, callbackFired, failed,
 \* Draining: claimed out of the slot by the drainer (TryClaimSlotForDrain won), CompleteWaiter
 \* not yet run. The slot fields are already empty - a successor commit can reuse the slot
 \* while this item is mid-drain.
-Locations == {"Nowhere", "Executing", "InTail", "InSlot", "InEscalation",
+\* InSlotPending: the slot commit's CAS landed but the field writes haven't (SplitSlotFieldOps;
+\* the slot-tier mirror of InWaitersPending). The slot is claimable in this state - a claim
+\* Exchange here reads the previous tenure's cleared fields (NoDefaultSlotClaim's window).
+Locations == {"Nowhere", "Executing", "InTail", "InSlot", "InSlotPending", "InEscalation",
               "InWaitersPending", "InWaiters", "Recovering", "Draining", "Completed"}
 
 (* ===========================================================================
@@ -562,7 +608,10 @@ ExecCommitTailExecutorWins ==
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
             IF ~escalated /\ ~hasSlot
-              THEN \* Slot path: zero-alloc, wire slot callback.
+              THEN \* Slot path: zero-alloc, wire slot callback. Fused fiction only; the
+                   \* split triple (ExecCommitSlotCAS*/Fields/Count*) covers this case
+                   \* under SplitSlotFieldOps.
+                /\ ~SplitSlotFieldOps
                 /\ StoreSlotCommit(i)
                 /\ loc' = [loc EXCEPT ![i] = "InSlot"]
                 /\ activations' = IF storeCount = 0
@@ -603,7 +652,9 @@ ExecCommitTailExecutorLoses ==
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
             IF ~escalated /\ ~hasSlot
-              THEN \* Slot path. activated=true: no B-path activate.
+              THEN \* Slot path. activated=true: no B-path activate. Fused fiction only
+                   \* (see ExecCommitTailExecutorWins's slot arm).
+                /\ ~SplitSlotFieldOps
                 /\ StoreSlotCommit(i)
                 /\ loc' = [loc EXCEPT ![i] = "InSlot"]
                 /\ activations' = activations
@@ -684,6 +735,120 @@ ExecCommitQueueCountLoses ==
                  activations, callbackFired, failed, drainer_vars>>
 
 (* ===========================================================================
+   Truthful slot commit (SplitSlotFieldOps): TryEscalateOrEnqueue's pre-
+   escalation slot path as the THREE steps the code performs - the _hasSlot
+   CAS (the slot is CLAIMABLE from here while the fields hold the previous
+   tenure's residue: the license bit precedes the data), the field writes,
+   then Interlocked.Increment. Backlog #7's commit half; the claim half is
+   the SlotClaim* steps below.
+   =========================================================================== *)
+
+\* Step 1, executor-wins variant (publish consumption mirrors ExecCommitQueueVisibleWins).
+ExecCommitSlotCASWins ==
+  /\ SplitSlotFieldOps
+  /\ ~TriStateSlotClaim  \* shipped license-before-data ordering; the Write variants are the fix
+  /\ hasTail
+  /\ hasExecuting  \* Exchange reads own write; TRUE = wins (see ExecCommitTailExecutorWins)
+  /\ LET i == tailWaiter IN
+       /\ i \notin taskDone  \* sync-success never reaches the store; stays on the fused action
+       /\ StoreSlotCommitCAS(i, "slot_cas_act")
+       /\ hasExecuting' = FALSE
+       /\ hasExecutingVisible' = FALSE
+       /\ executingItem' = NoItem
+       /\ executingItemVisible' = NoItem
+       /\ tailWaiter' = NoItem
+       /\ hasTail' = FALSE
+       /\ loc' = [loc EXCEPT ![i] = "InSlotPending"]
+  /\ UNCHANGED <<adv_vars, drainSignal, taskDone, activations, callbackFired, failed,
+                 drainer_vars>>
+
+\* Step 1, executor lost (alreadyActivated = true): no publish touch, no activation later.
+ExecCommitSlotCASLoses ==
+  /\ SplitSlotFieldOps
+  /\ ~TriStateSlotClaim
+  /\ hasTail
+  /\ ~hasExecuting
+  /\ LET i == tailWaiter IN
+       /\ i \notin taskDone
+       /\ StoreSlotCommitCAS(i, "slot_cas_noact")
+       /\ tailWaiter' = NoItem
+       /\ hasTail' = FALSE
+       /\ loc' = [loc EXCEPT ![i] = "InSlotPending"]
+  /\ UNCHANGED <<publish_vars, adv_vars, drainSignal, taskDone, activations,
+                 callbackFired, failed, drainer_vars>>
+
+\* Step 2: the field writes land; the pair is now truthfully present (InSlot).
+ExecCommitSlotFields ==
+  /\ StoreSlotCommitFields
+  /\ loc' = [loc EXCEPT ![escTail] = "InSlot"]
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, taskDone, activations,
+                 callbackFired, failed, drainer_vars>>
+
+(* TriStateSlotClaim commit: data, then license. Fields land first (flag-0 fields are
+   executor-exclusive: claims never write them under the tri-state protocol), the publish
+   makes flag 1 PROVE field completeness, and the count rides the existing slot_f step. *)
+
+\* Step 1, executor-wins variant: the field writes, publish consumption as in the CAS form.
+ExecCommitSlotWriteWins ==
+  /\ SplitSlotFieldOps
+  /\ TriStateSlotClaim
+  /\ hasTail
+  /\ hasExecuting  \* Exchange reads own write; TRUE = wins (see ExecCommitTailExecutorWins)
+  /\ LET i == tailWaiter IN
+       /\ i \notin taskDone  \* sync-success never reaches the store; stays on the fused action
+       /\ StoreSlotCommitFieldsFirst(i, "slot_w_act")
+       /\ hasExecuting' = FALSE
+       /\ hasExecutingVisible' = FALSE
+       /\ executingItem' = NoItem
+       /\ executingItemVisible' = NoItem
+       /\ tailWaiter' = NoItem
+       /\ hasTail' = FALSE
+       /\ loc' = [loc EXCEPT ![i] = "InSlotPending"]
+  /\ UNCHANGED <<adv_vars, drainSignal, taskDone, activations, callbackFired, failed,
+                 drainer_vars>>
+
+ExecCommitSlotWriteLoses ==
+  /\ SplitSlotFieldOps
+  /\ TriStateSlotClaim
+  /\ hasTail
+  /\ ~hasExecuting
+  /\ LET i == tailWaiter IN
+       /\ i \notin taskDone
+       /\ StoreSlotCommitFieldsFirst(i, "slot_w_noact")
+       /\ tailWaiter' = NoItem
+       /\ hasTail' = FALSE
+       /\ loc' = [loc EXCEPT ![i] = "InSlotPending"]
+  /\ UNCHANGED <<publish_vars, adv_vars, drainSignal, taskDone, activations,
+                 callbackFired, failed, drainer_vars>>
+
+\* Step 2: the publish - Volatile.Write(_slotState, 1), no CAS. The pair is now claimable
+\* AND complete, in that order.
+ExecCommitSlotPublish ==
+  /\ StoreSlotCommitPublish
+  /\ loc' = [loc EXCEPT ![escTail] = "InSlot"]
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, taskDone, activations,
+                 callbackFired, failed, drainer_vars>>
+
+\* Step 3: the increment + the wasEmpty activation with its IsCompleted skip (the code
+\* reads both AFTER the count lands - CommitWaiter's `if (wasEmpty && !waiterTask
+\* .IsCompleted)` - so a task completing mid-commit changes both answers).
+ExecCommitSlotCountWins ==
+  /\ escPhase = "slot_f_act"
+  /\ LET i == escTail IN
+       activations' = IF storeCount = 0 /\ i \notin taskDone
+                      THEN [activations EXCEPT ![i] = @ + 1]
+                      ELSE activations
+  /\ StoreCommitCount("idle")
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
+                 callbackFired, failed, drainer_vars>>
+
+ExecCommitSlotCountLoses ==
+  /\ escPhase = "slot_f_noact"
+  /\ StoreCommitCount("idle")
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars>>
+
+(* ===========================================================================
    First-escalation entry + multi-step escalation flow.
 
    Step 1 (PublishQueue): publish _queue (escalated' = TRUE). hasSlot and slot
@@ -743,8 +908,29 @@ ExecCommitTailPublishQueueExecutorLoses ==
 \* drained the slot before the executor reached publish, hasSlot is FALSE and escSlotClaimed
 \* records the loss; otherwise the executor wins and the slot fields are still populated.
 ExecEscalationCASSlot ==
+  /\ ~TriStateSlotClaim  \* Exchange semantics: zeroes ANY state - under the tri-state word
+                         \* that would steal a consuming drainer's release (see the Tri variant)
   /\ StoreEscalateClaimSlot
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
+                 loc, taskDone, activations, callbackFired, failed, drainer_vars>>
+
+\* Step 2 under TriStateSlotClaim: CAS(1 -> 0), NOT Exchange - the escalation may only take
+\* a QUIESCENT occupied slot. A consuming word (2: the drainer between its own CAS 1 -> 2 and
+\* its release - modeled as hasSlot /\ drainPhase = "cl_own") reads as not-moved: the occupant
+\* is completing RIGHT NOW under the advancer latch and exits the pipeline without ever
+\* entering the queue, so FIFO is preserved and the drainer's release (2 -> 0) proceeds
+\* untouched. The Exchange here was the corner that strands a live occupant: zeroing state 2
+\* leaves the un-claimable pair fieldside with no queue route. lives in Pipeline.tla (not the
+\* store module) because the owned state rides the drainer's PC.
+ExecEscalationCASSlotTri ==
+  /\ TriStateSlotClaim
+  /\ escPhase = "publish_done"
+  /\ LET quiescent == hasSlot /\ drainPhase # "cl_own" IN
+       /\ escSlotClaimed' = quiescent
+       /\ hasSlot' = (IF quiescent THEN FALSE ELSE hasSlot)
+  /\ escPhase' = "cas_done"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, slotItem, escalated, waiters,
+                 storeCount, escTail, escMoved,
                  loc, taskDone, activations, callbackFired, failed, drainer_vars>>
 
 \* Step 3: MoveSlot. If the CAS won, append the slot item to waiters head and clear the slot
@@ -950,7 +1136,8 @@ SlotCallbackBailsDuringEscalation ==
 \* the claim step - the proposed contract, release happens-before the count republish.
 \* FALSE (shipped code) defers the release to SlotDrainComplete, opening the clash window.
 SlotDrainClaim ==
-  \E i \in Item :
+  /\ ~SplitSlotFieldOps  \* fused fiction; the SlotDrainClaimEntry + SlotClaim* steps are the truth
+  /\ \E i \in Item :
     /\ i \in taskDone
     /\ loc[i] = "InSlot"
     /\ i \notin callbackFired
@@ -975,12 +1162,265 @@ SlotDrainClaim ==
                    taskDone, activations, esc_vars, failed, drainRemaining, pendingHeadActivation,
                    tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
+(* ===========================================================================
+   Truthful slot claim (SplitSlotFieldOps): the two entry routes (callback fire,
+   stale-token reclaim) converge on TryClaimSlotForDrain's three real steps -
+   Exchange, field read, field clear. The READ takes slotItem AS IT IS: the
+   committed pair, the previous claim's NoItem, or a successor commit's writes
+   racing in. NoDefaultSlotClaim pins the unlicensed default claim.
+   =========================================================================== *)
+
+\* Callback-path entry: the slot occupant's callback fires (one-shot consumed) and wins
+\* the latch. Licensed for its OWN item by construction (fields -> count -> wiring ->
+\* fire, all program-ordered on the executor; i # escTail excludes mid-commit fire) -
+\* but the claim steps it routes to read the fields truthfully, so a successor commit
+\* landing mid-claim is still in play.
+SlotDrainClaimEntry ==
+  /\ SplitSlotFieldOps
+  /\ \E i \in Item :
+       /\ i \in taskDone
+       /\ loc[i] = "InSlot"
+       /\ i \notin callbackFired
+       /\ i # escTail  \* wiring runs after the commit's count step
+       /\ ~advancingVisible
+       /\ ~escalated
+       /\ drainPhase = "idle"
+       /\ callbackFired' = callbackFired \cup {i}
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ drainerActive' = TRUE
+  /\ drainSignal' = TRUE  \* set-then-acquire: the callback's plain store precedes the win;
+                          \* the token stays visible until the post-claim clear
+  /\ drainPhase' = "cl_acq"
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
+                 loc, taskDone, activations, esc_vars, failed, drainItem, drainRemaining,
+                 pendingHeadActivation, tenure, tenureClash, assertFailed, nullActivation,
+                 qDrainPhase, qDrainedAny, advancingPending>>
+
+\* Reclaim-path entry, the TRUTHFUL gate: drainSignal + the latch win. No identity, no
+\* taskDone, no callbackFired knowledge - the fused SlotDrainerReclaim's
+\* `slotItem = i /\ i \in taskDone /\ i \in callbackFired` license is fiction the code
+\* never had. A stale token routes this entry into the claim steps against whatever the
+\* slot holds, INCLUDING a successor commit between its CAS and its field writes.
+SlotDrainerReclaimEntry ==
+  /\ SplitSlotFieldOps
+  /\ SlotReclaimEnabled
+  /\ drainerActive
+  /\ ~advancingVisible
+  /\ drainSignal  \* read, NOT consumed: the code's clear sits after the claim succeeds
+  /\ ~escalated
+  /\ drainPhase = "idle"
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ drainPhase' = "cl_acq"
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+\* Claim step 1: the Exchange. The flag transfers; the fields are whatever they are.
+SlotClaimExchange ==
+  /\ ~TriStateSlotClaim  \* shipped take-first protocol; the peek-gated steps are the fix
+  /\ drainPhase = "cl_acq"
+  /\ hasSlot
+  /\ StoreClaimSlotExchange
+  /\ drainPhase' = "cl_xchg"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, waiters,
+                 loc, taskDone, activations, callbackFired, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+\* Claim miss: the slot is empty (escalation or a prior claim owned it). Code: IsEscalated
+\* reroutes into DrainReadyWaiters holding the latch (do-top clear and the queue drain's
+\* own tail handles exit); otherwise the claim-fail arm RETURNS - release via
+\* SlotClaimFailRelease ("cl_exit"), with NO reclaim tail check on this arm.
+SlotClaimMiss ==
+  /\ drainPhase = "cl_acq"
+  /\ ~hasSlot
+  /\ IF escalated
+       THEN /\ qDrainPhase' = "pass"
+            /\ drainSignal' = FALSE
+            /\ qDrainedAny' = FALSE
+            /\ drainPhase' = "idle"
+       ELSE /\ drainPhase' = "cl_exit"
+            /\ UNCHANGED <<qDrainPhase, drainSignal, qDrainedAny>>
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, advancingPending>>
+
+(* TriStateSlotClaim claim: peek under the stable flag, claim only the completed, consume
+   under exclusive ownership. The 1 -> 0 -> 1 cycle that would invalidate the peek is
+   impossible: the only droppers are this latch-serialized claimer and the escalation,
+   which drops permanently (post-escalation the slot never refills). *)
+
+\* The peek, live verdict: the occupant's task is still running. Bail with NO state change -
+\* no claim, no un-claim, no GetResult block. The occupant's wired callback drains it on
+\* completion; the stale token that drove this probe costs exactly this one pass.
+SlotClaimPeekLive ==
+  /\ TriStateSlotClaim
+  /\ drainPhase = "cl_acq"
+  /\ hasSlot
+  /\ slotItem \notin taskDone
+  /\ drainPhase' = "cl_exit"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+\* The peek, completed verdict: proceed toward the claim CAS. taskDone is monotonic, so the
+\* verdict cannot go stale; the FLAG can (escalation takes the pair) - the own-win/lose pair
+\* below is the CAS.
+SlotClaimPeekDone ==
+  /\ TriStateSlotClaim
+  /\ drainPhase = "cl_acq"
+  /\ hasSlot
+  /\ slotItem \in taskDone
+  /\ drainPhase' = "cl_peeked"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+\* The claim CAS (1 -> 2) won: the consuming state begins. The word stays non-zero (hasSlot
+\* TRUE + this PC = state 2), so commits route to escalation and the escalation's
+\* quiescent-only CAS skips us.
+SlotClaimOwnWin ==
+  /\ drainPhase = "cl_peeked"
+  /\ hasSlot
+  /\ drainPhase' = "cl_own"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+\* The claim CAS lost: the escalation took the pair between our peek and our CAS (the only
+\* possible taker). The occupant is, or is about to be, the queue head - reroute into the
+\* queue drain holding the latch, exactly the claim-fail IsEscalated arm.
+SlotClaimOwnLose ==
+  /\ drainPhase = "cl_peeked"
+  /\ ~hasSlot
+  /\ escalated  \* the only dropper besides ourselves; TLC checks this guard is total
+  /\ qDrainPhase' = "pass"
+  /\ drainSignal' = FALSE
+  /\ qDrainedAny' = FALSE
+  /\ drainPhase' = "idle"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, advancingPending>>
+
+\* The consume: read + clear + release (2 -> 0) + the post-claim signal clear. Fused as one
+\* step because state 2 admits no interfering field access BY GUARD - commits need word 0,
+\* the escalation skips 2, claimers are latch-serialized - and those guards are exact word
+\* tests, so the fusion hides nothing observable.
+SlotClaimConsume ==
+  /\ drainPhase = "cl_own"
+  /\ drainItem' = slotItem
+  /\ slotItem' = NoItem
+  /\ hasSlot' = FALSE
+  /\ drainSignal' = FALSE  \* Interlocked.Exchange(_drainSignal, false) after the claim wins
+  /\ loc' = [loc EXCEPT ![slotItem] = "Draining"]
+  /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = slotItem THEN NoItem ELSE tenure
+  /\ drainPhase' = "claimed"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, escalated, waiters,
+                 taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainRemaining, pendingHeadActivation, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+(* The claim-fail exit: the code's fail arm releases the latch and RETURNS - no reclaim
+   tail check (that belongs to the successful-drain path). The v5 pending arm applies: a
+   deposit consumed at this release obligates one re-claim attempt (the code's
+   `if (serveDeposit && TryAcquireOrFlagPending()) continue;`). *)
+
+SlotClaimFailRelease ==
+  /\ drainPhase = "cl_exit"
+  /\ advancing
+  /\ qDrainPhase = "none"
+  /\ IF PendingWordLatch /\ advancingPending
+       THEN /\ IF WeakAdvancerRelease
+                 THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
+                 ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
+            /\ advancingPending' = FALSE
+            /\ drainPhase' = "cl_pendReacq"
+            /\ drainerActive' = drainerActive
+       ELSE /\ IF WeakAdvancerRelease
+                 THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
+                 ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
+            /\ advancingPending' = advancingPending
+            /\ drainPhase' = "idle"
+            /\ drainerActive' = FALSE
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny>>
+
+SlotClaimPendReacqWin ==
+  /\ drainPhase = "cl_pendReacq"
+  /\ ~advancingVisible
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ drainPhase' = "cl_acq"  \* the code's `continue`: back to the claim
+  /\ drainerActive' = TRUE
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+SlotClaimPendReacqLose ==
+  /\ drainPhase = "cl_pendReacq"
+  /\ advancingVisible
+  /\ drainPhase' = "idle"
+  /\ drainerActive' = FALSE
+  \* The re-acquire is the uniform word primitive: losing re-deposits on the winner.
+  /\ advancingPending' = TRUE
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny>>
+
+\* Claim step 2: the field read, TRUTHFUL. drainItem takes slotItem as it is at this
+\* instant - NoItem when the claim won against a commit's CAS before its field writes
+\* (the previous tenure's clear still in the cell), or the successor's identity when its
+\* writes landed mid-claim (the hijack: the drainer processes the successor, the item it
+\* was woken for strands).
+SlotClaimRead ==
+  /\ drainPhase = "cl_xchg"
+  /\ drainItem' = slotItem
+  /\ drainPhase' = "cl_read"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+\* Claim step 3: the field clear (unconditional, like the code - if a successor's CAS
+\* re-occupied the flag and its writes landed, this WIPES them under _hasSlot = 1), plus
+\* the post-claim pass-top signal clear and the drain bookkeeping. Gated on a non-default
+\* read so the model stays well-formed; the default claim halts at "cl_read" where
+\* NoDefaultSlotClaim pins it.
+SlotClaimClear ==
+  /\ drainPhase = "cl_read"
+  /\ drainItem # NoItem
+  /\ StoreClaimSlotClear
+  /\ drainSignal' = FALSE  \* Interlocked.Exchange(_drainSignal, false) after the claim wins
+  /\ loc' = [loc EXCEPT ![drainItem] = "Draining"]
+  /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = drainItem THEN NoItem ELSE tenure
+  /\ drainPhase' = "claimed"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, hasSlot, escalated, waiters,
+                 taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
 \* Slot drain, step 2 of 3: DecrementCount - the position republish. The executor's Count==0
 \* inline-activation gate (SourceYieldInline's storeCount = 0) can pass the instant this
 \* lands. The shipped code asserts the post-decrement count is 0; a commit that landed in
 \* the freed slot during the claimed window makes it 1 - assertFailed records the firing.
 SlotDrainCount ==
   /\ drainPhase = "claimed"
+  \* The drain's GetResult blocks until the claimed task completes. Vacuous under the
+  \* fused claim (its guard required taskDone); load-bearing under SplitSlotFieldOps,
+  \* where a hijack claim can hold a successor whose task is still running.
+  /\ drainItem \in taskDone
   /\ StoreDecrementCount
   /\ assertFailed' = IF storeCount - 1 # 0 THEN TRUE ELSE assertFailed
   \* The atomic decrement's return value, captured for the SlotDrainComplete* branch choice
@@ -1131,11 +1571,15 @@ SlotDrainHandoffTrust ==
 SlotDrainCompleteCPath ==
   /\ SlotChainActivation
   /\ drainPhase = "counted"
-  /\ drainRemaining = 0
+  \* <= 0 under the skew fix, mirroring DrainSlotInline's shipped `count <= 0` partition
+  \* and AdvancerCPath: a -1 means the consumed pair was the in-flight commit (already
+  \* completed), leaving the deferred publish as the only live responsibility.
+  /\ (IF SkewTolerantPartition THEN drainRemaining <= 0 ELSE drainRemaining = 0)
   /\ LET i == drainItem IN
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
        /\ tenure' = IF ~ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
-       /\ IF storeCount = 0 /\ hasExecutingVisible /\ executingItemVisible # NoItem
+       /\ IF (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)
+             /\ hasExecutingVisible /\ executingItemVisible # NoItem
             THEN
               /\ activations' = [activations EXCEPT ![executingItemVisible] = @ + 1]
               /\ hasExecuting' = FALSE
@@ -1172,18 +1616,33 @@ SlotDrainerRelease ==
        THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
        ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
   \* PendingWordLatch: the release Exchange wipes the whole word, so a deposit made during
-  \* this hold is consumed HERE - but the slot path does not take the pendReacq route. The
-  \* obligation delegates to the flag-driven tail (SlotDrainerReclaim / TailRerouteEscalated):
-  \* sound because every bail sets drainSignal alongside the pending deposit, and nothing can
-  \* consume that flag during this hold (the queue pass's do-top Exchange requires the latch
-  \* we are holding). Post-release, either our own tail serves the flag or a concurrent
-  \* acquirer's exhaustive pass does.
-  /\ advancingPending' = (IF PendingWordLatch THEN FALSE ELSE advancingPending)
+  \* this hold is consumed HERE. The obligation must be SERVED, not delegated to the flag:
+  \* the slot drain's own claim cleared drainSignal at consume time (SlotClaimConsume /
+  \* SlotDrainClaim), so a deposit whose companion flag-set the claim ate would vanish if we
+  \* relied on the flag-gated tail (the tri-state round's first liveness counterexample - a
+  \* queue inline-callback bail's deposit consumed by a slot release that then read the
+  \* self-cleared flag and exited, stranding the queue head). The consumed-deposit route
+  \* re-acquires and continues, exactly the queue path's pendReacq and the code's
+  \* `(deposit || drainSignal)` reclaim gate. The non-deposit path keeps the flag-gated tail
+  \* (a bail that did NOT win the deposit re-set the flag, and the tail serves it).
+  \* The serve route is taken under SplitSlotFieldOps, where the claim's finer steps let a
+  \* bail's flag be eaten by a LATER consume step (the strand). Under the fused claim the
+  \* atomic consume + the bail's flag re-set keep the flag-gated tail sound (verified green),
+  \* and "cl_acq" has no fused continuation - so fused keeps the delegate-to-flag behavior.
+  /\ IF PendingWordLatch /\ advancingPending /\ SplitSlotFieldOps
+       THEN /\ advancingPending' = FALSE
+            /\ drainPhase' = "sl_serve"
+            /\ drainerActive' = drainerActive
+       ELSE /\ advancingPending' = (IF PendingWordLatch THEN FALSE ELSE advancingPending)
+            /\ drainPhase' = drainPhase
+            /\ drainerActive' = drainerActive
   \* drainerActive stays TRUE: the slot drainer's method continues past the release into
   \* its reclaim check (mirroring the queue drain's do-while). DrainerChainExit clears it
   \* when no reclaim precondition holds.
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
-                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+                 loc, taskDone, activations, callbackFired, failed, esc_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny>>
 
 \* Pass-once slot-method tail, escalated arm: DrainSlotInline's post-release reclaim finds
 \* the store escalated and reroutes into DrainReadyWaiters (a fresh queue pass with the
@@ -1225,11 +1684,56 @@ SlotDrainerTailExit ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars>>
 
+(* Consumed-deposit serve (SlotDrainerRelease's "sl_serve" route): the slot release wiped
+   a deposit, so the drainer is obligated regardless of the flag. Re-acquire and continue -
+   escalated reroutes into the queue drain, non-escalated re-enters the slot claim loop,
+   a lost re-acquire re-deposits on the winner. The code's
+   `if (deposit && TryAcquireOrFlagPending()) { IsEscalated ? DrainReadyWaiters() : continue; }`. *)
+
+SlotServeReacqEscalated ==
+  /\ drainPhase = "sl_serve"
+  /\ ~advancingVisible
+  /\ escalated
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ drainSignal' = FALSE  \* DrainReadyWaiters' do-top clear
+  /\ qDrainPhase' = "pass"
+  /\ qDrainedAny' = FALSE
+  /\ drainPhase' = "idle"
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, advancingPending>>
+
+SlotServeReacqSlot ==
+  /\ drainPhase = "sl_serve"
+  /\ ~advancingVisible
+  /\ ~escalated
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ drainPhase' = "cl_acq"  \* re-enter the truthful slot claim (peek-gated under TriState)
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+
+SlotServeReacqLose ==
+  /\ drainPhase = "sl_serve"
+  /\ advancingVisible
+  /\ drainPhase' = "idle"
+  /\ drainerActive' = FALSE
+  /\ advancingPending' = TRUE  \* lost re-acquire re-deposits on the winner (uniform rule)
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny>>
+
 \* The slot-mode reclaim (the strand fix under design): post-release, the drainer re-checks
 \* for a waiter whose callback bailed against its hold (recorded in drainSignal, callback
 \* one-shot spent) and re-acquires to drain it. Fused TryAcquire + TryClaimSlotForDrain,
 \* entering the standard three-step drain at "claimed". Mirrors TryReclaimAdvancerForWork.
 SlotDrainerReclaim ==
+  /\ ~SplitSlotFieldOps  \* fused fiction; SlotDrainerReclaimEntry + SlotClaim* are the truth
   /\ SlotReclaimEnabled
   /\ drainerActive
   /\ ~advancingVisible
@@ -1754,6 +2258,15 @@ ExecSetTailW == ExecSetTail /\ UNCHANGED aux_vars
 RecoverItemWinsW == RecoverItemWins /\ UNCHANGED aux_vars
 RecoverItemLosesW == RecoverItemLoses /\ UNCHANGED aux_vars
 ExecCommitQueueVisibleWinsW == ExecCommitQueueVisibleWins /\ UNCHANGED aux_vars
+ExecCommitSlotCASWinsW == ExecCommitSlotCASWins /\ UNCHANGED aux_vars
+ExecCommitSlotCASLosesW == ExecCommitSlotCASLoses /\ UNCHANGED aux_vars
+ExecCommitSlotFieldsW == ExecCommitSlotFields /\ UNCHANGED aux_vars
+ExecCommitSlotCountWinsW == ExecCommitSlotCountWins /\ UNCHANGED aux_vars
+ExecCommitSlotCountLosesW == ExecCommitSlotCountLoses /\ UNCHANGED aux_vars
+ExecCommitSlotWriteWinsW == ExecCommitSlotWriteWins /\ UNCHANGED aux_vars
+ExecCommitSlotWriteLosesW == ExecCommitSlotWriteLoses /\ UNCHANGED aux_vars
+ExecCommitSlotPublishW == ExecCommitSlotPublish /\ UNCHANGED aux_vars
+ExecEscalationCASSlotTriW == ExecEscalationCASSlotTri /\ UNCHANGED aux_vars
 ExecCommitQueueVisibleLosesW == ExecCommitQueueVisibleLoses /\ UNCHANGED aux_vars
 ExecCommitQueueCountWinsW == ExecCommitQueueCountWins /\ UNCHANGED aux_vars
 ExecCommitQueueCountLosesW == ExecCommitQueueCountLoses /\ UNCHANGED aux_vars
@@ -1770,7 +2283,7 @@ ExecutorInlineCallbackBecomesAdvancerW == ExecutorInlineCallbackBecomesAdvancer 
   /\ qDrainedAny' = (IF PassOnceDrain THEN FALSE ELSE qDrainedAny)
 ExecutorInlineCallbackBailsOutW == ExecutorInlineCallbackBailsOut /\ UNCHANGED aux_nopend
   /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
-SlotDrainerReleaseW == SlotDrainerRelease /\ UNCHANGED aux_nopend
+SlotDrainerReleaseW == SlotDrainerRelease
 SlotCallbackBailsOutW == SlotCallbackBailsOut /\ UNCHANGED aux_nopend
   /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
 SlotCallbackBailsDuringEscalationW == SlotCallbackBailsDuringEscalation /\ UNCHANGED aux_vars
@@ -1822,18 +2335,44 @@ Next ==
   \/ ExecCommitQueueVisibleLosesW
   \/ ExecCommitQueueCountWinsW
   \/ ExecCommitQueueCountLosesW
+  \/ ExecCommitSlotCASWinsW
+  \/ ExecCommitSlotCASLosesW
+  \/ ExecCommitSlotFieldsW
+  \/ ExecCommitSlotCountWinsW
+  \/ ExecCommitSlotCountLosesW
+  \/ ExecCommitSlotWriteWinsW
+  \/ ExecCommitSlotWriteLosesW
+  \/ ExecCommitSlotPublishW
   \/ ExecEscalationEnqueueTailW
   \/ ExecEscalationCommitCountW
   \/ ExecEscalationNudgeStepW
   \/ ExecCommitTailPublishQueueExecutorWinsW
   \/ ExecCommitTailPublishQueueExecutorLosesW
   \/ ExecEscalationCASSlotW
+  \/ ExecEscalationCASSlotTriW
   \/ ExecEscalationMoveSlotW
   \/ ExecEscalationEnqueueNewW
   \/ ExecutorRegistersCallbackW
   \/ ExecutorInlineCallbackBecomesAdvancerW
   \/ ExecutorInlineCallbackBailsOutW
   \/ SlotDrainClaim
+  \/ SlotDrainClaimEntry
+  \/ SlotDrainerReclaimEntry
+  \/ SlotClaimExchange
+  \/ SlotClaimMiss
+  \/ SlotClaimRead
+  \/ SlotClaimClear
+  \/ SlotClaimPeekLive
+  \/ SlotClaimPeekDone
+  \/ SlotClaimOwnWin
+  \/ SlotClaimOwnLose
+  \/ SlotClaimConsume
+  \/ SlotClaimFailRelease
+  \/ SlotClaimPendReacqWin
+  \/ SlotClaimPendReacqLose
+  \/ SlotServeReacqEscalated
+  \/ SlotServeReacqSlot
+  \/ SlotServeReacqLose
   \/ SlotDrainCount
   \/ SlotDrainCompleteLegacy
   \/ SlotDrainCompleteChainSlot
@@ -1881,8 +2420,13 @@ Spec == Init /\ [][Next]_vars
         \* be installed via one of the two paths; WF on the disjunction so liveness still
         \* holds when the gate's storeCount value toggles between branches.
         /\ WF_vars(RecoverItemWinsW \/ RecoverItemLosesW)
+        \* One fairness anchor over every commit-entry variant: the commit's first step
+        \* eventually fires whichever route (fused, queue split, slot CAS-first, slot
+        \* write-first) the toggles and the store state enable.
         /\ WF_vars(ExecCommitTailExecutorWins \/ ExecCommitTailExecutorLoses
-                   \/ ExecCommitQueueVisibleWinsW \/ ExecCommitQueueVisibleLosesW)
+                   \/ ExecCommitQueueVisibleWinsW \/ ExecCommitQueueVisibleLosesW
+                   \/ ExecCommitSlotCASWinsW \/ ExecCommitSlotCASLosesW
+                   \/ ExecCommitSlotWriteWinsW \/ ExecCommitSlotWriteLosesW)
         \* The split commit's count step is the executor finishing TryEscalateOrEnqueue -
         \* an unconditional program step once the enqueue landed.
         /\ WF_vars(ExecCommitQueueCountWinsW \/ ExecCommitQueueCountLosesW)
@@ -1890,7 +2434,7 @@ Spec == Init /\ [][Next]_vars
         /\ WF_vars(ExecEscalationCommitCountW)
         /\ WF_vars(ExecEscalationNudgeStepW)
         /\ WF_vars(ExecCommitTailPublishQueueExecutorWinsW \/ ExecCommitTailPublishQueueExecutorLosesW)
-        /\ WF_vars(ExecEscalationCASSlotW)
+        /\ WF_vars(ExecEscalationCASSlotW \/ ExecEscalationCASSlotTriW)
         /\ WF_vars(ExecEscalationMoveSlotW)
         /\ WF_vars(ExecEscalationEnqueueNewW)
         /\ WF_vars(SlotCallbackBailsDuringEscalationW)
@@ -1914,6 +2458,30 @@ Spec == Init /\ [][Next]_vars
         \* we still include WF for symmetry. The interesting test is whether liveness holds.
         /\ WF_vars(ExecPostEscalationNudgeW)
         /\ WF_vars(SlotDrainClaim)
+        \* Truthful slot commit steps (SplitSlotFieldOps): the executor's straight-line
+        \* program continuation after the entry lands (fields after the CAS-first entry;
+        \* publish after the write-first entry).
+        /\ WF_vars(ExecCommitSlotFieldsW \/ ExecCommitSlotPublishW)
+        /\ WF_vars(ExecCommitSlotCountWinsW \/ ExecCommitSlotCountLosesW)
+        \* Truthful slot claim steps: the drainer's straight-line continuation after an
+        \* entry routes to "cl_acq". The cl_acq dispatch partitions on hasSlot/taskDone
+        \* (Exchange or peek verdicts vs miss); the later steps are unconditional program
+        \* steps within their phases. The entries themselves follow SlotDrainClaim /
+        \* SlotDrainerReclaim's fairness pattern.
+        /\ WF_vars(SlotDrainClaimEntry)
+        /\ WF_vars(SlotDrainerReclaimEntry)
+        /\ WF_vars(SlotClaimExchange \/ SlotClaimMiss
+                   \/ SlotClaimPeekDone \/ SlotClaimPeekLive)
+        /\ WF_vars(SlotClaimRead)
+        /\ WF_vars(SlotClaimClear)
+        /\ WF_vars(SlotClaimOwnWin \/ SlotClaimOwnLose)
+        /\ WF_vars(SlotClaimConsume)
+        /\ WF_vars(SlotClaimFailRelease)
+        \* The claim-fail pendReacq CAS: one of the two arms must fire post-release.
+        /\ WF_vars(SlotClaimPendReacqWin \/ SlotClaimPendReacqLose)
+        \* The consumed-deposit serve: the slot release's obligation re-acquire. One arm
+        \* must fire (escalated reroute / slot re-enter / lost re-deposit).
+        /\ WF_vars(SlotServeReacqEscalated \/ SlotServeReacqSlot \/ SlotServeReacqLose)
         /\ WF_vars(SlotDrainCount)
         \* One WF over the disjunction: the complete variants are mutually exclusive
         \* (constant gate + drainRemaining partition + escalated branch) - the disjunction
@@ -1957,9 +2525,13 @@ TypeOK ==
   /\ advancingPending \in BOOLEAN
   /\ drainerActive \in BOOLEAN
   /\ failed \subseteq Item
-  /\ drainPhase \in {"idle", "claimed", "counted", "handoff"}
+  /\ drainPhase \in {"idle", "claimed", "counted", "handoff", "cl_acq", "cl_xchg", "cl_read",
+                     "cl_peeked", "cl_own", "cl_exit", "cl_pendReacq", "sl_serve"}
   /\ drainItem \in Item \cup {NoItem}
-  /\ drainRemaining \in 0..NumItems
+  \* -1 floor: the slot claim can consume a committed-but-uncounted pair under the split
+  \* commit (the same single-producer skew bound as BoundedCountSkew; the code's
+  \* Debug.Assert(count >= -1) in DrainSlotInline).
+  /\ drainRemaining \in -1..NumItems
   /\ pendingHeadActivation \in BOOLEAN
   /\ tenure \in Item \cup {NoItem}
   /\ tenureClash \in BOOLEAN
@@ -1980,20 +2552,51 @@ TypeOK ==
 \* an entry is appended to waiters one step before its increment lands, so a mid-commit
 \* state carries one visible-but-uncounted entry. Mirrors the drainPhase = "claimed" term's
 \* shape (counted-but-not-resident vs here resident-but-not-counted).
+\* The slot_f term mirrors the queue enqueued-term: under SplitSlotFieldOps the slot pair
+\* is resident (fields written) one step before its increment lands.
+\* The claim-in-flight terms (SplitSlotFieldOps): between the claim's Exchange and its
+\* clear, the claimed position's pair is a GHOST in the cell - the claim owns it (the +1),
+\* and the cell's residue must not double-count. Only a successor commit's landed fields
+\* (escPhase slot_f*) are a real occupant again. Built so the equation balances through
+\* every healthy interleaving and breaks exactly at corruption: the clear wiping a
+\* successor's landed pair desyncs count from residency PERMANENTLY - that violation is a
+\* face of backlog #7, not a bookkeeping artifact.
 CountConsistency ==
-  storeCount = (IF slotItem # NoItem THEN 1 ELSE 0) + Len(waiters)
+  LET claimInFlight == drainPhase \in {"cl_xchg", "cl_read"}
+      \* In-window, the cell's residue is the ghost unless a successor re-CASed the flag
+      \* (hasSlot back to TRUE - the claim's Exchange dropped it) AND its fields landed
+      \* (past the slot_cas phases, where the cell still shows the ghost under the new
+      \* owner's flag).
+      slotTerm == IF slotItem # NoItem
+                     /\ (~claimInFlight
+                         \/ (hasSlot /\ escPhase \notin {"slot_cas_act", "slot_cas_noact"}))
+                  THEN 1 ELSE 0
+  IN storeCount = slotTerm + Len(waiters)
                + (IF drainPhase = "claimed" THEN 1 ELSE 0)
-               - (IF escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact"} THEN 1 ELSE 0)
+               + (IF claimInFlight THEN 1 ELSE 0)
+               - (IF escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact",
+                                   "slot_f_act", "slot_f_noact",
+                                   "slot_w_act", "slot_w_noact"} THEN 1 ELSE 0)
 
 \* Drain-phase bookkeeping coherence. Note mid-drain commits are LEGAL: a successor can
 \* reuse the freed slot and even trigger first escalation while the drainer is between its
 \* claim and its decrement - the only ownership constraint is the advancer latch itself.
 DrainConsistent ==
-  /\ (drainPhase \in {"claimed", "counted"}) <=> (drainItem # NoItem)
-  /\ drainItem # NoItem => loc[drainItem] = "Draining"
+  \* Split from the fused <=> so the truthful claim's read phase fits: at "cl_read"
+  \* drainItem holds whatever the read returned - the committed pair (forward direction
+  \* must not require it) or NoItem (NoDefaultSlotClaim's subject, not this invariant's).
+  /\ (drainPhase \in {"claimed", "counted"}) => (drainItem # NoItem)
+  /\ (drainItem # NoItem) => (drainPhase \in {"claimed", "counted", "cl_read"})
+  /\ (drainItem # NoItem /\ drainPhase # "cl_read") => loc[drainItem] = "Draining"
   /\ \A i \in Item : (loc[i] = "Draining") => (drainItem = i)
-  /\ drainPhase # "idle" => (advancing /\ drainerActive)
+  \* cl_pendReacq / sl_serve are the drainer phases that hold the method alive PAST a release
+  \* (the obligation re-acquire windows: claim-fail exit and the main release's deposit serve).
+  /\ drainPhase \notin {"idle", "cl_pendReacq", "sl_serve"} => (advancing /\ drainerActive)
+  /\ drainPhase \in {"cl_pendReacq", "sl_serve"} => drainerActive
   /\ drainPhase # "counted" => drainRemaining = 0
+  \* The slot decrement's -1 floor (claimed-but-uncounted, BoundedCountSkew's bound) is
+  \* reachable once the split commit lets a claim land before the increment.
+  /\ drainRemaining >= -1
   \* The handoff flag only exists in escalated runs (the drainer publishes it exactly when
   \* its chain obligation met an escalation).
   /\ pendingHeadActivation => escalated
@@ -2023,6 +2626,15 @@ EscalationConsistent ==
        => (loc[escTail] = "InEscalation")
   /\ (escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact"})
        => (loc[escTail] \in {"InWaitersPending", "Completed"})
+  \* Slot-split commit phases: CAS landed, fields pending = InSlotPending (CAS-first form);
+  \* fields landed, flag pending = InSlotPending (TriState write-first form); fields landed,
+  \* count pending = InSlot - or already hijack-claimed (Draining) or even completed by a
+  \* stale-token reclaim that won the mid-commit window (the same consumability class the
+  \* queue's Completed admission covers).
+  /\ (escPhase \in {"slot_cas_act", "slot_cas_noact", "slot_w_act", "slot_w_noact"})
+       => (loc[escTail] = "InSlotPending")
+  /\ (escPhase \in {"slot_f_act", "slot_f_noact"})
+       => (loc[escTail] \in {"InSlot", "Draining", "Completed"})
   /\ \A i \in Item : (loc[i] = "InEscalation") => (escTail = i)
 
 \* Slot occupancy consistency. The slotItem field and the InSlot location always agree
@@ -2033,11 +2645,25 @@ EscalationConsistent ==
 \* until the MoveSlot step. The escPhase = "idle" gating on clause 3 admits that window.
 SlotConsistent ==
   LET inSlotExists == \E i \in Item : loc[i] = "InSlot"
-  IN  /\ inSlotExists <=> (slotItem # NoItem)
-      /\ slotItem # NoItem => loc[slotItem] = "InSlot"
-      /\ escPhase = "idle" => (hasSlot <=> inSlotExists)
+      \* The TriState commit's data-then-license window: fields landed, flag pending.
+      midWrite == escPhase \in {"slot_w_act", "slot_w_noact"}
+  IN  /\ (slotItem # NoItem) <=> (inSlotExists \/ midWrite)
+      /\ slotItem # NoItem => loc[slotItem] = (IF midWrite THEN "InSlotPending" ELSE "InSlot")
+      \* The truthful claim's Exchange-to-clear window (cl_xchg/cl_read) legitimately holds
+      \* hasSlot = FALSE with the fields still populated - the same shape as the escalation's
+      \* cas_done window, drainer-side. The TriState consuming state (cl_own) needs NO
+      \* exception: the word stays non-zero and the occupant stays InSlot until the consume
+      \* flips both - preserving this invariant is the design's point.
+      /\ (escPhase = "idle" /\ drainPhase \notin {"cl_xchg", "cl_read"})
+           => (hasSlot <=> inSlotExists)
 
-\* PostEscalationSlotEmpty (the loosened-CAS justification) lives in WaiterStore.tla.
+\* PostEscalationSlotEmpty (the loosened-CAS justification) lives in WaiterStore.tla, but
+\* the TriState consuming hold can legitimately outlive an escalation that skipped it (the
+\* quiescent-only CAS reads 2 as not-moved and proceeds; the drainer's release follows).
+\* This quiescent form replaces it in Invariants; it reduces to the original whenever
+\* cl_own is unreachable (every non-TriState configuration).
+PostEscalationSlotQuiescent ==
+  (escalated /\ escPhase = "idle" /\ drainPhase # "cl_own") => ~hasSlot
 
 \* Pipeline contract: at most one item is "inline-activated" without going through the
 \* deferred-publish + advancer C-path. Inline-activated means SourceYieldInline /
@@ -2064,7 +2690,7 @@ Invariants ==
   /\ NoTripleActivation
   /\ WaitersConsistent
   /\ SlotConsistent
-  /\ PostEscalationSlotEmpty
+  /\ PostEscalationSlotQuiescent
   /\ EscalationConsistent
   /\ NoSimultaneousActiveReader
 
@@ -2103,6 +2729,19 @@ NoTenureClash ==
 NoNullActivation ==
   ~nullActivation
 
+\* Every slot claim that returns TRUE is LICENSED: the pair it read is the pair some
+\* commit fully published. The "cl_read" state with drainItem = NoItem is the unlicensed
+\* default claim - a claim Exchange that won between a successor commit's _hasSlot CAS and
+\* its field writes, reading the previous tenure's cleared fields (backlog #7's NRE face:
+\* the code would GetResult a default ValueTask - which completes successfully - and
+\* CompleteWaiterDeferred(default(T))). EXPECTED FALSE under SplitSlotFieldOps = TRUE
+\* against the shipped claim protocol (Pipeline_SlotTearWitness.cfg) IF the stale-token
+\* reclaim window is reachable; the companion faces are SlotConsistent (the wipe / the
+\* stranded hijack victim) and EventuallyCompleted (the lost item). Torn reads as such are
+\* expected - SPSC tears the same way - the property is that no claim ACTS on one.
+NoDefaultSlotClaim ==
+  (drainPhase = "cl_read") => (drainItem # NoItem)
+
 (* ===========================================================================
    Liveness
    =========================================================================== *)
@@ -2117,7 +2756,7 @@ NoNullActivation ==
 \* drainSignal bump, and never get drained.
 EventuallyCompleted ==
   \A i \in Item :
-    (loc[i] \in {"Executing", "InTail", "InSlot", "InEscalation", "InWaitersPending", "InWaiters", "Draining"} /\ i \in taskDone)
+    (loc[i] \in {"Executing", "InTail", "InSlot", "InSlotPending", "InEscalation", "InWaitersPending", "InWaiters", "Draining"} /\ i \in taskDone)
       ~> (loc[i] = "Completed")
 
 \* Every yielded item is eventually activated (or has already left the pipeline). The property
