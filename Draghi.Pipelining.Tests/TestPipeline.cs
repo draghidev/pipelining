@@ -181,13 +181,14 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
 {
     readonly bool _runEnqueueAsynchronously;
     readonly Func<PipelineItemFailureContext, TestPipelineItem?>? _recoveryFactory;
-    readonly TaskCompletionSource? _idleTcs;
 
-    public TestPipelinePolicy(bool runEnqueueAsynchronously = true, Func<PipelineItemFailureContext, TestPipelineItem?>? recoveryFactory = null, TaskCompletionSource? idleTcs = null)
+    // Executor-idle observation no longer lives on the policy (the OnExecutionIdleAsync hook was
+    // removed in the source-driven refactor). Tests that need an "executor at rest" barrier wire it
+    // through TestObservableQueueSource's onIdle lambda via ObservablePipeline.Create.
+    public TestPipelinePolicy(bool runEnqueueAsynchronously = true, Func<PipelineItemFailureContext, TestPipelineItem?>? recoveryFactory = null)
     {
         _runEnqueueAsynchronously = runEnqueueAsynchronously;
         _recoveryFactory = recoveryFactory;
-        _idleTcs = idleTcs;
     }
 
     public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
@@ -229,13 +230,5 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
         return recoveryItem is not null;
     }
 
-    public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-    {
-        _idleTcs?.TrySetResult();
-        return ValueTask.CompletedTask;
-    }
-
     public bool RunEnqueueAsynchronously => _runEnqueueAsynchronously;
-
-    public ValueTask YieldAfterFirstItem() => default;
 }

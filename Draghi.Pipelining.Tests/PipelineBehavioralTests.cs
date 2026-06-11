@@ -6,96 +6,10 @@ namespace Draghi.Pipelining.Tests;
 public class PipelineBehavioralTests
 {
     [TestMethod]
-    [Ignore("YieldAfterFirstItem hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
-    public async Task YieldAfterFirstItem_CalledOncePerBatch_WhenMoreItemsQueued()
-    {
-        var counter = new Counter();
-        var pipeline = Pipeline.Create<TestPipelineItem, YieldCountingPolicy>(new(counter));
-
-        // Hold the executor inside the first ExecuteItemAsync so we can enqueue more items
-        // before the first one completes and the queue gets re-checked.
-        var first = new TestPipelineItem { ExecuteAsync = true };
-        pipeline.Enqueue(first).Execute();
-        await first.WaitForExecutedAsync();
-
-        var second = new TestPipelineItem();
-        var third = new TestPipelineItem();
-        pipeline.Enqueue(second).Execute();
-        pipeline.Enqueue(third).Execute();
-
-        // Release the first item, executor finishes it, sees queue is non-empty,
-        // and must call YieldAfterFirstItem before processing the next.
-        first.CompleteExecuteTask();
-
-        await first.WaitForCompleteAsync();
-        await second.WaitForCompleteAsync();
-        await third.WaitForCompleteAsync();
-
-        Assert.AreEqual(1, counter.Value, "YieldAfterFirstItem should fire exactly once per batch.");
-    }
-
-    [TestMethod]
-    [Ignore("YieldAfterFirstItem hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
-    public async Task YieldAfterFirstItem_NotCalled_WhenQueueEmptyAfterFirstItem()
-    {
-        var counter = new Counter();
-        var pipeline = Pipeline.Create<TestPipelineItem, YieldCountingPolicy>(new(counter));
-
-        var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
-        await item.WaitForCompleteAsync();
-
-        // Give the executor a chance to settle into the idle path.
-        await pipeline.WaitForEmptyAsync();
-        await Task.Delay(50);
-
-        Assert.AreEqual(0, counter.Value, "YieldAfterFirstItem should not fire when the queue is empty after the first item.");
-    }
-
-    [TestMethod]
-    [Ignore("YieldAfterFirstItem hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
-    public async Task YieldAfterFirstItem_CalledAgainOnNewBatch()
-    {
-        var counter = new Counter();
-        // The re-arm contract is per genuine executor park, not per depth-zero. WaitForEmptyAsync
-        // returns at depth-zero (fired from inside CompleteItem while executor may still be mid-batch),
-        // which can race the second batch's enqueue into the same inner-while iteration. Sync on the
-        // policy's OnExecutionIdleAsync hook instead - testing a policy contract via the policy hook.
-        var idleSem = new SemaphoreSlim(0);
-        var pipeline = Pipeline.Create<TestPipelineItem, YieldCountingPolicy>(new(counter, () => idleSem.Release()));
-
-        // First batch.
-        var firstA = new TestPipelineItem { ExecuteAsync = true };
-        pipeline.Enqueue(firstA).Execute();
-        await firstA.WaitForExecutedAsync();
-        var secondA = new TestPipelineItem();
-        pipeline.Enqueue(secondA).Execute();
-        firstA.CompleteExecuteTask();
-        await firstA.WaitForCompleteAsync();
-        await secondA.WaitForCompleteAsync();
-
-        await idleSem.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.AreEqual(1, counter.Value, "After first batch, yield count should be 1.");
-
-        // Second batch. Executor is genuinely parked now, needsYieldAfterFirst is reset.
-        var firstB = new TestPipelineItem { ExecuteAsync = true };
-        pipeline.Enqueue(firstB).Execute();
-        await firstB.WaitForExecutedAsync();
-        var secondB = new TestPipelineItem();
-        pipeline.Enqueue(secondB).Execute();
-        firstB.CompleteExecuteTask();
-        await firstB.WaitForCompleteAsync();
-        await secondB.WaitForCompleteAsync();
-
-        await idleSem.WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.AreEqual(2, counter.Value, "Each idle→active batch transition should re-arm YieldAfterFirstItem.");
-    }
-
-    [TestMethod]
     public async Task ExecutionScheduler_CustomScheduler_ReceivesSubmissions()
     {
         var scheduler = new RecordingScheduler();
-        var pipeline = Pipeline.Create<TestPipelineItem, CustomSchedulerPolicy>(new(scheduler));
+        var pipeline = Pipeline.Create<TestPipelineItem, CustomSchedulerPolicy>(new(), scheduler: scheduler);
 
         // Enqueue an item. The wake signal will dispatch through the custom scheduler
         // when running continuations asynchronously.
@@ -140,11 +54,11 @@ public class PipelineBehavioralTests
     }
 
     [TestMethod]
-    [Ignore("OnExecutionIdleAsync hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task OnExecutionIdleAsync_Throws_PropagatesViaCompleteAsync()
     {
         var idleException = new InvalidOperationException("idle handler exploded");
-        var pipeline = Pipeline.Create<TestPipelineItem, ThrowingIdlePolicy>(new(idleException));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, ThrowingIdlePolicy>(
+            new(), onIdle: _ => throw idleException);
 
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
@@ -218,11 +132,6 @@ public class PipelineBehavioralTests
 
     // -- Helpers --
 
-    sealed class Counter
-    {
-        public int Value;
-    }
-
     sealed class RecordingScheduler : PipelineScheduler
     {
         public int SubmitCount;
@@ -234,41 +143,8 @@ public class PipelineBehavioralTests
         }
     }
 
-    struct YieldCountingPolicy(Counter counter, Action? onIdle = null) : IPipelinePolicy<TestPipelineItem>
+    struct CustomSchedulerPolicy : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
-        {
-            var task = item.GetExecuteTask();
-            item.SignalExecuted();
-            return task;
-        }
-
-        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
-
-        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
-        {
-            recoveryItem = null;
-            return false;
-        }
-
-        public ValueTask YieldAfterFirstItem()
-        {
-            counter.Value++;
-            return default;
-        }
-
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-        {
-            onIdle?.Invoke();
-            return default;
-        }
-    }
-
-    struct CustomSchedulerPolicy(PipelineScheduler scheduler) : IPipelinePolicy<TestPipelineItem>
-    {
-        public PipelineScheduler? ExecutionScheduler => scheduler;
-
         public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
@@ -330,7 +206,7 @@ public class PipelineBehavioralTests
         }
     }
 
-    struct ThrowingIdlePolicy(Exception toThrow) : IPipelinePolicy<TestPipelineItem>
+    struct ThrowingIdlePolicy : IPipelinePolicy<TestPipelineItem>
     {
         public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
         {
@@ -347,8 +223,6 @@ public class PipelineBehavioralTests
             recoveryItem = null;
             return false;
         }
-
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => throw toThrow;
     }
 
     struct TokenCapturingPolicy(TaskCompletionSource<CancellationToken> capture) : IPipelinePolicy<TestPipelineItem>
@@ -406,7 +280,6 @@ public class PipelineBehavioralTests
     /// enqueues the next batch, executor picks it up on the outer loop's next iteration without
     /// parking (queue is non-empty). Gated by a counter to avoid infinite refilling.
     [TestMethod]
-    [Ignore("OnExecutionIdleAsync hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task ReentrantEnqueueFromOnExecutionIdleAsync_RefillsBatchUntilGated()
     {
         var refills = new TestPipelineItem[3];
@@ -414,14 +287,16 @@ public class PipelineBehavioralTests
             refills[i] = new TestPipelineItem();
 
         var refillIdx = 0;
-        QueuedPipeline<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>? pipelineRef = null;
+        ObservablePipeline<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>? pipelineRef = null;
 
-        var pipeline = Pipeline.Create<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>(
-            new ReentrantEnqueueOnIdlePolicy(() =>
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, ReentrantEnqueueOnIdlePolicy>(
+            new ReentrantEnqueueOnIdlePolicy(),
+            onIdle: _ =>
             {
                 if (refillIdx < refills.Length)
                     pipelineRef!.Enqueue(refills[refillIdx++]).Execute();
-            }));
+                return default;
+            });
         pipelineRef = pipeline;
 
         var first = new TestPipelineItem();
@@ -462,16 +337,11 @@ public class PipelineBehavioralTests
             return false;
         }
 
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
         public bool RunEnqueueAsynchronously => true;
-        public ValueTask YieldAfterFirstItem() => default;
     }
 
     struct ReentrantEnqueueOnIdlePolicy : IPipelinePolicy<TestPipelineItem>
     {
-        readonly Action _onIdle;
-        public ReentrantEnqueueOnIdlePolicy(Action onIdle) => _onIdle = onIdle;
-
         public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
@@ -487,13 +357,6 @@ public class PipelineBehavioralTests
             return false;
         }
 
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-        {
-            _onIdle();
-            return default;
-        }
-
         public bool RunEnqueueAsynchronously => true;
-        public ValueTask YieldAfterFirstItem() => default;
     }
 }

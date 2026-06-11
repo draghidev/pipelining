@@ -48,13 +48,14 @@ public class PipelineEnumeratorTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task PendingWaiters_YieldsAllInEnqueueOrder()
     {
-        // Items are CompleteAsync, so depth never reaches 0 - use OnExecutionIdleAsync as the
+        // Items are CompleteAsync, so depth never reaches 0 - use the source onIdle hook as the
         // executor-at-rest signal (CommitTailWaiter's transit window must be settled before enum).
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         const int count = 5;
         var enqueued = new TestPipelineItem[count];
@@ -85,14 +86,15 @@ public class PipelineEnumeratorTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task SegmentGrowth_YieldsAllItems()
     {
         // SPSC initial segment size is 32. Enqueue more than that to force segment growth.
-        // Items are CompleteAsync, so depth never reaches 0 - use OnExecutionIdleAsync as the
+        // Items are CompleteAsync, so depth never reaches 0 - use the source onIdle hook as the
         // executor-at-rest signal (CommitTailWaiter's transit window must be settled before enum).
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         const int count = 50;
         var enqueued = new TestPipelineItem[count];
@@ -144,14 +146,15 @@ public class PipelineEnumeratorTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task TwoSnapshots_BothObserveSameItems()
     {
         // Enumeration is non-mutating, repeating it yields the same items. Items are CompleteAsync,
         // so depth never reaches 0 during enumeration - WaitForEmptyAsync would hang. Need an
-        // executor-at-rest signal independent of depth. Use the policy's OnExecutionIdleAsync TCS.
+        // executor-at-rest signal independent of depth. Use the source onIdle hook.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         const int count = 4;
         var enqueued = new TestPipelineItem[count];
@@ -188,15 +191,16 @@ public class PipelineEnumeratorTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task ManualMoveNext_ReturnsFalseAfterLastItem()
     {
         // WaitForExecutedAsync only signals that SignalExecuted fired inside ExecuteItemAsync.
-        // the executor hasn't yet committed the item to _tailWaiter / _waiters. Use idleTcs to
-        // wait until the executor is settled before enumerating, otherwise MoveNext races the
-        // routing and may see no items.
+        // the executor hasn't yet committed the item to _tailWaiter / _waiters. Use the source
+        // onIdle hook to wait until the executor is settled before enumerating, otherwise MoveNext
+        // races the routing and may see no items.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();

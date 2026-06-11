@@ -75,11 +75,15 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
 
     /// <summary>Reference-typed inner state shared across struct copies.</summary>
     /// <remarks>
-    /// <c>Current</c> lives here (rather than on the struct enumerator) because the enumerator's
-    /// <c>MoveNextAsync</c> is <c>async</c>: the C# compiler captures <c>this</c> by value when it
-    /// builds the state machine, so any field mutation inside the async method updates the state
-    /// machine's local copy of the struct rather than the caller's field. Storing the produced
-    /// item on the class-backed <see cref="State"/> makes the mutation visible to the caller.
+    /// <c>Current</c> lives here (rather than on the struct enumerator) because the enumerator is a
+    /// struct that callers hold and copy: a write to a struct field would land on a copy and be
+    /// lost. Routing the produced item through the class-backed state keeps it observable.
+    /// <para>
+    /// The pull is <c>=&gt; WakeSignal.Rendezvous(_resolve)</c>: the wake signal owns the park
+    /// lifecycle and value-task plumbing, and this state supplies only a cached resolver run under
+    /// the wake lock. A pull that finds an item (or observes completion) returns an already-completed
+    /// task with no state-machine box; only an actual park hands out an IValueTaskSource-backed one.
+    /// </para>
     /// </remarks>
     internal sealed class State
     {
@@ -92,10 +96,44 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         // linked with this in the Enumerator's CTS construction.
         public readonly CancellationToken CancellationToken;
 
+        // The active enumeration's combined (source + per-call) token, published by the enumerator
+        // at construction. The resolver reads it to translate cancellation into a completed (false)
+        // result, matching the WakeSignal.IsCompleted check.
+        public CancellationToken EnumerationToken;
+
+        readonly Func<WakeOutcome> _resolve;
+
         public State(bool runContinuationsAsynchronously, PipelineScheduler scheduler, CancellationToken cancellationToken)
         {
             WakeSignal = new(runContinuationsAsynchronously, scheduler);
             CancellationToken = cancellationToken;
+            _resolve = Resolve;
+        }
+
+        public ValueTask<bool> MoveNextAsync() => WakeSignal.Rendezvous(_resolve);
+
+        // Runs under the wake lock (WakeSignal.Pump holds it across this call). Pure: a single
+        // dequeue attempt, no user code, so no reentrancy or park-hook concern.
+        WakeOutcome Resolve()
+        {
+            NotEmpty = false;
+
+            if (Queue.TryDequeue(out var current))
+            {
+                Current = current!;
+                return WakeOutcome.GotItem;
+            }
+
+            // No item to hand back: release the previously-yielded Current so the last item is not
+            // GC-rooted by this field across the park. The executor only reads Current after a
+            // GotItem, so clearing it on a non-GotItem outcome is safe.
+            if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                Current = default!;
+
+            if (WakeSignal.IsCompleted || EnumerationToken.IsCancellationRequested)
+                return WakeOutcome.Completed;
+
+            return WakeOutcome.Park;
         }
     }
 
@@ -141,6 +179,8 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
                 (false, false) => new CancellationTokenSource(),
             };
             _completionToken = _cts.Token;
+            // Publish the combined token to the state so the pump can observe cancellation.
+            state.EnumerationToken = _completionToken;
             _completionToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
         }
 
@@ -149,36 +189,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
 
         public void Complete() => _cts.Cancel();
 
-        public async ValueTask<bool> MoveNextAsync()
-        {
-            // Dequeue first, exit only when queue is empty AND the source is shutting down. The
-            // outer-predicate variant would strand items admitted before Complete().
-            // After WaitUnsynchronized resumes (whether woken by Signal or Complete), loop back
-            // to retry the dequeue. The await's boolean result is not load-bearing because the
-            // top-of-loop completion check handles the "completed and empty" case.
-            while (true)
-            {
-                _state.WakeSignal.AcquireWakeLock();
-                _state.NotEmpty = false;
-
-                if (_state.Queue.TryDequeue(out var current))
-                {
-                    _state.Current = current!;
-                    _state.WakeSignal.ReleaseWakeLock();
-                    return true;
-                }
-
-                if (_state.WakeSignal.IsCompleted || _completionToken.IsCancellationRequested)
-                {
-                    _state.WakeSignal.ReleaseWakeLock();
-                    return false;
-                }
-
-                // OnCompleted releases the lock after storing the continuation. Signal re-acquires
-                // to claim and dispatch it.
-                await _state.WakeSignal.WaitUnsynchronized();
-            }
-        }
+        public ValueTask<bool> MoveNextAsync() => _state.MoveNextAsync();
 
         public ValueTask DisposeAsync()
         {
@@ -188,4 +199,3 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         }
     }
 }
-

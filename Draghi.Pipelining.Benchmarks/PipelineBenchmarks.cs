@@ -23,7 +23,11 @@ public class PipelineBenchmarks
     [GlobalSetup]
     public void Setup()
     {
-        _pipeline = Pipeline.Create<BareItem, BarePolicy>(new BarePolicy(RunAsync));
+        // RunAsync selects the source wake mode. With runContinuationsAsynchronously:false the
+        // Signal() in Execute() resumes the parked executor inline on the producer thread, so the
+        // whole enqueue->execute->complete round-trip runs synchronously (the ~60ns path). With
+        // true, the wake dispatches to the scheduler (a thread-pool hop per item, ~2us).
+        _pipeline = Pipeline.Create<BareItem, BarePolicy>(new BarePolicy(), runContinuationsAsynchronously: RunAsync);
         _item = new BareItem();
     }
 
@@ -40,6 +44,39 @@ public class PipelineBenchmarks
         item.Reset();
         _pipeline.Enqueue(item).Execute();
         item.Wait();
+    }
+
+    const int BurstSize = 100;
+    BareItem[] _burstItems = null!;
+
+    [GlobalSetup(Target = nameof(EnqueueBurst))]
+    public void SetupBurst()
+    {
+        Setup();
+        _burstItems = new BareItem[BurstSize];
+        for (var i = 0; i < _burstItems.Length; i++)
+            _burstItems[i] = new BareItem();
+    }
+
+    /// Backlogged per-item cost: all items are enqueued before a single wake, so the executor
+    /// drains the whole batch and every pull after the first finds an item already queued (the
+    /// sync MoveNextAsync path). EnqueueComplete by contrast parks the executor on every item,
+    /// so it never exercises this path. Per-op numbers are per item via OperationsPerInvoke.
+    [Benchmark(OperationsPerInvoke = BurstSize)]
+    public void EnqueueBurst()
+    {
+        var items = _burstItems;
+        for (var i = 0; i < items.Length - 1; i++)
+        {
+            items[i].Reset();
+            _pipeline.Enqueue(items[i]);
+        }
+        var last = items[items.Length - 1];
+        last.Reset();
+        // Single wake drains the backlog. Items complete in order on the sync path, so waiting
+        // on the last is waiting on all.
+        _pipeline.Enqueue(last).Execute();
+        last.Wait();
     }
 }
 
@@ -62,7 +99,7 @@ sealed class BareItem
 /// Minimal policy that immediately completes items during execution.
 /// No trailing work, no pipelining phase, just the fastest possible round-trip.
 /// </summary>
-struct BarePolicy(bool runEnqueueAsynchronously) : IPipelinePolicy<BareItem>
+struct BarePolicy : IPipelinePolicy<BareItem>
 {
     public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItem item, CancellationToken cancellationToken)
     {
@@ -81,10 +118,4 @@ struct BarePolicy(bool runEnqueueAsynchronously) : IPipelinePolicy<BareItem>
         recoveryItem = null;
         return false;
     }
-
-    public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => ValueTask.CompletedTask;
-
-    public ValueTask YieldAfterFirstItem() => default;
-
-    public bool RunEnqueueAsynchronously => runEnqueueAsynchronously;
 }

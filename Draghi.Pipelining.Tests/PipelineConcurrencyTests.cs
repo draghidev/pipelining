@@ -105,11 +105,11 @@ public class PipelineConcurrencyTests
     /// EnqueueWaiter path (callback registered, advancer drains). Verifies every item completes
     /// regardless of which path it took.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task MixedSyncAsyncPipelineTasks_AllItemsComplete()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         // Alternating mix: even = sync (CompleteAsync=false), odd = async (CompleteAsync=true).
         const int count = 10;
@@ -145,14 +145,14 @@ public class PipelineConcurrencyTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task PipelinedCompletionOrder()
     {
         // Wait for executor to park before completing tasks so all items are in _waiters with
         // callbacks registered. Otherwise items still at _tailWaiter get completed via the
         // executor's CommitTailWaiter sync-success path, breaking the FIFO completion order.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
         var completionOrder = new List<int>();
         var orderLock = new object();
 
@@ -346,15 +346,12 @@ public class PipelineConcurrencyTests
             => item.Complete(exception);
 
         public bool RunEnqueueAsynchronously => true;
-
-        public ValueTask YieldAfterFirstItem() => default;
     }
 
     /// Stresses the advancer's drain loop by completing many waiter pipeline tasks from
     /// parallel threads simultaneously. Exercises the do-while re-acquire at the end of
     /// DrainReadyWaiters and the count-decrement-then-_hasExecutingItem-check ordering.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task ConcurrentWaiterCompletions()
     {
         // Wait for executor to park (all items committed to _waiters via pre-idle commit) before
@@ -362,7 +359,8 @@ public class PipelineConcurrencyTests
         // fires, and executor's CommitTailWaiter handles them via sync-success branch instead of the
         // advancer path - mixed routing that pulls the test away from what it's supposed to exercise.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
         const int count = 200;
 
         var items = new TestPipelineItem[count];
@@ -639,19 +637,19 @@ public class PipelineConcurrencyTests
     /// state. Stress test - won't deterministically hit every interleaving but catches
     /// regressions under load.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task ThreeWayRace_ProducerExecutorRecoveryContinuations()
     {
-        // Recovery factory only handles PipelineTaskWaiter (advancer path). Sync on
-        // OnExecutionIdleAsync so all items are committed to _waiters with callbacks registered
-        // before we fault, otherwise the trailing filler at _tailWaiter could take the executor's
+        // Recovery factory only handles PipelineTaskWaiter (advancer path). Sync on the source
+        // onIdle hook so all items are committed to _waiters with callbacks registered before we
+        // fault, otherwise the trailing filler at _tailWaiter could take the executor's
         // CommitTailWaiter path and skew the routing this test wants to stress.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter
-                ? new TestPipelineItem()
-                : null,
-            idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true,
+                ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter
+                    ? new TestPipelineItem()
+                    : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         const int iterations = 50;
         var faultingItems = new TestPipelineItem[iterations];
@@ -719,8 +717,6 @@ public class PipelineConcurrencyTests
 
         public bool RunEnqueueAsynchronously => false;
 
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-        public ValueTask YieldAfterFirstItem() => default;
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
             recoveryItem = null;
@@ -774,19 +770,18 @@ public class PipelineConcurrencyTests
     /// waits on the advancer-idle TCS, which the recovery continuation signals when it releases
     /// _advancing via BailoutRecoveryOnShutdown (or via AdvanceAndDrainRecovery's loop exit).
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task CompleteAsync_DuringActiveRecovery_DrainsCleanly()
     {
         var recovery = new TestPipelineItem { ExecuteAsync = true };
         // We deliberately only handle the advancer's PipelineTaskWaiter kind. The test must avoid
         // the racy executor-side trailing-recovery path (RecoverCommittedTailWaiterAsync), which
-        // fires kind=PipelineTask when CommitTailWaiter sees a pre-faulted tail task. Sync on
-        // OnExecutionIdleAsync via idleTcs to guarantee the executor has done its pre-idle commit
-        // (faulting moved to _waiters with callback registered) before we fault the task.
+        // fires kind=PipelineTask when CommitTailWaiter sees a pre-faulted tail task. Sync on the
+        // source onIdle hook to guarantee the executor has done its pre-idle commit (faulting moved
+        // to _waiters with callback registered) before we fault the task.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
-            idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         // Waiter item with a pipeline task that will fault, triggering recovery.
         var faulting = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
@@ -1063,19 +1058,35 @@ public class PipelineConcurrencyTests
     /// suspension. Test gates the executor inside OnExecutionIdleAsync so GC happens at the
     /// exact suspension point where pre-idle clears must have taken effect.
     [TestMethod]
-    [Ignore("Uses OnExecutionIdleAsync gate (hook removed); restore via custom IPipelineSource later.")]
     public async Task ExecuteQueue_PreIdleClearsLocals_ItemNotRetainedAcrossIdle()
     {
         var idleEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var idleCanReturn = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         WeakReference? itemRef = null;
 
-        var pipeline = Pipeline.Create<TestPipelineItem, IdleGatedPolicy>(
-            new(idleEntered, idleCanReturn.Task));
+        // The source onIdle hook gates the executor at the park: it signals idleEntered, then blocks
+        // on idleCanReturn before letting MoveNextAsync park. GC is forced while the executor is held
+        // at the suspension point, so the assertion observes whether the last-processed item is still
+        // rooted by the executor's state-machine box across idle.
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true),
+            onIdle: async _ =>
+            {
+                idleEntered.TrySetResult();
+                await idleCanReturn.Task.ConfigureAwait(false);
+            });
 
         PushAndDrop(pipeline, ref itemRef);
 
         await idleEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // idleEntered is signaled at the TOP of onIdle, BEFORE its `await idleCanReturn` actually
+        // suspends the executor. GCing immediately races the executor thread's still-live stack
+        // (registers/spill slots transiently rooting the just-processed item before they spill to
+        // the heap state-machine box on suspension), yielding a false "alive". Let it suspend first,
+        // same as the sibling Idle_* leak tests. After suspension the item is genuinely unreachable
+        // (verified via gcroot: 0 roots), so a real retention regression here still fails the assert.
+        await Task.Delay(50);
 
         for (var i = 0; i < 3; i++)
         {
@@ -1092,106 +1103,11 @@ public class PipelineConcurrencyTests
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    static void PushAndDrop(QueuedPipeline<TestPipelineItem, IdleGatedPolicy> pipeline, ref WeakReference? itemRef)
+    static void PushAndDrop(ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline, ref WeakReference? itemRef)
     {
         var item = new TestPipelineItem();
         itemRef = new WeakReference(item);
         pipeline.Enqueue(item).Execute();
-    }
-
-    /// Demonstrates the post-lock advancer race in RecoverTrailingFailure when the executor
-    /// inline-activates recovery (recoveryActivated=true) and leaves _executingItem=recovery,
-    /// _hasExecutingItem=true after the lock. Construction:
-    ///
-    ///  1. Items X, Y enqueued together. X has pending pipeline + PipelineTaskException.
-    ///     Y has pending pipeline + TrailingTaskException.
-    ///  2. Executor processes X (activated path, count==0), stores X as _tailWaiter with
-    ///     X.pipelineTask still pending, then hits YieldAfterFirstItem which suspends on a
-    ///     test-controlled TCS gate.
-    ///  3. Test faults X.pipelineTask while the executor is parked.
-    ///  4. Test releases the yield gate. Executor resumes, dequeues Y. CommitTailWaiter for X
-    ///     now sees X.pipelineTask faulted, dispatches RecoverCommittedTailWaiter(X). recoveryX
-    ///     (ExecuteAsync=true) gets activated, hooks executeTask continuation, returns.
-    ///  5. Y is processed activated path (count==0, recoveryX not yet a waiter), suspends at
-    ///     trailing await.
-    ///  6. Test faults Y.trailing. Executor resumes, enters RecoverTrailingFailure(Y).
-    ///     Since _hasExecutingItem=false, recoveryActivated=true. Lock block activates recoveryY
-    ///     and releases the lock, leaving _executingItem=recoveryY, _hasExecutingItem=true.
-    ///     Executor suspends in await ExecuteItemAsync(recoveryY).
-    ///  7. Test fires recoveryX.executeTask. Its continuation runs, hits
-    ///     RecoverCommittedTailWaiterPipelineTask which EnqueueWaiters recoveryX (pipeline still
-    ///     pending). count goes 0 → 1.
-    ///  8. Test fires recoveryX.pipelineTask. Hooked OnWaiterTaskCompleted fires, becomes
-    ///     advancer, DrainReadyWaiters drains recoveryX, count 1 → 0, hits the count==0 claim
-    ///     path, Exchange(_hasExecutingItem, false) returns true (was set by RecoverTrailingFailure),
-    ///     reads _executingItem=recoveryY, calls ActivateHeadItem(recoveryY). SECOND activation.
-    [TestMethod]
-    [Ignore("Uses YieldAfterFirstItem hook (removed from IPipelinePolicy); restore via custom IPipelineSource later.")]
-    public async Task RecoverTrailingFailure_PostLockAdvancerRace_DoubleActivates()
-    {
-        var activations = new System.Collections.Concurrent.ConcurrentDictionary<TestPipelineItem, int>();
-        var recoveryX = new TestPipelineItem { CompleteAsync = true, ExecuteAsync = true };
-        var recoveryY = new TestPipelineItem { CompleteAsync = true, ExecuteAsync = true };
-        var yieldGate = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-
-        var pipeline = Pipeline.Create<TestPipelineItem, YieldGatePolicy>(
-            new YieldGatePolicy(activations, ctx => ctx.Kind switch
-            {
-                PipelineItemFailureKind.PipelineTask => recoveryX,
-                PipelineItemFailureKind.TrailingExecutionTask => recoveryY,
-                _ => null,
-            }, yieldGate));
-
-        var x = new TestPipelineItem
-        {
-            CompleteAsync = true,
-            PipelineTaskException = new InvalidOperationException("x"),
-        };
-        var y = new TestPipelineItem
-        {
-            CompleteAsync = true,
-            TrailingTaskException = new InvalidOperationException("y"),
-        };
-
-        pipeline.Enqueue(x).Execute();
-        pipeline.Enqueue(y).Execute();
-
-        // X is processed. Executor parks in YieldAfterFirstItem.
-        await x.WaitForExecutedAsync();
-        await Task.Delay(50);
-
-        // Fault X.pipeline and pre-fire recoveryX.executeTask so when the executor handles X's
-        // tail-recovery (via the inline RecoverCommittedTailWaiterAsync), recoveryX's ExecuteItemAsync
-        // returns sync-complete and the executor EnqueueWaiters recoveryX with pending pipeline,
-        // landing it in _waiters before processing Y.
-        x.CompletePipelineTask();
-        recoveryX.CompleteExecuteTask();
-        yieldGate.SetResult();
-
-        // Executor processes X's recovery inline, recoveryX lands in _waiters, then dequeues Y
-        // in deferred path. Y parks in trailing await.
-        await y.WaitForExecutedAsync();
-        await Task.Delay(50);
-
-        // Fault Y.trailing, RecoverTrailingFailure runs with recoveryActivated=true and parks
-        // in await ExecuteItemAsync(recoveryY).
-        y.CompleteTrailingTask();
-        await recoveryY.WaitForExecutedAsync();
-
-        // Fire recoveryX.pipeline → OnWaiterTaskCompleted → advancer → count==0 claim path →
-        // ActivateHeadItem(recoveryY) for the second time (the post-lock advancer race).
-        recoveryX.CompletePipelineTask();
-        await Task.Delay(100);
-
-        // Drive recoveryY to completion so CompleteAsync drains cleanly.
-        recoveryY.CompleteExecuteTask();
-        recoveryY.CompletePipelineTask();
-        await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
-
-        activations.TryGetValue(recoveryY, out var recoveryYCount);
-        activations.TryGetValue(recoveryX, out var recoveryXCount);
-        Assert.IsTrue(recoveryXCount == 1, $"recoveryX should activate once, got {recoveryXCount}. (sanity check)");
-        Assert.IsTrue(recoveryYCount <= 1, $"recoveryY activated {recoveryYCount} times; post-lock double-activation race.");
     }
 
     /// Regression guard for the _tailWaiter slot clear in CommitTailWaiter (Pipeline.cs:508-509).
@@ -1200,11 +1116,11 @@ public class PipelineConcurrencyTests
     /// the pipeline should pin the item. Without the line 508 `_tailWaiter = default!` clear, the
     /// completed item stays GC-rooted for the entire idle period.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task Idle_TailWaiterSlotDoesNotLeakCompletedItem()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         WeakReference? itemRef = null;
         Action? completer = null;
@@ -1230,7 +1146,7 @@ public class PipelineConcurrencyTests
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    static void EnqueueTailWaiterItem(QueuedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline, ref WeakReference? itemRef, ref Action? completer)
+    static void EnqueueTailWaiterItem(ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline, ref WeakReference? itemRef, ref Action? completer)
     {
         var item = new TestPipelineItem { CompleteAsync = true };
         itemRef = new WeakReference(item);
@@ -1244,11 +1160,11 @@ public class PipelineConcurrencyTests
     /// must Exchange _hasExecutingItem=false AND clear _executingItem when the executor wins the race.
     /// Without the clear, the completed item stays GC-rooted for the entire idle period.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task Idle_ExecutingItemSlotDoesNotLeakDeferredItem()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         WeakReference? waiterRef = null;
         WeakReference? deferredRef = null;
@@ -1279,7 +1195,7 @@ public class PipelineConcurrencyTests
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     static void EnqueueDeferredScenario(
-        QueuedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline,
+        ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline,
         ref WeakReference? waiterRef,
         ref WeakReference? deferredRef,
         ref Action? waiterCompleter)
@@ -1301,16 +1217,15 @@ public class PipelineConcurrencyTests
     /// BailoutRecoveryOnShutdown. Without that branch the recovery would be stranded with the
     /// advancer flag still held.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task WaiterRecovery_AsyncTrailingDuringShutdown_BailsOutCleanly()
     {
         // Recovery: sync execute (ExecuteAsync default = false), async trailing (HasTrailingTask),
         // pending pipeline task. Enters RecoverWaiterResult's async-trailing branch.
         var recovery = new TestPipelineItem { HasTrailingTask = true, CompleteAsync = true };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
-            idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         var item = new TestPipelineItem
         {
@@ -1344,26 +1259,26 @@ public class PipelineConcurrencyTests
     /// `_waiterRecoveryItem` pointing at the now-completed item. For long-lived pipelines doing
     /// rare recoveries this is one stale strong reference, observable via WeakReference after GC.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task RecoverWaiter_ClearsWaiterRecoveryItemReferenceAfterSuccess()
     {
         WeakReference? recoveryRef = null;
         TestPipelineItem? heldRecovery = null;
 
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx =>
-            {
-                if (ctx.Kind == PipelineItemFailureKind.PipelineTaskWaiter)
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true,
+                ctx =>
                 {
-                    var r = new TestPipelineItem { ExecuteAsync = true };
-                    recoveryRef = new WeakReference(r);
-                    heldRecovery = r;
-                    return r;
-                }
-                return null;
-            },
-            idleTcs));
+                    if (ctx.Kind == PipelineItemFailureKind.PipelineTaskWaiter)
+                    {
+                        var r = new TestPipelineItem { ExecuteAsync = true };
+                        recoveryRef = new WeakReference(r);
+                        heldRecovery = r;
+                        return r;
+                    }
+                    return null;
+                }),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         var item = new TestPipelineItem
         {
@@ -1427,86 +1342,5 @@ public class PipelineConcurrencyTests
         }
 
         public bool RunEnqueueAsynchronously => true;
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-        public ValueTask YieldAfterFirstItem() => default;
-    }
-
-    struct IdleGatedPolicy : IPipelinePolicy<TestPipelineItem>
-    {
-        readonly TaskCompletionSource _idleEntered;
-        readonly Task _idleCanReturn;
-
-        public IdleGatedPolicy(TaskCompletionSource idleEntered, Task idleCanReturn)
-        {
-            _idleEntered = idleEntered;
-            _idleCanReturn = idleCanReturn;
-        }
-
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
-        {
-            var task = item.GetExecuteTask();
-            item.SignalExecuted();
-            return task;
-        }
-
-        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
-            => item.Complete(exception);
-
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-        {
-            _idleEntered.TrySetResult();
-            return new(_idleCanReturn);
-        }
-
-        public bool RunEnqueueAsynchronously => true;
-
-        public ValueTask YieldAfterFirstItem() => default;
-    }
-
-    struct YieldGatePolicy : IPipelinePolicy<TestPipelineItem>
-    {
-        readonly System.Collections.Concurrent.ConcurrentDictionary<TestPipelineItem, int> _activations;
-        readonly Func<PipelineItemFailureContext, TestPipelineItem?>? _recoveryFactory;
-        readonly TaskCompletionSource _yieldGate;
-
-        public YieldGatePolicy(
-            System.Collections.Concurrent.ConcurrentDictionary<TestPipelineItem, int> activations,
-            Func<PipelineItemFailureContext, TestPipelineItem?>? recoveryFactory,
-            TaskCompletionSource yieldGate)
-        {
-            _activations = activations;
-            _recoveryFactory = recoveryFactory;
-            _yieldGate = yieldGate;
-        }
-
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
-        {
-            if (item.ThrowOnExecute is { } ex)
-                throw ex;
-            var task = item.GetExecuteTask();
-            item.SignalExecuted();
-            return task;
-        }
-
-        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true)
-        {
-            _activations.AddOrUpdate(item, 1, (_, c) => c + 1);
-            item.Activate();
-        }
-
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
-            => item.Complete(exception);
-
-        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
-        {
-            recoveryItem = _recoveryFactory?.Invoke(context);
-            return recoveryItem is not null;
-        }
-
-        public bool RunEnqueueAsynchronously => true;
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-        public ValueTask YieldAfterFirstItem() => new(_yieldGate.Task);
     }
 }

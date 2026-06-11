@@ -75,10 +75,6 @@ public interface IPipelinePolicy<T>
         recoveryItem = default;
         return false;
     }
-
-    /// The scheduler used for the execution loop.
-    /// When null, falls back to ThreadPool.
-    PipelineScheduler? ExecutionScheduler => null;
 }
 
 /// <summary>

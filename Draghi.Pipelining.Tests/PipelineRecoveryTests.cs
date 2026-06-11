@@ -114,14 +114,13 @@ public class PipelineRecoveryTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task WaiterPipelineTaskFaults_RecoveryOnAdvancer()
     {
         var recovery = new TestPipelineItem();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
-            idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         // Item has a pending pipeline task that will fault later.
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
@@ -139,7 +138,6 @@ public class PipelineRecoveryTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task TrailingTaskFailure_RecoveryTakesOver()
     {
         var recovery = new TestPipelineItem();
@@ -161,7 +159,6 @@ public class PipelineRecoveryTests
     }
 
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task CommittedTailFaults_RecoveryOnExecutor()
     {
         // The committed tail recovery path (PipelineTask kind in CommitTailWaiter) requires the
@@ -170,9 +167,9 @@ public class PipelineRecoveryTests
         // of which path handles it (PipelineTask or PipelineTaskWaiter).
         var recovery = new TestPipelineItem();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask or PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
-            idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask or PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         var first = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("tail fault") };
         pipeline.Enqueue(first).Execute();
@@ -399,16 +396,15 @@ public class PipelineRecoveryTests
     /// and never released _advancing, deadlocking CompleteAsync. The bailout now mirrors the
     /// executeTask continuation pattern (lock + complete-if-needed + release _advancing).
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task RecoverWaiterPipelineTask_PendingDuringCompleteAsync_DoesNotDeadlock()
     {
         // Recovery: sync execute, pipeline task pending. Triggers the RecoverWaiterPipelineTask
         // continuation-hooked path that holds _advancing.
         var recovery = new TestPipelineItem { CompleteAsync = true };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
-            idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         // Original: async pipeline that will fault, drives the advancer into RecoverWaiter.
         var item = new TestPipelineItem
@@ -521,8 +517,6 @@ public class PipelineRecoveryTests
         }
 
         public bool RunEnqueueAsynchronously => true;
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-        public ValueTask YieldAfterFirstItem() => default;
     }
 
     /// Executor inline path: ExecuteItemAsync returns a sync-faulted PipelineTask. Pins the
@@ -604,15 +598,14 @@ public class PipelineRecoveryTests
     /// RecoverWaiter's recovery-execute sync-throw catch (lines 799-807). Advancer-side variant
     /// of TrailingFailure_RecoveryExecuteThrows.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task WaiterRecovery_RecoveryExecuteSyncThrows_RecoveryCompletedWithException()
     {
         var recoveryEx = new ApplicationException("recovery execute fail");
         var recovery = new TestPipelineItem { ThrowOnExecute = recoveryEx };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null,
-            idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         var item = new TestPipelineItem
         {

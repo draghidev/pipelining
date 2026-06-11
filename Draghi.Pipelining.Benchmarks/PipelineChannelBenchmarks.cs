@@ -40,9 +40,13 @@ sealed class PipelineChannel<T>
     ManualResetValueTaskSourceCore<bool> _readerSignal;
     bool _readerWaiting;
 
-    public PipelineChannel(bool runEnqueueAsynchronously = false)
+    public PipelineChannel(bool runContinuationsAsynchronously = false)
     {
-        _pipeline = Pipeline.Create<T, Policy>(new Policy(this, runEnqueueAsynchronously));
+        // runContinuationsAsynchronously:false resumes the parked executor inline on the Write()
+        // caller's thread, so the item is completed (and lands in the ready slot) before Write
+        // returns. That is what lets the WriteReadSync benchmark observe a synchronous ReadAsync.
+        // With true the wake hops the scheduler and Write returns before completion.
+        _pipeline = Pipeline.Create<T, Policy>(new Policy(this), runContinuationsAsynchronously: runContinuationsAsynchronously);
     }
 
     public void Write(T item)
@@ -110,7 +114,7 @@ sealed class PipelineChannel<T>
             => channel._readerSignal.OnCompleted(continuation, state, token, flags);
     }
 
-    struct Policy(PipelineChannel<T> channel, bool runEnqueueAsynchronously) : IPipelinePolicy<T>
+    struct Policy(PipelineChannel<T> channel) : IPipelinePolicy<T>
     {
         public ValueTask<PipelineItemResult> ExecuteItemAsync(T item, CancellationToken cancellationToken)
             => new(new PipelineItemResult(ValueTask.CompletedTask));
@@ -120,12 +124,8 @@ sealed class PipelineChannel<T>
         public void CompleteItem(T item, int remainingDepth, Exception? exception)
             => channel.OnItemCompleted(item);
 
-        public bool RunEnqueueAsynchronously => runEnqueueAsynchronously;
-
         // Override IPipelinePolicy DIM methods explicitly. DIM dispatch through an interface
         // call on a struct boxes the struct on every call. Explicit overrides avoid the box.
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-        public ValueTask YieldAfterFirstItem() => default;
         public bool TryRecoverItemFailure(PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out T? recoveryItem)
         {
             recoveryItem = default;

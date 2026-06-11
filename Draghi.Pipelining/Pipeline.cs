@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
 using Draghi.Pipelining.Internal;
 
 namespace Draghi.Pipelining;
@@ -160,8 +161,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// <param name="exception">
     /// Optional exception delivered to any items still in flight when shutdown drains them
     /// (via <see cref="IPipelinePolicy{T}.CompleteItem"/>'s exception parameter). Note: this exception is
-    /// not propagated through the returned task. It only flows to items. Exceptions thrown by
-    /// <see cref="IPipelinePolicy{T}.OnExecutionIdleAsync"/> during shutdown DO fault the returned task.
+    /// not propagated through the returned task. It only flows to items.
     /// </param>
     /// <remarks>
     /// Awaiting the returned task gives "fully quiet" semantics: all items are completed, the executor
@@ -215,9 +215,47 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 // returns a Task to await.
                 var commitWork = CommitTailWaiter();
                 if (commitWork is not null)
+                {
+                    // Cold suspension (trailing recovery): clear the per-item locals first, same
+                    // retention rationale as the park-path clear below.
+                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                        item = default!;
+                    itemResult = default;
                     await commitWork.ConfigureAwait(false);
+                }
 
-                if (!await _enumerator.MoveNextAsync().ConfigureAwait(false))
+                // The source doubles as the wake signal, so this is an await per item. When items
+                // are backlogged (a pull finds one already queued) MoveNextAsync completes
+                // synchronously - unwrap that result by hand rather than paying the
+                // ConfiguredValueTaskAwaitable + awaiter + state-machine dance the compiler emits
+                // even for an already-completed ValueTask. The real await still runs (with
+                // ConfigureAwait(false)) when MoveNextAsync genuinely parks on the wake.
+                // NOTE: this exact shape is measured. The seemingly-leaner single plain await
+                // benched +8.6ns on the park shape, and the ternary form +4ns - if/else with the
+                // clears in the else is the empirical winner (96.6 / 92.2 / 88.0ns); see the
+                // pipeline benchmark history before restructuring.
+                var moveNext = _enumerator.MoveNextAsync();
+                bool hasNext;
+                if (moveNext.IsCompletedSuccessfully)
+                {
+                    hasNext = moveNext.Result;
+                }
+                else
+                {
+                    // Genuine park. item/itemResult are hoisted into the executor's state-machine
+                    // box (they live across the in-iteration awaits), so without this clear the box
+                    // keeps the last-processed item and its tasks GC-rooted across the whole idle
+                    // period (the post-loop clear only runs on termination). Clearing only on the
+                    // suspend branches keeps the backlogged loop free of these dead stores; the box
+                    // spill happens at the await, so clearing after the sync-completion check is
+                    // sufficient. Both are reassigned below before any use, and the recovery
+                    // `continue` paths route back through here too.
+                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                        item = default!;
+                    itemResult = default;
+                    hasNext = await moveNext.ConfigureAwait(false);
+                }
+                if (!hasNext)
                     break;
 
                 item = _enumerator.Current;
@@ -1691,137 +1729,146 @@ public static class Pipeline
     public static QueuedPipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy, bool runContinuationsAsynchronously = true, PipelineScheduler? scheduler = null, CancellationToken cancellationToken = default)
         where TPolicy : IPipelinePolicy<T>
     {
-        var source = UnboundedQueueSource<T>.Create(runContinuationsAsynchronously, scheduler ?? policy.ExecutionScheduler, cancellationToken);
+        var source = UnboundedQueueSource<T>.Create(runContinuationsAsynchronously, scheduler, cancellationToken);
         var pipeline = new Pipeline<T, TPolicy, UnboundedQueueSource<T>, UnboundedQueueSource<T>.Enumerator>(policy, source);
         return new QueuedPipeline<T, TPolicy>(pipeline, source);
     }
 
-    /// <summary>
-    /// Packed state word coordinating pipeline depth and the drain-waiter (WaitForIdleAsync) protocol.
-    /// Layout:
-    ///   bits 0-31 : depth (int), total of queued + waiting items
-    ///   bit  32   : DrainBit, set when a drain waiter is registered in <see cref="_drainTcs"/>
-    ///   bits 33-63: reserved for future flags
-    /// </summary>
-    /// <remarks>
-    /// Depth changes use <see cref="Interlocked.Increment(ref int)"/> and <see cref="Interlocked.Decrement(ref int)"/>
-    /// on the first 32 bits via <see cref="Unsafe.As{TFrom, TTo}(ref TFrom)"/> (endianness-aware).
-    /// This keeps the hot path (every Enqueue and CompleteWaiter) at native 32-bit Interlocked cost
-    /// while the drain side can CAS the full word atomically.
-    /// <para>
-    /// Order on the consumer is <em>clear-bit-before-Exchange-TCS</em>. A publisher racing in after
-    /// the clear will re-run its publish path and either reuse the still-present <see cref="_drainTcs"/>
-    /// (we care about idle state convergence, not exactly-once semantics, TrySetResult handles the at most once publication).
-    /// </para>
-    /// </remarks>
+    /// Split-counter depth + drain-waiter (WaitForEmptyAsync) protocol. Depth is the difference of two
+    /// monotonic totals rather than one shared word:
+    ///   _enqueued - producer-owned. The SPSC contract serializes enqueues, so the increment is a plain
+    ///     read + Volatile.Write (release), no RMW, on its own padded cache line (no producer/completer
+    ///     line ping-pong).
+    ///   _completed - completer-side Interlocked.Increment. The RMW stays because executor-inline
+    ///     completions and advancer drains overlap, but the producer never touches this line.
+    /// Counters are uint, wrap-safe while live depth stays below 2^31 (guarded in IncrementDepth via a
+    /// producer-cached completed snapshot, so the guard adds no cross-line read per enqueue).
+    ///
+    /// Zero-crossing (drain): completers bump _completed (full-fence RMW), compute depth against their
+    /// own bump, and on zero check the _drainTcs slot (the load cannot hoist above the RMW) and
+    /// Exchange-take + fire. The armer publishes the TCS with a CAS - the publish IS the arm, and the
+    /// full-fence RMW orders the subsequent depth re-check (a release publish would let the re-check's
+    /// loads reorder above it on x64, a lost wake).
+    ///
+    /// Firing on a momentary zero while a producer races a new item in is the documented
+    /// WaitForEmptyAsync semantics (idle convergence, not exactly-once). TrySetResult and the
+    /// Exchange-clear keep completer/armer races idempotent, and at most one armed cycle is outstanding
+    /// (single-caller API), so a clear+fire always targets the cycle that armed it. The momentary-zero
+    /// license covers zeros at or after the arm: the armer's re-check fire qualifies by construction, a
+    /// completer's fire is deferred and revalidates depth first (see OnDepthReachedZero).
     internal struct DepthState
     {
-        ulong _value;
-        TaskCompletionSource? _drainTcs;
-
-        const ulong DrainBit = 1UL << 32;
-
-        /// Returns a ref to the low-32-bits half of <see cref="_value"/>, regardless of endianness.
-        /// On little-endian the low half sits at byte offset 0, on big-endian at offset 4.
-        /// Split as if/else (not ternary inside Add) so the JIT constant-folds
-        /// <see cref="BitConverter.IsLittleEndian"/> and elides the Add(0) on LE.
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        static ref int DepthRef(ref ulong value)
+        // Ref-free explicit-layout blob so the producer counter's isolation survives the
+        // runtime's auto layout of this ref-containing struct: wherever the blob lands,
+        // Value sits >= 128 bytes (one Apple Silicon line) from the fields on either side.
+        [StructLayout(LayoutKind.Explicit, Size = 256)]
+        struct PaddedProducerCounter
         {
-            if (BitConverter.IsLittleEndian)
-                return ref Unsafe.As<ulong, int>(ref value);
-            return ref Unsafe.Add(ref Unsafe.As<ulong, int>(ref value), 1);
+            [FieldOffset(128)] public uint Value;
+            // Producer-owned stale snapshot of _completed for the overflow guard. Same line as
+            // Value on purpose: only the producer reads/writes it.
+            [FieldOffset(132)] public uint CompletedCache;
         }
 
-        /// <summary>Current depth. Lock-free, <see cref="Volatile.Read(ref readonly int)"/> semantics.</summary>
+        PaddedProducerCounter _enqueued;
+        uint _completed;
+        // The slot doubles as the arm signal: non-null means a drain waiter is armed. The
+        // publish CAS is the full-fence RMW the Dekker pair needs, so no separate flag word.
+        TaskCompletionSource? _drainTcs;
+
+        /// <summary>Current depth. Lock-free.</summary>
         public int Depth
         {
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
-            get => Volatile.Read(ref DepthRef(ref _value));
+            get
+            {
+                // Read completed BEFORE enqueued: every completion's enqueue-side increment is
+                // visible before the completion publishes (dequeue / waiter-store acquire
+                // chains), so this order can never observe comp > enq (negative depth).
+                var comp = Volatile.Read(ref _completed);
+                var enq = Volatile.Read(ref _enqueued.Value);
+                return (int)(enq - comp);
+            }
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void IncrementDepth()
         {
-            // Single-producer pre-check, race-safe: only the producer increments, decrements
-            // only lower the value. Observing MaxValue means a further Increment would wrap to
-            // MinValue and silently break the drain protocol (negative depth never reaches 0).
-            // Hitting this implies an unbounded producer. The queue's GC heap would exhaust
-            // long before this in any realistic workload.
-            if (Depth == int.MaxValue)
-                ThrowOverflow();
-            Interlocked.Increment(ref DepthRef(ref _value));
+            // Producer-owned plain read; release store publishes before the source's queue write
+            // (Enqueue calls this hook first), so a consumer that sees the item sees the count.
+            var next = _enqueued.Value + 1;
+            // Wrap guard against the producer-local stale snapshot: apparent live depth past
+            // int.MaxValue forces a snapshot refresh (the only time the producer touches the
+            // completer's line) and throws if the depth is genuinely at the limit.
+            if (next - _enqueued.CompletedCache > (uint)int.MaxValue)
+                RefreshCacheOrThrow(next);
+            Volatile.Write(ref _enqueued.Value, next);
         }
 
-        [DoesNotReturn]
-        static void ThrowOverflow() => throw new InvalidOperationException("Pipeline depth overflow.");
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void RefreshCacheOrThrow(uint next)
+        {
+            var comp = Volatile.Read(ref _completed);
+            if (next - comp > (uint)int.MaxValue)
+                throw new InvalidOperationException("Pipeline depth overflow.");
+            _enqueued.CompletedCache = comp;
+        }
 
-        /// <summary>Decrements depth. Returns the new value. Caller MUST invoke
+        /// <summary>Records a completion. Returns the new depth. Caller MUST invoke
         /// <see cref="OnDepthReachedZero"/> when the result is 0 to signal any pending drain waiter.</summary>
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        public int DecrementDepth() => Interlocked.Decrement(ref DepthRef(ref _value));
+        public int DecrementDepth()
+        {
+            // Full-fence RMW; the enqueued read (and any subsequent _drainTcs read in
+            // OnDepthReachedZero) is ordered after it. Depth is computed against OUR bump:
+            // when completers race the final item, exactly the last bumper observes zero.
+            var comp = Interlocked.Increment(ref _completed);
+            var enq = Volatile.Read(ref _enqueued.Value);
+            return (int)(enq - comp);
+        }
 
         /// <summary>
-        /// Returns a task that completes when depth reaches 0. Lock-free publish + backstop.
-        /// Drain protocol:
+        /// Returns a task that completes when depth reaches 0 (momentarily; see remarks on the
+        /// containing type). Publish-arm-recheck; single-caller API.
         /// </summary>
-        /// <list type="bullet">
-        /// <item><see cref="GetIdleTask"/> short-circuits on depth==0. Otherwise it publishes
-        /// <see cref="_drainTcs"/> via <see cref="Interlocked.CompareExchange{T}(ref T, T, T)"/>
-        /// (concurrent publishers share), then CAS-loops to set <see cref="DrainBit"/>. Observing
-        /// depth==0 during the loop means a transition happened during publish, so it self-signals
-        /// and returns.</item>
-        /// <item><see cref="OnDepthReachedZero"/> CAS-loops to clear <see cref="DrainBit"/>. The clearer
-        /// takes <see cref="_drainTcs"/> via <see cref="Interlocked.Exchange{T}(ref T, T)"/> and signals it.</item>
-        /// </list>
         public ValueTask GetIdleTask(CancellationToken cancellationToken)
         {
             if (Depth is 0)
                 return ValueTask.CompletedTask;
 
             var newTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            // The publish IS the arm: the CAS is the full-fence RMW, so the re-check below is
+            // ordered after it. A completer that hit zero before observing the publish skipped
+            // its fire; the re-check catches that case and self-signals. TLA:
+            // DepthDrain.ArmPublish/ArmRecheckZero; the witness config (RecheckFix=FALSE) shows
+            // the lost wake when the re-check is removed.
             var tcs = Interlocked.CompareExchange(ref _drainTcs, newTcs, null) ?? newTcs;
-
-            while (true)
-            {
-                var state = Volatile.Read(ref _value);
-                if ((int)state is 0)
-                {
-                    // Depth reached 0 during our publish window. Self-signal and clear our
-                    // published slot so the next caller doesn't reuse the completed TCS.
-                    // OnDepthReachedZero won't clear it because DrainBit was never set on this path.
-                    // Plain write is safe, the API is single-caller.
-                    tcs.TrySetResult();
-                    _drainTcs = null;
-                    break;
-                }
-                if ((state & DrainBit) != 0)
-                    break; // already published by us or another publisher.
-                if (Interlocked.CompareExchange(ref _value, state | DrainBit, state) == state)
-                    break;
-            }
+            if (Depth is 0)
+                SignalDrainWaiter();
 
             return new(tcs.Task.WaitAsync(cancellationToken));
         }
 
         /// <summary>
-        /// Called by the consumer after <see cref="DecrementDepth"/> returns 0. Clears
-        /// <see cref="DrainBit"/> and signals the pending drain waiter, if any.
+        /// Called by a completer after <see cref="DecrementDepth"/> returns 0. Disarms and
+        /// signals the pending drain waiter, if any.
         /// </summary>
         public void OnDepthReachedZero()
         {
-            while (true)
-            {
-                var state = Volatile.Read(ref _value);
-                if ((state & DrainBit) == 0)
-                    return; // no waiter, or already consumed by a racing decrementer.
-                if (Interlocked.CompareExchange(ref _value, state & ~DrainBit, state) == state)
-                {
-                    var tcs = Interlocked.Exchange(ref _drainTcs, null);
-                    tcs?.TrySetResult();
-                    return;
-                }
-            }
+            // The caller's bump was a full fence, so this load is ordered after it; a publish
+            // that preceded the bump is visible here. A publish that FOLLOWS the bump may be
+            // missed - that side's re-check covers it (see GetIdleTask).
+            if (Volatile.Read(ref _drainTcs) is null)
+                return;
+            SignalDrainWaiter();
+        }
+
+        void SignalDrainWaiter()
+        {
+            // Exchange-take makes the disarm exactly-once per armed cycle; the winner fires.
+            // TrySetResult keeps the armer-vs-completer self-signal race idempotent.
+            var tcs = Interlocked.Exchange(ref _drainTcs, null);
+            tcs?.TrySetResult();
         }
     }
 }

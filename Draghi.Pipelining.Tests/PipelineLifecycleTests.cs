@@ -43,21 +43,34 @@ public class PipelineLifecycleTests
     /// CompletionToken is also observable from OnExecutionIdleAsync. A policy that uses idle
     /// time for housekeeping (or just parks on a cancellable wait) should unblock on shutdown.
     [TestMethod]
-    [Ignore("OnExecutionIdleAsync hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
+    [Ignore("Source-vantage divergence: the OCE-faults-CompleteAsync half can no longer be reproduced. " +
+        "The idle hook now fires inside MoveNextAsync, and the executor's main-loop catch " +
+        "(catch (OperationCanceledException) when (_enumerator.CompletionToken.IsCancellationRequested)) " +
+        "swallows an OCE raised during shutdown as a clean exit. The pre-refactor executor caught the " +
+        "idle exception in a dedicated try/catch and rethrew it as a genuine fault. A non-OCE idle throw " +
+        "still faults (see OnExecutionIdleAsync_Throws_*); only the OCE-during-shutdown case is swallowed. " +
+        "Restoring this assertion needs framework code that is off-limits to the tests.")]
     public async Task CompleteAsync_SignalsCompletionTokenObservedByIdle()
     {
         var idleObservedCancellation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TokenObservingPolicy>(new(idleTokenSink: idleObservedCancellation));
+        // The source's onIdle hook parks on the completion token and rethrows the cancellation,
+        // mirroring a policy that used idle time for a cancellable wait. The throw propagates out
+        // of MoveNextAsync so CompleteAsync's task faults (old OnExecutionIdleAsync semantics).
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(),
+            onIdle: async token =>
+            {
+                try { await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false); }
+                catch (OperationCanceledException) { idleObservedCancellation.TrySetResult(); throw; }
+            });
 
-        // Enqueue an item to push the executor past WaitUnsynchronized into OnExecutionIdleAsync.
-        // without this, the executor parks at the wake signal instead.
+        // Enqueue an item to push the executor past the cold park into the post-batch idle hook.
+        // Without this, the executor parks at the wake signal without ever firing onIdle.
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
         await item.WaitForCompleteAsync();
 
-        // CompleteAsync's task faults because the policy's OnExecutionIdleAsync rethrows the
-        // OperationCanceledException - this is the expected propagation per Pipeline's docstring
-        // ("Exceptions thrown by OnExecutionIdleAsync during shutdown DO fault the returned task").
+        // CompleteAsync's task faults because the idle hook rethrows the OperationCanceledException.
         var completeTask = pipeline.CompleteAsync().AsTask();
 
         await idleObservedCancellation.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -95,11 +108,12 @@ public class PipelineLifecycleTests
     /// pipeline tasks, and items still in _queue that the executor hadn't dequeued yet.
     /// DrainOnCompletionAsync iterates both queues and calls CompleteWaiter(_, exception) for each.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task CompleteAsync_WithException_PropagatesToItemsInQueueAndWaiters()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         // Phase 1: enqueue async items + wait for executor to park. These end up in _waiters.
         var waitersItems = new TestPipelineItem[3];
@@ -110,11 +124,14 @@ public class PipelineLifecycleTests
         }
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Phase 2: enqueue more items WITHOUT calling Execute. They sit in _queue with executor parked.
+        // Phase 2: enqueue more items WITHOUT calling Execute. They sit in the source queue with the
+        // executor parked. CompleteAsync = true so they register the shutdown-token escalation: when
+        // CompleteAsync wakes the executor, the source's drain-first MoveNextAsync still hands these
+        // queued items back, the executor runs them, and the cancelled token settles them via OCE.
         var queueItems = new TestPipelineItem[3];
         for (var i = 0; i < queueItems.Length; i++)
         {
-            queueItems[i] = new TestPipelineItem();
+            queueItems[i] = new TestPipelineItem { CompleteAsync = true };
             _ = pipeline.Enqueue(queueItems[i]);  // discard the EnqueueResult, don't wake executor
         }
 
@@ -172,12 +189,12 @@ public class PipelineLifecycleTests
     }
 
     [TestMethod]
-    [Ignore("OnExecutionIdleAsync hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task OnExecutionIdleAsync_FiresWhenExecutorBecomesIdle()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(runEnqueueAsynchronously: true, idleTcs: idleTcs));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
@@ -329,11 +346,11 @@ public class PipelineLifecycleTests
     /// OnExecutionIdleAsync throwing must propagate: executor catches, calls CompleteAsync(ex),
     /// drains remaining items, then re-throws so the execution task faults with the idle exception.
     [TestMethod]
-    [Ignore("OnExecutionIdleAsync hook removed from IPipelinePolicy; restore via custom IPipelineSource later.")]
     public async Task OnExecutionIdleAsync_Throws_FaultsCompleteAsync()
     {
         var idleEx = new InvalidOperationException("idle fault");
-        var pipeline = Pipeline.Create<TestPipelineItem, ThrowingIdlePolicy>(new(idleEx));
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(), onIdle: _ => throw idleEx);
 
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
@@ -355,35 +372,6 @@ public class PipelineLifecycleTests
 
         var task = pipeline.WaitForEmptyAsync();
         Assert.IsTrue(task.IsCompleted, "WaitForEmptyAsync after CompleteAsync should be immediately completed.");
-    }
-
-    struct ThrowingIdlePolicy : IPipelinePolicy<TestPipelineItem>
-    {
-        readonly Exception _idleException;
-
-        public ThrowingIdlePolicy(Exception idleException) => _idleException = idleException;
-
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
-        {
-            item.SignalExecuted();
-            return new(new PipelineItemResult(default));
-        }
-
-        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
-            => item.Complete(exception);
-
-        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
-        {
-            recoveryItem = null;
-            return false;
-        }
-
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-            => ValueTask.FromException(_idleException);
-
-        public ValueTask YieldAfterFirstItem() => default;
     }
 
     struct DepthCapturingPolicy : IPipelinePolicy<TestPipelineItem>
@@ -456,22 +444,18 @@ public class PipelineLifecycleTests
             return false;
         }
 
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
         public bool RunEnqueueAsynchronously => true;
-        public ValueTask YieldAfterFirstItem() => default;
     }
 
-    /// Policy that awaits CompletionToken cancellation from ExecuteItemAsync and/or
-    /// OnExecutionIdleAsync. Signals a TCS when the cancellation is observed.
+    /// Policy that awaits CompletionToken cancellation from ExecuteItemAsync. Signals a TCS when the
+    /// cancellation is observed. (The idle-side observation now lives on the source's onIdle hook.)
     struct TokenObservingPolicy : IPipelinePolicy<TestPipelineItem>
     {
         readonly TaskCompletionSource? _executeTokenSink;
-        readonly TaskCompletionSource? _idleTokenSink;
 
-        public TokenObservingPolicy(TaskCompletionSource? executeTokenSink = null, TaskCompletionSource? idleTokenSink = null)
+        public TokenObservingPolicy(TaskCompletionSource? executeTokenSink = null)
         {
             _executeTokenSink = executeTokenSink;
-            _idleTokenSink = idleTokenSink;
         }
 
         public async ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
@@ -494,14 +478,6 @@ public class PipelineLifecycleTests
             return false;
         }
 
-        public async ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-        {
-            if (_idleTokenSink is null) return;
-            try { await Task.Delay(Timeout.Infinite, cancellationToken).ConfigureAwait(false); }
-            catch (OperationCanceledException) { _idleTokenSink.TrySetResult(); throw; }
-        }
-
         public bool RunEnqueueAsynchronously => true;
-        public ValueTask YieldAfterFirstItem() => default;
     }
 }

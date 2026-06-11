@@ -302,11 +302,7 @@ public class ActivatedFlowReductionTests
             return false;
         }
 
-        public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken) => default;
-
         public bool RunEnqueueAsynchronously => true;
-
-        public ValueTask YieldAfterFirstItem() => default;
     }
 
     static async Task RunBatch(bool activateOnTp, int items, int batches, NullPolicy nullPolicy = NullPolicy.AlwaysNull, bool concurrentEnqueue = false)

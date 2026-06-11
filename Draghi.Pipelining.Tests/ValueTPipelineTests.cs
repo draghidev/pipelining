@@ -38,12 +38,13 @@ public class ValueTPipelineTests
     /// for value-T (no GC barrier on the ref write side). After executor parks, all items should
     /// be observable via the enumerator in enqueue order.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task ValueTypeT_EnumeratorYieldsAllItems()
     {
         var pool = new ValueItemPool();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<ValueItem, ValueItemPolicy>(new(pool, idleTcs));
+        var pipeline = ObservablePipeline.Create<ValueItem, ValueItemPolicy>(
+            new(pool),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         const int count = 6;
         var ids = new int[count];
@@ -97,8 +98,7 @@ public class ValueTPipelineTests
     public async Task LargeValueTypeT_EnumeratorTailWaiterCrossCycleTearing()
     {
         var pool = new ValueItemPool();
-        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<LargeValueItem, LargeValueItemPolicy>(new(pool, idleTcs));
+        var pipeline = Pipeline.Create<LargeValueItem, LargeValueItemPolicy>(new(pool));
 
         const int producerItems = 1000;
         var producerDone = false;
@@ -138,12 +138,13 @@ public class ValueTPipelineTests
     /// Value-type T with async pipeline tasks - exercises the deferred-publish + _tailWaiter
     /// path for value-T. Tests the publish-pair fence ordering under load.
     [TestMethod]
-    [Ignore("Uses idleTcs which fires from OnExecutionIdleAsync (hook removed); restore via custom IPipelineSource later.")]
     public async Task ValueTypeT_DeferredPublishAndDrain()
     {
         var pool = new ValueItemPool();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = Pipeline.Create<ValueItem, ValueItemPolicy>(new(pool, idleTcs));
+        var pipeline = ObservablePipeline.Create<ValueItem, ValueItemPolicy>(
+            new(pool),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
         const int count = 5;
         var ids = new int[count];
@@ -213,7 +214,7 @@ sealed class ValueItemPool
     public ValueItemState Get(int id) => _states[id];
 }
 
-readonly struct ValueItemPolicy(ValueItemPool pool, TaskCompletionSource? idleTcs = null) : IPipelinePolicy<ValueItem>
+readonly struct ValueItemPolicy(ValueItemPool pool) : IPipelinePolicy<ValueItem>
 {
     public ValueTask<PipelineItemResult> ExecuteItemAsync(ValueItem item, CancellationToken cancellationToken)
         => new(new PipelineItemResult(default, pool.Get(item.Id).GetPipelineTask()));
@@ -228,22 +229,14 @@ readonly struct ValueItemPolicy(ValueItemPool pool, TaskCompletionSource? idleTc
         return false;
     }
 
-    public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-    {
-        idleTcs?.TrySetResult();
-        return default;
-    }
-
     public bool RunEnqueueAsynchronously => true;
-
-    public ValueTask YieldAfterFirstItem() => default;
 }
 
 /// Large value-T (4 longs = 32 bytes, well beyond native word size). All four fields are set to
 /// the same value at construction. A torn read will observe them unequal.
 readonly record struct LargeValueItem(long A, long B, long C, long D);
 
-readonly struct LargeValueItemPolicy(ValueItemPool pool, TaskCompletionSource? idleTcs = null, Action<long, long, long, long>? onComplete = null) : IPipelinePolicy<LargeValueItem>
+readonly struct LargeValueItemPolicy(ValueItemPool pool, Action<long, long, long, long>? onComplete = null) : IPipelinePolicy<LargeValueItem>
 {
     public ValueTask<PipelineItemResult> ExecuteItemAsync(LargeValueItem item, CancellationToken cancellationToken)
         => new(new PipelineItemResult(default, default));
@@ -262,13 +255,5 @@ readonly struct LargeValueItemPolicy(ValueItemPool pool, TaskCompletionSource? i
         return false;
     }
 
-    public ValueTask OnExecutionIdleAsync(CancellationToken cancellationToken)
-    {
-        idleTcs?.TrySetResult();
-        return default;
-    }
-
     public bool RunEnqueueAsynchronously => true;
-
-    public ValueTask YieldAfterFirstItem() => default;
 }
