@@ -1110,26 +1110,20 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // executor observes the Exchange and acquires its fence-lock uncontested.
                     lock (_activationLock!)
                     {
-                        if (Interlocked.Exchange(ref _hasExecutingItem, false))
+                        // Count gates the Exchange: only CONSUME the publish when the queue is actually
+                        // drained (Count <= 0). A successor committing between our Decrement and here
+                        // leaves Count > 0, and the publish is the item we won the Exchange for, whose
+                        // own commit sees alreadyActivated and does not self-activate. LEAVE the publish
+                        // at Count > 0 so the executor's CommitTailWaiter Exchange reclaims and activates
+                        // it; consuming-then-clearing here would strand the activation (neither side
+                        // activates). The Exchange stays inside the lock so the executor's fence-acquire
+                        // blocks until ActivateHeadItem finishes. The skewed -1 is a C-path state too.
+                        if (_waiters.Count <= 0 && Interlocked.Exchange(ref _hasExecutingItem, false))
                         {
-                            // Re-check count under the lock. Executor iterations between our
-                            // Decrement and here can enqueue waiters and re-publish _executingItem.
-                            // The latest publish is no longer the head, so activating here would
-                            // double-activate (now via C-path, again via D-path). Skip when count > 0.
-                            // <= 0 like the outer test: the skewed -1 is a C-path state too.
-                            // Plain read: the Exchange above is a full fence (acquire on the read),
-                            // so this read sees the latest committed value without its own LDAR.
-                            if (_waiters.Count <= 0)
-                            {
-                                var executing = _executingItem;
-                                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                                    _executingItem = default!;
-                                ActivateHeadItem(executing, preferAsync: true);
-                            }
-                            else if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                            {
+                            var executing = _executingItem;
+                            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                                 _executingItem = default!;
-                            }
+                            ActivateHeadItem(executing, preferAsync: true);
                         }
                     }
                 }
@@ -1489,21 +1483,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // Advancer chain reachability implies _activationLock is non-null.
             lock (_activationLock!)
             {
-                if (Interlocked.Exchange(ref _hasExecutingItem, false))
+                // Count gates the Exchange - LEAVE the publish at Count > 0 for the executor's commit
+                // to reclaim and activate, never consume-and-clear it (see DrainReadyWaiters' C-path).
+                if (_waiters.Count <= 0 && Interlocked.Exchange(ref _hasExecutingItem, false))
                 {
-                    // Re-check count under the lock (see DrainReadyWaiters count==0 branch).
-                    // Plain read: the Exchange above provides the acquire fence.
-                    if (_waiters.Count <= 0)
-                    {
-                        var executing = _executingItem;
-                        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                            _executingItem = default!;
-                        ActivateHeadItem(executing);
-                    }
-                    else if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                    {
+                    var executing = _executingItem;
+                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                         _executingItem = default!;
-                    }
+                    ActivateHeadItem(executing);
                 }
             }
         }

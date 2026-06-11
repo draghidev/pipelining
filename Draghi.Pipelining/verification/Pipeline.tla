@@ -257,6 +257,38 @@ CONSTANTS
                              \* Meaningful only under SplitSlotFieldOps. TRUE = the fix
                              \* (Contract); FALSE = shipped two-phase ops
                              \* (Pipeline_SlotTearWitness.cfg pins the tear).
+  ,
+  ModelCPathClear            \* Fidelity toggle (June 2026, backlog #8): the queue C-path lock
+                             \* block's clear-at-Count>0 branch (DrainReadyWaiters ~1243). When
+                             \* the advancer WINS the deferred-publish Exchange but re-reads
+                             \* Count>0 under the lock (a successor committed since its decrement),
+                             \* the code CLEARS _executingItem WITHOUT activating, on the belief
+                             \* that the D-path activates the item as a queue head. That is the
+                             \* slot double-skip's shape: winning the Exchange means the executor's
+                             \* own commit saw alreadyActivated and did NOT self-activate, so the
+                             \* clear leaves NEITHER side activating - sound ONLY if the D-path
+                             \* always covers it. AdvancerCPath models only the Len=0 activate
+                             \* arm; this toggle adds the Count>0 clear arm and lets
+                             \* EventuallyActivated adjudicate. FALSE = the 9 verified configs
+                             \* (the publish persists until the queue drains, then AdvancerCPath
+                             \* claims it - behaviorally unaffected). TRUE = Pipeline_CPathClear-
+                             \* Witness.cfg, the experiment.
+  ,
+  CPathLeaveFix              \* The backlog #8 FIX (June 2026, confirmed bug). At the C-path lock
+                             \* with Count>0 (a successor raced in since the <=0 decrement), the
+                             \* shipped code CLEARS the won publish without activating - and the
+                             \* tightened witness proved that strands the published item (the
+                             \* executor's commit saw alreadyActivated and deferred; neither side
+                             \* activates; the item hangs when the successor drains before it
+                             \* re-queues with a predecessor). The fix LEAVES the publish at
+                             \* Count>0 (does not Exchange it away) - the executor's own
+                             \* CommitTailWaiter Exchange then reclaims it and activates (wasEmpty
+                             \* self-activate, or a later C-path/D-path once it queues behind the
+                             \* successor). Code: check Count BEFORE the Exchange, only consume +
+                             \* activate at Count<=0. Mirrors slot mode's lost-activation fix (the
+                             \* clear-at-Count>0 was the bug there too). Meaningful only under
+                             \* ModelCPathClear. TRUE = Pipeline_CPathFixWitness.cfg (expect
+                             \* green); FALSE = Pipeline_CPathClearWitness.cfg (pins the bug).
 
 VARIABLES
   loc,                  \* [Item -> Location] - per-item bucket.
@@ -1862,15 +1894,25 @@ AdvancerDrainHead ==
                  /\ nullActivation' = nullActivation
             ELSE /\ activations' = activations
                  /\ nullActivation' = TRUE
+       \* Backlog #8 (ModelCPathClear): a <=0 decrement enters the C-path LOCK block as a
+       \* distinct phase, so the lock's storeCount re-read (which can differ from newCount -
+       \* a successor committing in between is the whole point) is a separate step. Without
+       \* the toggle, qDrainPhase stays "pass" (the lock-activate folds into AdvancerCPath, as
+       \* the 9 verified configs have it). A >0 decrement is the D-path and never enters the lock.
+       /\ qDrainPhase' = (IF ModelCPathClear
+                             /\ (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
+                          THEN "cpath_lock" ELSE qDrainPhase)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, qDrainPhase, advancingPending>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, advancingPending>>
 
 \* Advancer at count=0, executes C-path activation under lock.
 AdvancerCPath ==
   /\ advancing
   /\ drainPhase = "idle"  \* see AdvancerDrainHead
-  /\ PassOnceDrain => qDrainPhase = "pass"  \* the C-path lock block runs inside the do-body
+  \* Under ModelCPathClear the C-path lock is its own phase ("cpath_lock", set by the <=0
+  \* decrement); without the toggle it folds into the "pass" do-body as the 9 configs have it.
+  /\ PassOnceDrain => qDrainPhase = (IF ModelCPathClear THEN "cpath_lock" ELSE "pass")
   \* The fix widens the C-path to count <= 0: a negative count means the in-flight commit's
   \* entry was already completed-and-consumed (BoundedCountSkew bounds it at -1), so the
   \* deferred publish is the only live responsibility and this claim is correct. Shipped
@@ -1886,8 +1928,75 @@ AdvancerCPath ==
        /\ hasExecutingVisible' = FALSE
        /\ executingItem' = NoItem
        /\ executingItemVisible' = NoItem
-  /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)  \* exit the lock, continue the do-body
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
                  loc, taskDone, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* The queue C-path lock block's clear-at-Count>0 arm (backlog #8, ModelCPathClear). The
+\* advancer reached the terminal C-path lock (the drain loop's while has exited - no ready
+\* head) and WON the deferred-publish Exchange (hasExecuting was TRUE), but the under-lock
+\* re-read sees storeCount>0: a successor committed since the decrement that brought it here.
+\* The code (DrainReadyWaiters ~1243) CLEARS _executingItem WITHOUT activating, trusting the
+\* D-path to activate the item as a queue head. Winning the Exchange means the executor's
+\* own commit of this item saw alreadyActivated and did NOT self-activate (the Loses path),
+\* so the clear leaves NEITHER side activating - the slot double-skip's exact shape. The
+\* cleared item is "Executing"; it commits behind the successor and its activation rides on a
+\* later D-path. EventuallyActivated adjudicates whether that coverage always holds.
+\* (Over-approximate in timing - it may fire before a specific <=0 decrement is marked - but
+\* the activation-coverage question is timing-independent: either the D-path covers the
+\* cleared item or it does not, regardless of exactly when the publish was cleared.)
+AdvancerCPathClearAtCount ==
+  /\ ModelCPathClear
+  /\ ~CPathLeaveFix             \* the BUG: clears the won publish. The fix LEAVES it (below).
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ qDrainPhase = "cpath_lock"  \* reached the lock via a genuine <=0 decrement
+  /\ hasExecutingVisible        \* Exchange(hasExecuting) won - a publish to act on
+  /\ executingItemVisible # NoItem
+  /\ storeCount > 0             \* the under-lock re-read: a successor committed since the decrement
+  /\ hasExecuting' = FALSE
+  /\ hasExecutingVisible' = FALSE
+  /\ executingItem' = NoItem
+  /\ executingItemVisible' = NoItem
+  /\ qDrainPhase' = "pass"      \* exit the lock, the do-body's while continues
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* The backlog #8 FIX (CPathLeaveFix): at the C-path lock with Count>0, do NOT consume the
+\* publish - LEAVE hasExecuting/executingItem intact and exit the lock. The published item is
+\* still owned by the executor's CommitTailWaiter Exchange, which reclaims it and activates
+\* (wasEmpty self-activate when it commits into the drained queue, or a later C-path/D-path
+\* when it queues behind the live successor). Code: re-order so the Count<=0 check gates the
+\* Exchange - only consume+activate at Count<=0, leave the publish otherwise.
+AdvancerCPathLeaveAtCount ==
+  /\ ModelCPathClear
+  /\ CPathLeaveFix
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ qDrainPhase = "cpath_lock"
+  /\ hasExecutingVisible
+  /\ executingItemVisible # NoItem
+  /\ storeCount > 0
+  /\ qDrainPhase' = "pass"      \* exit the lock; publish_vars deliberately untouched
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* The C-path lock found nothing to do: no publish (the Exchange returned false), or a
+\* residual storeCount/slot shape neither the activate nor the clear arm matches. Exit the
+\* lock back into the do-body. Keeps the cpath_lock phase from deadlocking the drainer.
+AdvancerCPathLockExit ==
+  /\ ModelCPathClear
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ qDrainPhase = "cpath_lock"
+  \* Neither the activate arm (storeCount<=0 /\ Len=0 /\ ~hasSlot /\ publish) nor the clear
+  \* arm (storeCount>0 /\ publish) is enabled.
+  /\ ~( (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)
+        /\ Len(waiters) = 0 /\ ~hasSlot /\ hasExecutingVisible /\ executingItemVisible # NoItem )
+  /\ ~( storeCount > 0 /\ hasExecutingVisible /\ executingItemVisible # NoItem )
+  /\ qDrainPhase' = "pass"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
 
 \* Advancer release. Toggle picks Volatile.Write vs Exchange.
 \* Aligned with DrainReadyWaiters' release: fires when queue is empty or head not done.
@@ -2295,7 +2404,10 @@ CallbackBecomesAdvancerW == CallbackBecomesAdvancer /\ UNCHANGED aux_nophase
 \* Bails deposit the pending bit atomically with their failed acquire (the one-word property).
 CallbackBailsOutW == CallbackBailsOut /\ UNCHANGED aux_nopend
   /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
-AdvancerCPathW == AdvancerCPath /\ UNCHANGED aux_vars
+AdvancerCPathW == AdvancerCPath /\ UNCHANGED aux_nophase
+AdvancerCPathClearAtCountW == AdvancerCPathClearAtCount /\ UNCHANGED aux_nophase
+AdvancerCPathLeaveAtCountW == AdvancerCPathLeaveAtCount /\ UNCHANGED aux_nophase
+AdvancerCPathLockExitW == AdvancerCPathLockExit /\ UNCHANGED aux_nophase
 AdvancerReleaseW == AdvancerRelease /\ UNCHANGED aux_vars
 AdvancerReclaimW == AdvancerReclaim /\ UNCHANGED aux_vars
 DrainerChainExitW == DrainerChainExit /\ UNCHANGED aux_vars
@@ -2389,6 +2501,9 @@ Next ==
   \/ CallbackBailsOutW
   \/ AdvancerDrainHead
   \/ AdvancerCPathW
+  \/ AdvancerCPathClearAtCountW
+  \/ AdvancerCPathLeaveAtCountW
+  \/ AdvancerCPathLockExitW
   \/ AdvancerReleaseW
   \/ AdvancerReclaimW
   \/ QDrainReleaseStepW
@@ -2439,7 +2554,16 @@ Spec == Init /\ [][Next]_vars
         /\ WF_vars(ExecEscalationEnqueueNewW)
         /\ WF_vars(SlotCallbackBailsDuringEscalationW)
         /\ WF_vars(AdvancerDrainHead)
-        /\ WF_vars(AdvancerCPathW)
+        \* AdvancerCPath / the lock-exit are the do-body's terminal lock step - WF so the
+        \* drainer makes progress out of "cpath_lock" (one of activate / exit must fire when
+        \* the clear does not). No WF over AdvancerCPathClearAtCount: the clear is a
+        \* POSSIBILITY (it competes with the executor's own-commit Exchange and the activate
+        \* arm), like ExecItemFailure. TLC still explores behaviors where it fires (it is in
+        \* Next); the downstream D-path actions carry the fairness that must recover the
+        \* cleared item, and EventuallyActivated reports the stranding if that coverage fails.
+        \* The leave arm (the fix) is a program step out of the lock, so it carries WF like
+        \* the activate/exit - the drainer must progress out of "cpath_lock".
+        /\ WF_vars(AdvancerCPathW \/ AdvancerCPathLockExitW \/ AdvancerCPathLeaveAtCountW)
         /\ WF_vars(AdvancerReleaseW)
         /\ WF_vars(AdvancerReclaimW)
         \* Pass-once drain steps: the drainer thread's straight-line program steps.
@@ -2520,7 +2644,7 @@ TypeOK ==
   /\ activations \in [Item -> 0..5]  \* bounded for TLC; recovery cycle adds up to 2 more
   /\ drainSignal \in BOOLEAN
   /\ qDrainPhase \in {"none", "pass", "recheck", "reclaim", "rhold", "rhit", "rmiss",
-                      "pendReacq"}
+                      "pendReacq", "cpath_lock"}
   /\ qDrainedAny \in BOOLEAN
   /\ advancingPending \in BOOLEAN
   /\ drainerActive \in BOOLEAN
@@ -2813,21 +2937,32 @@ EventuallyActivated ==
       but the "executor lost the CAS to a concurrent slot callback that
       already completed the item" branch could be made more explicit.
 
-   7. Slot field writes vs the _hasSlot flag (June 2026 find, unconfirmed in
-      field): SlotDrainClaim fuses Exchange+field-reads+clears and the slot
-      commit fuses CAS+field-writes+increment into atomic actions, hiding the
-      instruction-scale window where TryClaimSlotForDrain's reads/clears race
-      a successor commit's writes inside the just-freed slot (torn (item,task)
-      pair, or commit fields wiped under _hasSlot=1). Split the field accesses
-      from the flag ops to expose it, then design the fix (read-before-claim
-      with post-Exchange validation, or a version stamp).
+   7. [DONE June 2026] Slot field writes vs the flag. SplitSlotFieldOps exposed
+      the tear (Pipeline_SlotTearWitness.cfg, 15-state trace - the reachable
+      route was the licensed callback path, not the suspected stale-token
+      reclaim); TriStateSlotClaim fixed it (the _slotState 0/1/2 word,
+      data-then-license commit, peek-gated claim, quiescent-only escalation
+      CAS). Both toggles TRUE in Pipeline_Contract.cfg (green); WaiterStoreTests
+      + WaiterStoreConcurrencyTests guard the code (proven to fail on the
+      two-state version). A second liveness strand surfaced and was fixed in
+      the same round: the slot release delegated a consumed deposit to the
+      flag-driven tail, but the claim's own consume cleared that flag - the
+      release now serves its own deposit (SlotServeReacq*; code: DrainSlotInline
+      ORs the deposit into the reclaim gate).
 
-   8. The queue lock-block's clear-at-Count>0 branch (DrainReadyWaiters) is
-      not modeled (AdvancerCPath only fires at storeCount=0). It is believed
-      sound in queue mode (the recurring D-path re-activates the cleared
-      publish's item when its position comes up) but that belief is exactly
-      the kind that slot mode falsified - model it and let EventuallyActivated
-      adjudicate.
+   8. [DONE June 2026 - WAS A REAL BUG] The queue lock-block's clear-at-Count>0
+      branch. ModelCPathClear added the faithful lock sequencing (a "cpath_lock"
+      phase set only by a genuine <=0 decrement); the tightened witness
+      (Pipeline_CPathClearWitness.cfg) PROVED the shipped clear strands the
+      published item - the slot double-skip in the queue (winning the publish
+      Exchange means the executor's own commit defers, so the clear leaves
+      neither side activating; the item hangs when the successor drains before
+      it re-queues with a predecessor). The "believed sound" reasoning was wrong,
+      exactly as it was for slot mode. FIX (CPathLeaveFix): leave the publish at
+      Count>0 for the executor's commit to reclaim and activate; code is the
+      `Count<=0 && Exchange` short-circuit with the else-clear deleted, both the
+      DrainReadyWaiters and AdvanceAndDrain sites. Pipeline_CPathFixWitness.cfg +
+      Contract (both toggles TRUE) green; the clear witness pins the bug.
 *)
 
 =============================================================================
