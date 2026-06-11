@@ -3,17 +3,17 @@ namespace Draghi.Pipelining.Tests;
 [TestClass]
 public class LatchConcurrencyTests
 {
-    /// Publish-then-try-acquire pattern with a do-while reclaim drainer, mirroring the advancer
-    /// claim in Pipeline.DrainReadyWaiters (Release, then re-read pending and re-acquire if work
-    /// remains). Every publish must be drained by some caller. Strand prevention rests on BOTH
-    /// pieces: Release's seq-cst fence AND the post-release re-check. A single-shot drainer (drop
-    /// the do-while) strands publishes even with a correct Latch, via a fence-independent window
-    /// (an increment landing after the holder's drain-Exchange but before its Release, on the
-    /// incrementer's final iteration), so it cannot isolate the fence. With the re-check in place,
-    /// a non-zero pending count at steady state means a producer's TryAcquire bailed on stale state,
-    /// or the reread floated above the Release: suspect Latch.Release's seq-cst semantics.
+    /// Publish-then-acquire pattern with obligation transfer, mirroring the advancer claim in
+    /// Pipeline.DrainReadyWaiters: a producer whose acquire loses deposits in the latch word,
+    /// and the holder's release consumes the deposit and re-acquires to serve. Every publish
+    /// must be drained by some caller WITHOUT any out-of-band recheck: unlike the old two-cell
+    /// protocol (separate latch + pending flag, where strand prevention needed a post-release
+    /// re-read of the flag and still had the lost-wake window against transient holds), the
+    /// single word makes deposit-vs-release atomic. A stranded publish at steady state means
+    /// the word primitives lost a deposit: suspect the CAS loop in TryAcquireOrFlagPending or
+    /// the Exchange in ReleaseAndCheckPending.
     [TestMethod]
-    public void PublishThenTryAcquire_NoStrandedPublishesUnderConcurrentProducers()
+    public void PublishThenAcquireOrDeposit_NoStrandedPublishesUnderConcurrentProducers()
     {
         var box = new LatchBox();
         var pending = new int[1];  // array so closure captures the reference, not the slot
@@ -26,13 +26,14 @@ public class LatchConcurrencyTests
             for (var i = 0; i < perProducer; i++)
             {
                 Interlocked.Increment(ref pending[0]);
-                if (!box.TryAcquire())
-                    continue;
+                if (!box.TryAcquireOrFlagPending())
+                    continue;  // obligation deposited; the holder serves
+                bool obligated;
                 do
                 {
                     Interlocked.Add(ref drained[0], Interlocked.Exchange(ref pending[0], 0));
-                    box.Release();
-                } while (Volatile.Read(ref pending[0]) != 0 && box.TryAcquire());
+                    obligated = box.ReleaseAndCheckPending();
+                } while (obligated && box.TryAcquireOrFlagPending());
             }
         }
 

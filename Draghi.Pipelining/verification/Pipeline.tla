@@ -142,7 +142,7 @@ CONSTANTS
                              \* pass - the quiet face needs that granularity modeled, fix-round
                              \* backlog). FALSE keeps the legacy fused fiction so the
                              \* pre-existing green configs stay meaningful.
-  SkewTolerantPartition      \* The count-skew FIX (June 2026, designed against
+  SkewTolerantPartition,     \* The count-skew FIX (June 2026, designed against
                              \* SplitCountCommit = TRUE). The drain's C/D activation partition
                              \* treats the decremented count's `<= 0` as the C-path case instead
                              \* of `== 0`. Soundness rests on BoundedCountSkew (single producer
@@ -156,6 +156,64 @@ CONSTANTS
                              \* so the D-arm's checked peek becomes a canary (NoNullActivation
                              \* must HOLD). FALSE models shipped code (the witness). TRUE is the
                              \* design target (Pipeline_Contract.cfg, with SplitCountCommit on).
+  PassOnceDrain,             \* FIDELITY toggle (June 2026, bail/recheck strand round). The code's
+                             \* DrainReadyWaiters is a PASS with a program counter:
+                             \*   do { clear signal; while (head ready) drain; Release;
+                             \*   } while (signal-read && TryReclaim);
+                             \* and the post-release signal recheck runs ONCE per pass - a missed
+                             \* rendezvous exits the chain forever. The legacy model composes the
+                             \* drain from STANDING fair actions (AdvancerRelease / AdvancerReclaim
+                             \* / DrainerChainExit guarded on the live state), which lets fairness
+                             \* re-evaluate the exit decision - structurally hiding pass-once lost
+                             \* wakes (field dump park_hang.dmp: drainSignal TRUE, latch free,
+                             \* completed entry in queue, consumer cache never refreshed; the 2s
+                             \* tail-completed strand at ~1/40k stress iterations). TRUE replaces
+                             \* the standing trio with explicit pass steps (qDrainPhase) so TLC
+                             \* explores the recheck race the hand-proofs keep failing to close.
+                             \* FALSE keeps the legacy composition for the pre-existing configs.
+  SignalConservation,        \* The bail/recheck strand FIX (June 2026, designed against
+                             \* PassOnceDrain = TRUE). Round-3 counterexample (recheck_strand_
+                             \* trace3.txt): a pass consumes the signal, truthfully finds nothing
+                             \* peekable (the signaled work is still MATERIALIZING - the
+                             \* escalation's slot->queue move, or the split commit's enqueue/
+                             \* increment window), and exits through the once-only recheck -
+                             \* destroying the token every later rescue (the nudge, the reclaim)
+                             \* keys on. The rule: signals are CONSERVED - a pass that consumed
+                             \* one and drained nothing restores it at its release point. The
+                             \* restored token survives the pass's own exit (the recheck/reclaim
+                             \* reads don't consume) and the materializer's tail check finds it:
+                             \* the escalation's one-shot nudge, or the split commit's post-
+                             \* increment inline callback. TRUE must flip the round-3 witness
+                             \* green; FALSE models shipped code (expect the strand).
+  CountGatedConservation,    \* Refinement of SignalConservation (June 2026, post-livelock): the
+                             \* empty-handed restore fires only when storeCount > 0 - evidence of
+                             \* committed work (the materializing mid-move/mid-commit cases all
+                             \* carry a count). Without the gate, restores manufacture DANGLING
+                             \* tokens (flag TRUE, zero work, nothing scheduled to clear them),
+                             \* which both feed probe traffic into the reclaim's transient hold
+                             \* (the field strand's fuel) and livelock any unconditional reclaim
+                             \* retry (the iter-14 regression). With it, a post-release flag is
+                             \* always real: a bail or a materializer.
+  PendingWordLatch           \* THE transient-hold repair, FINAL (June 2026, v5 - after FOUR
+                             \* TLC-refuted two-cell protocols: naive retry livelocked, bounded
+                             \* retry left the recursion, serve-attempt and the uniform T-cycle
+                             \* each leaked at their own last release). The root flaw was never
+                             \* the protocol: latch and signal in SEPARATE CELLS make every
+                             \* release/recheck a two-location Dekker rendezvous, and a bail can
+                             \* always land between any pair of reads. v5 moves the bail's
+                             \* deposit INTO THE LATCH WORD - Drepper's mutex tri-state
+                             \* (free / held / held+pending) WITHOUT the kernel half: pending
+                             \* does not mean parked threads to wake, it means deposited work
+                             \* the RELEASER inherits (obligation transfer, no waiting anywhere).
+                             \* TryAcquire's failure atomically ORs pending (same word, cannot
+                             \* be missed); Release exchanges the whole word and READS pending
+                             \* atomically with releasing - the window class is unrepresentable,
+                             \* not handled. A releaser seeing pending re-acquires and continues
+                             \* the pass (losing the re-acquire is benign: the winner's
+                             \* exhaustive pass serves all visible work). drainSignal keeps ONLY
+                             \* the materializing-token role (count-gated conservation, served
+                             \* by the materializer's own tail checks). TRUE = the fix; FALSE =
+                             \* shipped two-cell code (the strand witness).
 
 VARIABLES
   loc,                  \* [Item -> Location] - per-item bucket.
@@ -190,6 +248,20 @@ VARIABLES
   \* consume it; the post-release recheck closes the lost-wake window - the IOQueue-style
   \* clear-fence-recheck gate.
   drainSignal,
+
+  \* The queue drain pass's program counter (PassOnceDrain only; "none" otherwise).
+  \* "pass" = inside the do-body (signal cleared, draining heads); "recheck" = released,
+  \* about to read the signal ONCE; "reclaim" = signal seen, attempting TryReclaim.
+  qDrainPhase,
+
+  \* Whether the current pass dequeued anything since it consumed the signal (PassOnceDrain;
+  \* reset at every pass/sub-pass entry clear). The SignalConservation restore keys on it.
+  qDrainedAny,
+
+  \* The latch word's pending bit (PendingWordLatch). Updated ATOMICALLY with the latch in
+  \* the same action - that single-word atomicity IS the design. Set by a failed acquire's
+  \* deposit; consumed by the release that reads it.
+  advancingPending,
 
   \* TRUE while a drainer chain (DrainReadyWaiters' do-while loop) is in progress: set when
   \* a callback acquires advancer or the nudge fires, kept TRUE through AdvancerRelease
@@ -257,7 +329,17 @@ item_vars    == <<loc, taskDone, activations, callbackFired, failed>>
 \* June 2026 additions (slot-drain split + tenure). Actions that predate them and don't
 \* interact get UNCHANGED aux_vars applied at the Next relation rather than per-body.
 aux_vars     == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
+                  tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
+\* aux minus the queue-drain PC, for wrappers of actions that WRITE qDrainPhase
+\* (the advancer-acquire entries under PassOnceDrain).
+aux_nophase  == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
+                  tenure, tenureClash, assertFailed, nullActivation, advancingPending>>
+\* aux minus the PC and the latch pending bit, for the release steps (they write both).
+aux_relmin   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                   tenure, tenureClash, assertFailed, nullActivation>>
+\* aux minus only the latch pending bit, for the bail wrappers (failed acquire deposits).
+aux_nopend   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
+                  tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny>>
 
 vars == <<loc, taskDone, activations, callbackFired, failed,
           executingItem, executingItemVisible, hasExecuting, hasExecutingVisible,
@@ -265,7 +347,7 @@ vars == <<loc, taskDone, activations, callbackFired, failed,
           hasSlot, slotItem, escalated, waiters,
           escPhase, escTail, escSlotClaimed, escMoved, drainerActive,
           drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-          tenure, tenureClash, assertFailed, nullActivation>>
+          tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Item / NoItem come from WaiterStore.tla.
 \* InWaitersPending: transient state inside CommitWaiter's queue path between waiters.Enqueue
@@ -307,6 +389,9 @@ Init ==
   /\ advancing = FALSE
   /\ advancingVisible = FALSE
   /\ drainSignal = FALSE
+  /\ qDrainPhase = "none"
+  /\ qDrainedAny = FALSE
+  /\ advancingPending = FALSE
   /\ callbackFired = {}
   /\ drainerActive = FALSE
   /\ failed = {}
@@ -378,7 +463,7 @@ SourceYieldInline ==
        /\ tenure' = i
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
                  taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Bug witness: the executor's Count==0 gate passed but the previous inline tenure is still
 \* held - the dispatch's TryStart lands on a started shared promise. Real-world signature:
@@ -397,7 +482,7 @@ SourceYieldInlineClash ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
                  taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
                  loc, activations, drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                 tenure, assertFailed, nullActivation>>
+                 tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Source yields next item with existing waiters - deferred publish.
 SourceYieldDeferred ==
@@ -496,7 +581,7 @@ ExecCommitTailExecutorWins ==
                                   ELSE activations
                 /\ drainSignal' = drainSignal
   /\ UNCHANGED <<adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* CommitTailWaiter, advancer won (alreadyActivated = true). Executor skips _executingItem clear.
 ExecCommitTailExecutorLoses ==
@@ -531,7 +616,7 @@ ExecCommitTailExecutorLoses ==
                 /\ activations' = activations
                 /\ drainSignal' = drainSignal
   /\ UNCHANGED <<publish_vars, adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 (* ===========================================================================
    Truthful queue commit (SplitCountCommit): TryEscalateOrEnqueue's post-
@@ -687,6 +772,41 @@ ExecEscalationEnqueueNew ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  taskDone, callbackFired, failed, drainer_vars>>
 
+\* CommitWaiter's post-escalation nudge as the code has it: a ONE-SHOT check at the tail of
+\* the first-escalation commit (split path; escPhase "nudge_check" routed from the count
+\* step / compensation). The legacy standing ExecPostEscalationNudge (gated ~SplitCountCommit)
+\* approximates this for the fused path - but a standing nudge is an unfaithful rescue: it
+\* re-fires whenever the signal is set, where the code's check runs once and never returns
+\* (the mid-escalation bail of SlotCallbackBailsDuringEscalation is exactly what it exists
+\* to catch - and the only thing it can catch).
+ExecEscalationNudgeStep ==
+  /\ escPhase = "nudge_check"
+  /\ IF NudgeEnabled /\ escSlotClaimed /\ drainSignal /\ ~advancingVisible
+       THEN /\ advancing' = TRUE
+            /\ advancingVisible' = TRUE
+            /\ drainerActive' = TRUE
+            /\ drainSignal' = FALSE  \* DrainReadyWaiters' do-top clear
+            /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+            /\ qDrainedAny' = (IF PassOnceDrain THEN FALSE ELSE qDrainedAny)
+            /\ advancingPending' = advancingPending
+       ELSE /\ advancing' = advancing
+            /\ advancingVisible' = advancingVisible
+            /\ drainerActive' = drainerActive
+            /\ drainSignal' = drainSignal
+            /\ qDrainPhase' = qDrainPhase
+            /\ qDrainedAny' = qDrainedAny
+            \* PendingWordLatch: the nudge's TryAcquire is the same word primitive as every
+            \* other acquirer - attempted (signal seen) and lost (holder present) deposits
+            \* the obligation in the word. THE Contract v5 round-1 counterexample: a nudge
+            \* bailing against the reclaim's transient rmiss hold, no deposit, strand.
+            /\ advancingPending' = (IF PendingWordLatch /\ NudgeEnabled /\ escSlotClaimed
+                                       /\ drainSignal /\ advancingVisible
+                                    THEN TRUE ELSE advancingPending)
+  /\ escPhase' = "idle"
+  /\ escSlotClaimed' = FALSE
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, hasSlot, slotItem, escalated, waiters,
+                 escTail, escMoved, loc, taskDone, activations, callbackFired, failed>>
+
 \* Split Step 4a (SplitCountCommit): the tail append alone. loc moves to InWaitersPending
 \* here (the entry is in waiters - WaitersConsistent); the count follows in 4b. Same
 \* count-skew window as the steady-state pair.
@@ -705,7 +825,7 @@ ExecEscalationCommitCount ==
        activations' = IF storeCount = 0 /\ i \notin taskDone
                       THEN [activations EXCEPT ![i] = @ + 1]
                       ELSE activations
-  /\ StoreCommitCount(IF SlotChainActivation /\ escSlotClaimed THEN "compensate" ELSE "idle")
+  /\ StoreCommitCount(IF SlotChainActivation /\ escSlotClaimed THEN "compensate" ELSE "nudge_check")
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
                  callbackFired, failed, drainer_vars>>
 
@@ -729,7 +849,7 @@ ExecEscalationCompensate ==
            /\ activations' = activations
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  loc, taskDone, callbackFired, failed, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation>>
+                 drainPhase, drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 (* Inline-callback race in CommitWaiter queue path: at the post-Enqueue check, if task is
    already done the executor fires the wired callback inline; otherwise it registers it for
@@ -853,7 +973,7 @@ SlotDrainClaim ==
     /\ drainSignal' = FALSE
     /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                    taskDone, activations, esc_vars, failed, drainRemaining, pendingHeadActivation,
-                   tenureClash, assertFailed, nullActivation>>
+                   tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Slot drain, step 2 of 3: DecrementCount - the position republish. The executor's Count==0
 \* inline-activation gate (SourceYieldInline's storeCount = 0) can pass the instant this
@@ -870,7 +990,7 @@ SlotDrainCount ==
   /\ drainPhase' = "counted"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, drainSignal,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, pendingHeadActivation, tenure, tenureClash, nullActivation>>
+                 drainItem, pendingHeadActivation, tenure, tenureClash, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Slot drain, step 3 of 3, SHIPPED code (~SlotChainActivation): CompleteWaiter + the
 \* lock-guarded C-path. The lock block consumes the publish whenever held; it re-checks the
@@ -905,7 +1025,7 @@ SlotDrainCompleteLegacy ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                 pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Slot drain, step 3 of 3, FIX, chain arm, slot-visible case (drainRemaining > 0,
 \* ~escalated): a successor's commit landed before our decrement, so it observed count >= 2
@@ -943,7 +1063,7 @@ SlotDrainCompleteChainSlot ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                 pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Chain arm, escalation-raced case: the peek saw IsEscalated - a first escalation is (or
 \* finished) relocating the head slot -> queue, so the head cannot be named from the slot
@@ -964,7 +1084,7 @@ SlotDrainCompleteChainHandoff ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 tenureClash, assertFailed, nullActivation>>
+                 tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Handoff resolution, drainer reclaims: the one-shot re-peek found the head visible (the
 \* escalation's move landed), so the drainer claims its own obligation back (Exchange wins)
@@ -981,7 +1101,7 @@ SlotDrainHandoffReclaim ==
   /\ drainPhase' = "idle"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation>>
+                 drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Handoff resolution, drainer trusts the escalator: the re-peek found no visible head (the
 \* move hasn't landed). The flag's full fence makes this safe: had the escalator's
@@ -997,7 +1117,7 @@ SlotDrainHandoffTrust ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Slot drain, step 3 of 3, FIX, C-path arm (drainRemaining = 0): no successor preceded our
 \* decrement, so any LATER commit observes count 1 = wasEmpty and self-activates - the
@@ -1030,7 +1150,7 @@ SlotDrainCompleteCPath ==
   /\ drainRemaining' = 0
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                 pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* Drainer's release step. Mirrors DrainSlotInline's _advancing.Release() tail. Between
 \* SlotCallbackDrains and this release, the slot is empty but the advancer is still held.
@@ -1039,17 +1159,71 @@ SlotDrainCompleteCPath ==
 SlotDrainerRelease ==
   /\ advancing
   /\ drainerActive
-  /\ ~escalated
   /\ drainPhase = "idle"  \* the drain's three steps complete before the release
-  /\ Len(waiters) = 0
+  \* The code's release is UNCONDITIONAL in the method flow. Under PassOnceDrain the slot
+  \* method's hold is disambiguated from queue passes by qDrainPhase = "none" (queue passes
+  \* own a phase); the legacy composition disambiguated by ~escalated /\ empty-queue - which
+  \* under pass-once would deadlock the slot drainer when the executor escalates mid-hold
+  \* (escalated is monotonic; the first hunt's artifact #2).
+  /\ (IF PassOnceDrain
+        THEN qDrainPhase = "none"
+        ELSE ~escalated /\ Len(waiters) = 0)
   /\ IF WeakAdvancerRelease
        THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
        ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
+  \* PendingWordLatch: the release Exchange wipes the whole word, so a deposit made during
+  \* this hold is consumed HERE - but the slot path does not take the pendReacq route. The
+  \* obligation delegates to the flag-driven tail (SlotDrainerReclaim / TailRerouteEscalated):
+  \* sound because every bail sets drainSignal alongside the pending deposit, and nothing can
+  \* consume that flag during this hold (the queue pass's do-top Exchange requires the latch
+  \* we are holding). Post-release, either our own tail serves the flag or a concurrent
+  \* acquirer's exhaustive pass does.
+  /\ advancingPending' = (IF PendingWordLatch THEN FALSE ELSE advancingPending)
   \* drainerActive stays TRUE: the slot drainer's method continues past the release into
   \* its reclaim check (mirroring the queue drain's do-while). DrainerChainExit clears it
   \* when no reclaim precondition holds.
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Pass-once slot-method tail, escalated arm: DrainSlotInline's post-release reclaim finds
+\* the store escalated and reroutes into DrainReadyWaiters (a fresh queue pass with the
+\* do-top clear). Code: `if (signal && TryAcquire) { if (IsEscalated) { DrainReadyWaiters();
+\* return; } ... }`. Unmodeled before this round; the legacy composition's standing actions
+\* blurred over it.
+SlotDrainerTailRerouteEscalated ==
+  /\ PassOnceDrain
+  /\ drainerActive
+  /\ qDrainPhase = "none"
+  /\ drainPhase = "idle"
+  /\ ~advancingVisible
+  /\ drainSignal
+  /\ escalated
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ drainSignal' = FALSE  \* DrainReadyWaiters' do-top clear
+  /\ qDrainPhase' = "pass"
+  /\ qDrainedAny' = FALSE
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Pass-once slot-method exit: the post-release check found no signal, or lost the acquire
+\* to a concurrent holder (who owns the chain from here). The method returns.
+SlotDrainerTailExit ==
+  /\ PassOnceDrain
+  /\ drainerActive
+  /\ qDrainPhase = "none"
+  /\ drainPhase = "idle"
+  /\ ~advancing
+  /\ \/ ~drainSignal
+     \/ advancingVisible  \* TryAcquire would lose; the winner's pass covers
+  /\ drainerActive' = FALSE
+  \* PendingWordLatch: a lose-exit (signal seen, stale-visible holder) deposits like every
+  \* contended acquirer. Dead under fenced release (visible = actual, so ~advancing excludes
+  \* the holder case); live under WeakAdvancerRelease.
+  /\ advancingPending' = (IF PendingWordLatch /\ drainSignal /\ advancingVisible
+                          THEN TRUE ELSE advancingPending)
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars>>
 
 \* The slot-mode reclaim (the strand fix under design): post-release, the drainer re-checks
 \* for a waiter whose callback bailed against its hold (recorded in drainSignal, callback
@@ -1079,7 +1253,7 @@ SlotDrainerReclaim ==
        /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
   /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                 drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* The race the originally-atomic SlotCallbackDrains hid: a follow-up slot callback fires
 \* while the previous drain still holds the advancer (between SlotDrainerDrains and
@@ -1145,6 +1319,7 @@ CallbackBailsOut ==
 AdvancerDrainHead ==
   /\ advancing
   /\ drainPhase = "idle"  \* the latch holder is one thread in one method: not mid-slot-drain
+  /\ PassOnceDrain => qDrainPhase = "pass"  \* pass-once: the inner while runs inside the do-body
   /\ Len(waiters) > 0
   /\ Head(waiters) \in taskDone
   /\ LET i == Head(waiters)
@@ -1155,6 +1330,8 @@ AdvancerDrainHead ==
          newCount == storeCount - 1 IN
        /\ StoreDequeueHead
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
+       \* This pass satisfied at least one signal's worth of work (SignalConservation's input).
+       /\ qDrainedAny' = (IF PassOnceDrain THEN TRUE ELSE qDrainedAny)
        \* No per-item signal bookkeeping: the dirty flag was cleared at pass start and the
        \* pass drains exhaustively (the counter's per-dequeue decrement - and its transient
        \* negative when consuming a visible-but-uncounted entry whose inline callback hasn't
@@ -1183,17 +1360,18 @@ AdvancerDrainHead ==
                  /\ nullActivation' = TRUE
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, qDrainPhase, advancingPending>>
 
 \* Advancer at count=0, executes C-path activation under lock.
 AdvancerCPath ==
   /\ advancing
   /\ drainPhase = "idle"  \* see AdvancerDrainHead
+  /\ PassOnceDrain => qDrainPhase = "pass"  \* the C-path lock block runs inside the do-body
   \* The fix widens the C-path to count <= 0: a negative count means the in-flight commit's
   \* entry was already completed-and-consumed (BoundedCountSkew bounds it at -1), so the
   \* deferred publish is the only live responsibility and this claim is correct. Shipped
   \* code's == 0 is the quiet-face skip.
-  /\ IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0
+  /\ (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)
   /\ hasExecutingVisible
   /\ Len(waiters) = 0
   /\ ~hasSlot
@@ -1212,6 +1390,7 @@ AdvancerCPath ==
 \* No slot clause: SlotCallbackDrains is atomic (acquire-drain-C-path-release), so the
 \* advancer is never observed held between transitions in any state where hasSlot = TRUE.
 AdvancerRelease ==
+  /\ ~PassOnceDrain  \* legacy standing release; QDrainReleaseStep is the pass-once truth
   /\ advancing
   /\ drainPhase = "idle"  \* see AdvancerDrainHead; SlotDrainerRelease covers the slot drain
   /\ \/ Len(waiters) = 0
@@ -1229,6 +1408,7 @@ AdvancerRelease ==
 \* they wait until the next entry to DrainReadyWaiters (a new callback fire or, with
 \* NudgeEnabled, the explicit nudge).
 AdvancerReclaim ==
+  /\ ~PassOnceDrain  \* legacy standing reclaim; the QDrainRecheck/Reclaim steps are the truth
   /\ drainerActive
   /\ ~advancingVisible
   /\ drainSignal
@@ -1241,10 +1421,178 @@ AdvancerReclaim ==
   /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
 
+(* ===========================================================================
+   Pass-once drain steps (PassOnceDrain = TRUE): DrainReadyWaiters' real shape.
+     do { Exchange(signal, FALSE); while (head ready) drain; Release();
+     } while (signal && TryReclaim());
+   The acquire entries (CallbackBecomesAdvancer / ExecutorInlineCallbackBecomesAdvancer /
+   ExecPostEscalationNudge wrappers) set qDrainPhase = "pass" alongside their signal clear.
+   AdvancerDrainHead and AdvancerCPath carry the qDrainPhase = "pass" gate. The steps below
+   model the release-recheck-reclaim tail of the do-while, each a separate atomic step so
+   TLC explores the rendezvous the standing composition re-evaluates away (field dump
+   park_hang.dmp: signal TRUE, latch free, completed head stranded).
+   =========================================================================== *)
+
+\* The inner while found no ready head: Release, then the ONE-SHOT signal recheck is next.
+QDrainReleaseStep ==
+  /\ PassOnceDrain
+  /\ qDrainPhase = "pass"
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ \/ Len(waiters) = 0
+     \/ /\ Len(waiters) > 0
+        /\ Head(waiters) \notin taskDone
+  \* The release is the latch-word Exchange: it reads the pending bit ATOMICALLY with
+  \* releasing (PendingWordLatch). Pending set = a bail deposited during our hold - we are
+  \* obligated: consume the bit and route to the re-acquire (the Exchange-then-CAS window
+  \* is modeled by the pendReacq arms; losing the re-acquire is benign, the winner's
+  \* exhaustive pass serves all visible work).
+  /\ IF PendingWordLatch /\ advancingPending
+       THEN /\ IF WeakAdvancerRelease
+                 THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
+                 ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
+            /\ advancingPending' = FALSE
+            /\ qDrainPhase' = "pendReacq"
+       ELSE /\ IF WeakAdvancerRelease
+                 THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
+                 ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
+            /\ advancingPending' = advancingPending
+            /\ qDrainPhase' = "recheck"
+  \* SignalConservation: a pass that consumed the signal and dequeued NOTHING did not
+  \* satisfy it - the signaled work is still materializing (mid-move / mid-commit). Restore
+  \* the token at the release so the materializer's tail check (the one-shot nudge, the
+  \* post-increment inline callback) finds it. The pass's own recheck/reclaim reads do not
+  \* consume, so the restored token survives this pass's exit.
+  /\ drainSignal' = (IF SignalConservation /\ ~qDrainedAny
+                        /\ (~CountGatedConservation \/ storeCount > 0)
+                     THEN TRUE ELSE drainSignal)
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Recheck read the signal as set: proceed to TryReclaim.
+QDrainRecheckSeen ==
+  /\ qDrainPhase = "recheck"
+  /\ drainSignal
+  /\ qDrainPhase' = "reclaim"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Recheck read the signal as clear: the do-while exits and the method returns. THE pass-once
+\* exit - if a wake was needed and this read raced it, nothing re-evaluates.
+QDrainRecheckMissed ==
+  /\ qDrainPhase = "recheck"
+  /\ ~drainSignal
+  /\ qDrainPhase' = "none"
+  /\ drainerActive' = FALSE
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars>>
+
+\* TryReclaimAdvancerForWork, UN-FUSED (June 2026, the field strand's home). The original
+\* fused acquire+peek+release gave the transient hold ZERO WIDTH in-model - no bail could
+\* land against it, which is why four hunt rounds missed the mechanism the event ring then
+\* caught on tape: a callback's one-shot wake bails against the reclaim's hold, and the
+\* miss path releases and exits with no post-release rendezvous. Four explicit steps now:
+\* acquire ("rhold"), peek snapshot ("rhit"/"rmiss" - the verdict is a READ AT THAT MOMENT,
+\* carried in the phase while the world moves on), then enter-pass or miss-release. Bail
+\* actions fire whenever advancingVisible, so they land inside "rhold"/"rmiss" exactly as
+\* on the tape.
+
+\* TryAcquire won: the transient hold begins.
+QDrainReclaimAcquire ==
+  /\ qDrainPhase = "reclaim"
+  /\ ~advancingVisible
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ qDrainPhase' = "rhold"
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* The peek: a snapshot of drainable-work-NOW, recorded in the phase. The world (commits,
+\* moves, completions, bails) keeps moving after this read - that staleness window is the
+\* mechanism.
+QDrainReclaimPeek ==
+  /\ qDrainPhase = "rhold"
+  /\ qDrainPhase' = (IF Len(waiters) > 0 /\ Head(waiters) \in taskDone THEN "rhit" ELSE "rmiss")
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Peek saw work: TryReclaim returns true holding the latch; the do-while loops back into
+\* the pass (with its do-top signal clear).
+QDrainReclaimEnterPass ==
+  /\ qDrainPhase = "rhit"
+  /\ qDrainPhase' = "pass"
+  /\ drainSignal' = FALSE  \* the do-top Exchange on loop re-entry
+  /\ qDrainedAny' = FALSE  \* new sub-pass
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Peek saw nothing: release. Two-cell shipped code (~PendingWordLatch) returns false with
+\* no post-release rendezvous (THE hole: a bail that landed after the peek snapshot is
+\* released into a world where its token will never be read - the field strand). With the
+\* pending word, the release Exchange reads the deposit atomically and serves it.
+QDrainReclaimMissRelease ==
+  /\ qDrainPhase = "rmiss"
+  /\ IF PendingWordLatch /\ advancingPending
+       THEN /\ IF WeakAdvancerRelease
+                 THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
+                 ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
+            /\ advancingPending' = FALSE
+            /\ qDrainPhase' = "pendReacq"
+            /\ drainerActive' = drainerActive
+       ELSE /\ IF WeakAdvancerRelease
+                 THEN WeakWriteOk(advancing', advancingVisible', FALSE, advancingVisible)
+                 ELSE FencedWriteOk(advancing', advancingVisible', FALSE)
+            /\ advancingPending' = advancingPending
+            /\ qDrainPhase' = "none"
+            /\ drainerActive' = FALSE
+  /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars>>
+
+(* The PendingWordLatch serve route: the release Exchange consumed the pending bit and
+   the releaser is obligated. The Exchange-then-CAS window from the code is the pendReacq
+   phase: re-acquire wins continue the pass (with its do-top clear), losses delegate to
+   the winner's exhaustive pass. *)
+
+QDrainPendReacqWin ==
+  /\ qDrainPhase = "pendReacq"
+  /\ ~advancingVisible
+  /\ advancing' = TRUE
+  /\ advancingVisible' = TRUE
+  /\ qDrainPhase' = "pass"
+  /\ drainSignal' = FALSE  \* the continued pass's do-top Exchange
+  /\ qDrainedAny' = FALSE
+  /\ drainerActive' = TRUE
+  /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars>>
+
+QDrainPendReacqLose ==
+  /\ qDrainPhase = "pendReacq"
+  /\ advancingVisible
+  /\ qDrainPhase' = "none"
+  /\ drainerActive' = FALSE
+  \* The re-acquire CAS is the same word primitive: losing it re-deposits the obligation on
+  \* the winner (who may itself be a stale-verdict reclaim hold - its release then serves).
+  /\ advancingPending' = TRUE
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars>>
+
+\* TryReclaim's TryAcquire lost to a concurrent acquirer: return false, the do-while exits.
+\* The winner owns the chain (its own pass + recheck).
+QDrainReclaimLose ==
+  /\ qDrainPhase = "reclaim"
+  /\ advancingVisible
+  /\ qDrainPhase' = "none"
+  \* PendingWordLatch: TryReclaim's failed acquire deposits like every contended acquirer -
+  \* the holder we lost to may be a stale-verdict rmiss hold whose release must learn of us.
+  /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
 \* The drainer chain exits when, post-release, the do-while's TryReclaim preconditions don't
 \* match (queue empty or head not done). Clears drainerActive. Real code's do-while exits
 \* and the calling method returns; subsequent stranded counts wait for a new callback entry.
 DrainerChainExit ==
+  /\ ~PassOnceDrain  \* legacy; pass-once exits via QDrainRecheckMissed / QDrainReclaim arms
   /\ drainerActive
   /\ ~advancing
   /\ ~(drainSignal /\ Len(waiters) > 0 /\ Head(waiters) \in taskDone)
@@ -1268,6 +1616,7 @@ DrainerChainExit ==
 \* The body matches a successful TryAcquire + DrainReadyWaiters entry: claim advancer,
 \* mark drainerActive so subsequent AdvancerReclaim transitions can fire.
 ExecPostEscalationNudge ==
+  /\ ~SplitCountCommit  \* fused-path approximation; the split path runs ExecEscalationNudgeStep
   /\ NudgeEnabled
   /\ escPhase = "idle"
   /\ escalated      \* nudge is only meaningful after escalation has happened in this run
@@ -1350,7 +1699,7 @@ ExecItemFailure ==
          ELSE UNCHANGED publish_vars
     /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                    taskDone, activations, callbackFired, esc_vars, drainer_vars,
-                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation>>
+                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending>>
 
 \* RecoverItem wins-path: no prior waiter in flight (_waiters.Count is 0), inline-activate
 \* the substitute. Mirrors the post-fix code at the new RecoverItem in Pipeline.cs. The
@@ -1416,18 +1765,43 @@ ExecEscalationCASSlotW == ExecEscalationCASSlot /\ UNCHANGED aux_vars
 ExecEscalationMoveSlotW == ExecEscalationMoveSlot /\ UNCHANGED aux_vars
 ExecEscalationEnqueueNewW == ExecEscalationEnqueueNew /\ UNCHANGED aux_vars
 ExecutorRegistersCallbackW == ExecutorRegistersCallback /\ UNCHANGED aux_vars
-ExecutorInlineCallbackBecomesAdvancerW == ExecutorInlineCallbackBecomesAdvancer /\ UNCHANGED aux_vars
-ExecutorInlineCallbackBailsOutW == ExecutorInlineCallbackBailsOut /\ UNCHANGED aux_vars
-SlotDrainerReleaseW == SlotDrainerRelease /\ UNCHANGED aux_vars
-SlotCallbackBailsOutW == SlotCallbackBailsOut /\ UNCHANGED aux_vars
+ExecutorInlineCallbackBecomesAdvancerW == ExecutorInlineCallbackBecomesAdvancer /\ UNCHANGED aux_nophase
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+  /\ qDrainedAny' = (IF PassOnceDrain THEN FALSE ELSE qDrainedAny)
+ExecutorInlineCallbackBailsOutW == ExecutorInlineCallbackBailsOut /\ UNCHANGED aux_nopend
+  /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
+SlotDrainerReleaseW == SlotDrainerRelease /\ UNCHANGED aux_nopend
+SlotCallbackBailsOutW == SlotCallbackBailsOut /\ UNCHANGED aux_nopend
+  /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
 SlotCallbackBailsDuringEscalationW == SlotCallbackBailsDuringEscalation /\ UNCHANGED aux_vars
-CallbackBecomesAdvancerW == CallbackBecomesAdvancer /\ UNCHANGED aux_vars
-CallbackBailsOutW == CallbackBailsOut /\ UNCHANGED aux_vars
+\* Acquire entries write the pass PC under PassOnceDrain (they enter DrainReadyWaiters,
+\* whose do-top clear their actions already fuse).
+CallbackBecomesAdvancerW == CallbackBecomesAdvancer /\ UNCHANGED aux_nophase
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+  /\ qDrainedAny' = (IF PassOnceDrain THEN FALSE ELSE qDrainedAny)
+\* Bails deposit the pending bit atomically with their failed acquire (the one-word property).
+CallbackBailsOutW == CallbackBailsOut /\ UNCHANGED aux_nopend
+  /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
 AdvancerCPathW == AdvancerCPath /\ UNCHANGED aux_vars
 AdvancerReleaseW == AdvancerRelease /\ UNCHANGED aux_vars
 AdvancerReclaimW == AdvancerReclaim /\ UNCHANGED aux_vars
 DrainerChainExitW == DrainerChainExit /\ UNCHANGED aux_vars
-ExecPostEscalationNudgeW == ExecPostEscalationNudge /\ UNCHANGED aux_vars
+ExecPostEscalationNudgeW == ExecPostEscalationNudge /\ UNCHANGED aux_nophase
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+  /\ qDrainedAny' = (IF PassOnceDrain THEN FALSE ELSE qDrainedAny)
+ExecEscalationNudgeStepW == ExecEscalationNudgeStep /\ UNCHANGED aux_relmin
+SlotDrainerTailRerouteEscalatedW == SlotDrainerTailRerouteEscalated /\ UNCHANGED aux_nophase
+SlotDrainerTailExitW == SlotDrainerTailExit /\ UNCHANGED aux_nopend
+QDrainReleaseStepW == QDrainReleaseStep /\ UNCHANGED aux_relmin
+QDrainRecheckSeenW == QDrainRecheckSeen /\ UNCHANGED aux_nophase
+QDrainRecheckMissedW == QDrainRecheckMissed /\ UNCHANGED aux_nophase
+QDrainReclaimAcquireW == QDrainReclaimAcquire /\ UNCHANGED aux_nophase
+QDrainReclaimPeekW == QDrainReclaimPeek /\ UNCHANGED aux_nophase
+QDrainReclaimEnterPassW == QDrainReclaimEnterPass /\ UNCHANGED aux_nophase
+QDrainReclaimMissReleaseW == QDrainReclaimMissRelease /\ UNCHANGED aux_relmin
+QDrainReclaimLoseW == QDrainReclaimLose /\ UNCHANGED aux_relmin
+QDrainPendReacqWinW == QDrainPendReacqWin /\ UNCHANGED aux_nophase
+QDrainPendReacqLoseW == QDrainPendReacqLose /\ UNCHANGED aux_relmin
 PropagateAdvancingW == PropagateAdvancing /\ UNCHANGED aux_vars
 PropagateHasExecutingW == PropagateHasExecuting /\ UNCHANGED aux_vars
 PropagateExecutingItemW == PropagateExecutingItem /\ UNCHANGED aux_vars
@@ -1450,6 +1824,7 @@ Next ==
   \/ ExecCommitQueueCountLosesW
   \/ ExecEscalationEnqueueTailW
   \/ ExecEscalationCommitCountW
+  \/ ExecEscalationNudgeStepW
   \/ ExecCommitTailPublishQueueExecutorWinsW
   \/ ExecCommitTailPublishQueueExecutorLosesW
   \/ ExecEscalationCASSlotW
@@ -1477,6 +1852,18 @@ Next ==
   \/ AdvancerCPathW
   \/ AdvancerReleaseW
   \/ AdvancerReclaimW
+  \/ QDrainReleaseStepW
+  \/ QDrainRecheckSeenW
+  \/ QDrainRecheckMissedW
+  \/ QDrainReclaimAcquireW
+  \/ QDrainReclaimPeekW
+  \/ QDrainReclaimEnterPassW
+  \/ QDrainReclaimMissReleaseW
+  \/ QDrainReclaimLoseW
+  \/ QDrainPendReacqWinW
+  \/ QDrainPendReacqLoseW
+  \/ SlotDrainerTailRerouteEscalatedW
+  \/ SlotDrainerTailExitW
   \/ DrainerChainExitW
   \/ ExecPostEscalationNudgeW
   \/ PropagateAdvancingW
@@ -1501,6 +1888,7 @@ Spec == Init /\ [][Next]_vars
         /\ WF_vars(ExecCommitQueueCountWinsW \/ ExecCommitQueueCountLosesW)
         /\ WF_vars(ExecEscalationEnqueueTailW)
         /\ WF_vars(ExecEscalationCommitCountW)
+        /\ WF_vars(ExecEscalationNudgeStepW)
         /\ WF_vars(ExecCommitTailPublishQueueExecutorWinsW \/ ExecCommitTailPublishQueueExecutorLosesW)
         /\ WF_vars(ExecEscalationCASSlotW)
         /\ WF_vars(ExecEscalationMoveSlotW)
@@ -1510,6 +1898,16 @@ Spec == Init /\ [][Next]_vars
         /\ WF_vars(AdvancerCPathW)
         /\ WF_vars(AdvancerReleaseW)
         /\ WF_vars(AdvancerReclaimW)
+        \* Pass-once drain steps: the drainer thread's straight-line program steps.
+        /\ WF_vars(QDrainReleaseStepW)
+        /\ WF_vars(QDrainRecheckSeenW \/ QDrainRecheckMissedW)
+        /\ WF_vars(QDrainReclaimAcquireW \/ QDrainReclaimLoseW)
+        /\ WF_vars(QDrainReclaimPeekW)
+        /\ WF_vars(QDrainReclaimEnterPassW \/ QDrainReclaimMissReleaseW)
+        \* The pendReacq re-acquire CAS: an unconditional program step after the release
+        \* Exchange consumed the deposit - one of the two arms must fire.
+        /\ WF_vars(QDrainPendReacqWinW \/ QDrainPendReacqLoseW)
+        /\ WF_vars(SlotDrainerTailRerouteEscalatedW \/ SlotDrainerTailExitW)
         /\ WF_vars(DrainerChainExitW)
         \* Nudge fairness: enabled iff NudgeEnabled constant is TRUE. If FALSE, the action
         \* never fires (its NudgeEnabled precondition is FALSE), so fairness over it is vacuous;
@@ -1553,6 +1951,10 @@ TypeOK ==
   /\ loc \in [Item -> Locations]
   /\ activations \in [Item -> 0..5]  \* bounded for TLC; recovery cycle adds up to 2 more
   /\ drainSignal \in BOOLEAN
+  /\ qDrainPhase \in {"none", "pass", "recheck", "reclaim", "rhold", "rhit", "rmiss",
+                      "pendReacq"}
+  /\ qDrainedAny \in BOOLEAN
+  /\ advancingPending \in BOOLEAN
   /\ drainerActive \in BOOLEAN
   /\ failed \subseteq Item
   /\ drainPhase \in {"idle", "claimed", "counted", "handoff"}

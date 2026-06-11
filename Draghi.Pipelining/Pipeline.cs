@@ -82,6 +82,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // their TryAcquire's full fence). Drain passes consume it with an Interlocked.Exchange at pass
     // start, and the post-release recheck closes the lost-wake window - the clear/fence/recheck gate.
     bool _drainSignal;
+
     Latch _advancing; // Held while a thread is currently the advancer. See Latch.cs for semantics.
     T _waiterRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
     TaskCompletionSource? _drainWakeupTcs; // Set by DrainOnCompletionAsync while waiting for the advancer chain to release and _waiters to empty. Signaled by callbacks at end-of-cycle so drain can re-check both conditions.
@@ -795,16 +796,19 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // During first escalation a slot callback can fire after the queue is published but
         // before the slot contents are moved into it, bumping completedCount without finding
         // anything to drain. Without this nudge the slot item would wait for the next callback
-        // fire, unbounded when the next item is a long-lived flow (exclusive scope, COPY, LISTEN).
-        if (slotWasMoved && Volatile.Read(ref _drainSignal) && _advancing.TryAcquire())
+        // fire, unbounded when the next item is a long-lived, long-running exclusive operation.
+        // Losing the acquire deposits the obligation on the holder (including a stale-verdict
+        // reclaim hold).
+        if (slotWasMoved && Volatile.Read(ref _drainSignal) && _advancing.TryAcquireOrFlagPending())
             DrainReadyWaiters();
     }
 
     /// Called when a waiter's pipeline task completes. Signals readiness and tries to become the advancer.
     void OnWaiterTaskCompleted()
     {
-        // Plain store: the TryAcquire below is the full fence that publishes it, pairing with
-        // the holder's fenced Release before its signal recheck (the Dekker halves).
+        // Plain store: the acquire RMW below is the full fence that publishes it. The flag
+        // keeps the materializing-token role (gates the nudge and the reclaim); the lost-wake
+        // hole the flag alone could not close now lives in the latch word.
         _drainSignal = true;
 
         // Try to become the advancer, only one thread processes completions at a time.
@@ -812,8 +816,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // us, and bailing out here would let drain "complete" the item via DrainOnCompletionAsync's
         // queue sweep while the body's pipeline task is still running, stranding the flow in a
         // half-completed state (ActivatedFlow cleared but body still reading).
-        if (!_advancing.TryAcquire())
+        if (!_advancing.TryAcquireOrFlagPending())
+        {
+            // Obligation deposited in the latch word; the holder's release serves it.
             return;
+        }
 
         DrainReadyWaiters();
     }
@@ -824,12 +831,15 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// callback functions as OnWaiterTaskCompleted and the standard advancer drains the queue.
     void OnCommittedTaskCompleted()
     {
-        // Plain store, published by the TryAcquire fence (see OnWaiterTaskCompleted).
+        // Plain store, published by the acquire RMW (see OnWaiterTaskCompleted).
         _drainSignal = true;
 
         // Process even during shutdown (see OnWaiterTaskCompleted).
-        if (!_advancing.TryAcquire())
+        if (!_advancing.TryAcquireOrFlagPending())
+        {
+            // Obligation deposited in the latch word; the holder's release serves it.
             return;
+        }
 
         if (_waiters.IsEscalated)
         {
@@ -859,8 +869,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
             // Slot already drained elsewhere. Shouldn't happen given single-callback wiring.
             // (No signal bookkeeping: a stale dirty flag costs one spurious reclaim check.)
-            _advancing.Release();
+            var serveDeposit = _advancing.ReleaseAndCheckPending();
             SignalDrainWakeupIfWaiting();
+            // A deposit during our hold transfers the obligation here; re-enter the claim
+            // loop to serve it. Losing the re-acquire re-deposits on the winner.
+            if (serveDeposit && _advancing.TryAcquireOrFlagPending())
+            {
+                continue;
+            }
             return;
         }
 
@@ -974,16 +990,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
         }
 
-        _advancing.Release();
+        // The slot path consumes a deposit at the release but delegates serving to the
+        // flag-driven reclaim below rather than re-acquiring directly: a deposit implies the
+        // depositor set _drainSignal during our hold, and nothing can consume that flag while
+        // we hold the latch (a pass-top clear requires the latch), so the reclaim's read
+        // finds it. Verified: Pipeline.tla SlotDrainerRelease (PendingWordLatch arm).
+        _advancing.ReleaseAndCheckPending();
         // Signal AFTER advancer release: prevents a WaitForEmptyAsync awaiter from resuming and
         // committing a new slot waiter whose callback would then race the still-held advancer
-        // (TryAcquire fails, callback bails, count stranded).
+        // (the callback's failed acquire deposits, costing the holder a serve pass).
         if (emptyReached)
             _depthState.OnDepthReachedZero();
         SignalDrainWakeupIfWaiting();
 
-        // Reclaim, mirroring the queue drain's do-while: a successor's waiter that completed
-        // while we held the advancer had its callback TryAcquire-fail and bail - with no
+        // Reclaim, mirroring the queue drain's tail: a successor's waiter that completed
+        // while we held the advancer had its callback deposit-and-bail - with no
         // reclaim the activation chain dies there (field signature: "Operation timed out
         // waiting for activation"). In non-escalated slot mode, a set drain signal implies
         // the bailed waiter IS the current slot occupant with a completed task (a commit
@@ -993,7 +1014,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // holds EventuallyCompleted and NoTripleActivation across the full state space).
         if (!_enumerator.CompletionToken.IsCancellationRequested
             && Volatile.Read(ref _drainSignal)
-            && _advancing.TryAcquire())
+            && _advancing.TryAcquireOrFlagPending())
         {
             if (_waiters.IsEscalated)
             {
@@ -1014,16 +1035,18 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     void DrainReadyWaiters()
     {
         var emptyReached = false;
-        do
+        while (true)
         {
             // Sub-pass start: consume the signal (full fence orders the clear before the pass's queue
             // reads). Completions firing mid-pass re-set it and the do-while's post-release recheck
             // catches them - the clear/fence/recheck gate.
             Interlocked.Exchange(ref _drainSignal, false);
+            var drainedAny = false;
 
             while (_waiters.TryPeek(out var item) && item.WaiterTask.IsCompleted)
             {
                 _waiters.TryDequeue(out _);
+                drainedAny = true;
 
                 // Process the completed waiter. The consume here already precedes this
                 // path's DecrementCount below - the queue drain has always had the
@@ -1119,11 +1142,42 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 }
             }
 
-            // Release latch, then re-check for late signals. Plain read of _drainSignal is
-            // safe: sandwiched between this release and TryReclaimAdvancerForWork's acquire,
-            // both full barriers via Latch's underlying Interlocked.Exchange.
-            _advancing.Release();
-        } while (!_enumerator.CompletionToken.IsCancellationRequested && _drainSignal && TryReclaimAdvancerForWork());
+            // SIGNAL CONSERVATION, count-gated: a pass that consumed the signal and dequeued nothing
+            // did not satisfy it - the signaled work is still materializing (the escalation's slot-to-
+            // queue move, or a commit between its enqueue and its increment) and was truthfully
+            // invisible to our peeks. Destroying the token here would let every later rescue (the
+            // one-shot nudge, the reclaim) read FALSE and decline, stranding completion. Restore before
+            // the release: the release's full fence publishes it, and the materializer's own tail check
+            // finds the token. The count gate kills the dangling restore - with no entry resident there
+            // is no materializer left to owe a token to, and an unconditional restore fed a
+            // reclaim-retry livelock.
+            if (!drainedAny && _waiters.Count > 0)
+            {
+                _drainSignal = true;
+            }
+
+            // The release Exchange consumes a deposited obligation atomically with releasing: a
+            // contended acquirer (callback, nudge, a sibling reclaim) that lost against our hold
+            // flagged the latch word instead of spending a one-shot wake against a recheck that
+            // already ran - the two-location strand the plain latch + flag protocol could not close.
+            // Deposit set means we are obligated: re-acquire and run another pass. Losing the
+            // re-acquire re-deposits on the winner, whose own release then serves - obligation
+            // transfer, no kernel wait.
+            if (_advancing.ReleaseAndCheckPending())
+            {
+                if (_advancing.TryAcquireOrFlagPending())
+                    continue;
+                break;
+            }
+
+            // No deposit consumed: re-check for late signals. The sandwich argument (release
+            // fence before, TryReclaim's acquire fence after) licenses a plain read here;
+            // Volatile.Read defeats JIT hoisting.
+            var recheck = !_enumerator.CompletionToken.IsCancellationRequested
+                && Volatile.Read(ref _drainSignal);
+            if (!recheck || !TryReclaimAdvancerForWork())
+                break;
+        }
 
         // Signal AFTER advancer release for the same reason as DrainSlotInline (external awaiter
         // must not resume while internal sync is still held).
@@ -1131,19 +1185,38 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             _depthState.OnDepthReachedZero();
         SignalDrainWakeupIfWaiting();
 
-        // Re-acquire the advancer latch and check for a ready waiter. Returns true with the latch
-        // held if there's work, false (latch released) otherwise. TryPeek MUST run inside the
+        // Re-acquire the advancer latch and check for a ready waiter. Returns true with the
+        // latch held if the pass should continue, false otherwise. TryPeek MUST run inside the
         // latch's protection so the SPSC single-consumer contract on _waiters holds against a
         // racing OnWaiterTaskCompleted caller.
         bool TryReclaimAdvancerForWork()
         {
-            if (!_advancing.TryAcquire())
+            // This transient hold was the June 2026 field strand (ring-trace-pinned, ~1/40k
+            // stress iterations): a callback's one-shot wake bailed against the hold while the
+            // miss path below released with no post-release rendezvous - signal set, latch
+            // free, completed entry resident, nobody left. The pending word closes it: a bail
+            // against this hold deposits in the latch word, and the miss release reads the
+            // deposit atomically with releasing and serves. Verified: Pipeline.tla
+            // PendingWordLatch (Pipeline_Contract.cfg green over the full state space;
+            // Pipeline_RecheckStrandWitness.cfg pins the unfixed strand).
+            if (!_advancing.TryAcquireOrFlagPending())
+            {
+                // Obligation deposited on the winner; its release serves.
                 return false;
+            }
 
             if (_waiters.TryPeek(out var pending) && pending.WaiterTask.IsCompleted)
+            {
                 return true;
+            }
 
-            _advancing.Release();
+            if (_advancing.ReleaseAndCheckPending())
+            {
+                // A bail landed against our transient hold after the peek's verdict went
+                // stale. Re-acquire and continue the pass; losing re-deposits on the winner.
+                if (_advancing.TryAcquireOrFlagPending())
+                    return true;
+            }
             return false;
         }
     }
@@ -1151,7 +1224,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// Returns true if the advancer should continue (recovery completed or no recovery),
     /// false if recovery is occupying this pipeline position (advancer must stop, recovery will resume knowing it held the advancer flag).
     /// <paramref name="emptyReached"/> propagates the deferred-empty signal up to the drain caller
-    /// on the sync return-true paths so it fires after _advancing.Release(). The async return-false
+    /// on the sync return-true paths so it fires after the advancer release. The async return-false
     /// path goes through the continuation chain which still uses CompleteRecoveryWaiter inline
     /// (residual race window, but DrainReadyWaiters' do-while reclaim downstream catches any
     /// stranded queue counts; slot-mode stranding from recovery is the case handled here).
@@ -1350,7 +1423,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _waiterRecoveryItem = default!;
         CompleteWaiter(recoveryItem, _completionException);
-        _advancing.Release();
+        // Shutdown bailout: a deposit consumed here is deliberately dropped - completion
+        // ownership has transferred to DrainOnCompletionAsync's queue sweep, which waits on
+        // advancer-idle (signaled below) and sweeps without consulting the signal flag.
+        _advancing.ReleaseAndCheckPending();
         SignalDrainWakeupIfWaiting();
     }
 

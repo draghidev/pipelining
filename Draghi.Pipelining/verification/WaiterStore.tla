@@ -131,8 +131,10 @@ StoreCommitCount(nextPhase) ==
   /\ storeCount' = storeCount + 1
   /\ escPhase' = nextPhase
   /\ escTail' = NoItem
-  /\ escSlotClaimed' = FALSE
-  /\ escMoved' = IF nextPhase = "compensate" THEN escMoved ELSE NoItem
+  \* escSlotClaimed (the code's slotWasMoved local) survives to the post-commit nudge check
+  \* (escPhase "nudge_check"); the nudge step clears it.
+  /\ escSlotClaimed' = (IF nextPhase \in {"compensate", "nudge_check"} THEN escSlotClaimed ELSE FALSE)
+  /\ escMoved' = (IF nextPhase = "compensate" THEN escMoved ELSE NoItem)
   /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters>>
 
 (* ===========================================================================
@@ -200,7 +202,8 @@ StoreEscalateEnqueueTail ==
 \* the deferred fields clear; the escalation call site returns to idle.
 StoreTakeMoved ==
   /\ escPhase = "compensate"
-  /\ escPhase' = "idle"
+  \* CommitWaiter's nudge check follows the compensation in code; route through it.
+  /\ escPhase' = "nudge_check"
   /\ escMoved' = NoItem
   /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount, escTail, escSlotClaimed>>
 
@@ -245,7 +248,7 @@ StoreTypeOK ==
   /\ slotItem \in Item \cup {NoItem}
   /\ escalated \in BOOLEAN
   /\ escPhase \in {"idle", "publish_done", "cas_done", "move_done", "esc_enqueued",
-                   "q_enq_act", "q_enq_noact", "compensate"}
+                   "q_enq_act", "q_enq_noact", "compensate", "nudge_check"}
   /\ escTail \in Item \cup {NoItem}
   /\ escSlotClaimed \in BOOLEAN
   /\ escMoved \in Item \cup {NoItem}
