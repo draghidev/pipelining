@@ -73,6 +73,7 @@ public class WaiterStoreConcurrencyTests
         {
             var box = new WaiterStoreBox<int>();
             var drained = new bool[perRound + 1];
+            var log = new List<string>(perRound);  // claimer-thread-only; visible after Join
             Exception? failure = null;
 
             var claimer = new Thread(() =>
@@ -84,12 +85,14 @@ public class WaiterStoreConcurrencyTests
                     {
                         if (box.TryClaimSlotForDrain(out var slotItem, out _))
                         {
+                            log.Add($"slot:{slotItem}");
                             Record(drained, slotItem);
                             box.DecrementCount();
                             count++;
                         }
                         else if (box.TryDequeue(out var entry))
                         {
+                            log.Add($"queue:{entry.Waiter}");
                             Record(drained, entry.Waiter);
                             box.DecrementCount();
                             count++;
@@ -104,14 +107,19 @@ public class WaiterStoreConcurrencyTests
             });
             claimer.Start();
 
+            var commitLog = new List<string>(perRound);
             for (var marker = 1; marker <= perRound; marker++)
-                box.TryEscalateOrEnqueue(marker, default, out _, out _);
+            {
+                box.TryEscalateOrEnqueue(marker, default, out var isSlot, out var slotWasMoved);
+                commitLog.Add($"{marker}:{(isSlot ? "slot" : "queue")}{(slotWasMoved ? "+moved" : "")}");
+            }
 
             claimer.Join();
+            var trace = $"commits=[{string.Join(",", commitLog)}] drains=[{string.Join(",", log)}] finalCount={box.Count}";
             if (failure is not null)
-                throw new AssertFailedException($"Escalation race failed at round {r}.", failure);
+                throw new AssertFailedException($"Escalation race failed at round {r}. {trace}", failure);
             for (var marker = 1; marker <= perRound; marker++)
-                Assert.IsTrue(drained[marker], $"Round {r}: marker {marker} was lost.");
+                Assert.IsTrue(drained[marker], $"Round {r}: marker {marker} was lost. {trace}");
         }
     }
 
