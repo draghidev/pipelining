@@ -621,6 +621,15 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (alreadyActivated && _activationLock is { } activationLock)
             lock (activationLock) { }
 
+        // Post-fence clear for the alreadyActivated case: the advancer (if it ever had the
+        // publish) finished its ActivateHeadItem behind the fence above, and any future C-path
+        // Exchange win requires a fresh publish that rewrites _executingItem first - nothing
+        // reads the current value anymore. Without this the inline-activated case (no publish,
+        // so the Exchange above "loses" vacuously and the !alreadyActivated clear is skipped)
+        // strands the committed item in _executingItem across the whole idle period.
+        if (alreadyActivated && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            _executingItem = default!;
+
         if (task.IsCompleted)
         {
             if (task.IsCompletedSuccessfully)
@@ -752,6 +761,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 _executingItem = default!;
             if (alreadyActivated && !recoveryActivated && _activationLock is { } activationLock)
                 lock (activationLock) { }
+            // Post-fence clear, mirroring CommitTailWaiter: the inline-activated case never
+            // published, so the Exchange "loses" vacuously and the clear above is skipped -
+            // without this the recovery item strands in _executingItem across the idle period.
+            if (alreadyActivated && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                _executingItem = default!;
             Volatile.Write(ref _hasInFlightItem, false);
             CommitWaiter(recoveryItem, activated: alreadyActivated, GuardRecoveryTask(pipelineTask));
         }

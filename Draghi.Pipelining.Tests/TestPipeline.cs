@@ -44,8 +44,16 @@ sealed class TestPipelineItem
     public System.Threading.Tasks.Sources.IValueTaskSource? TrailingTaskSource { get; init; }
     public Action? OnComplete { get; init; }
 
+    // The shutdown-settle registration (TestPipelinePolicy.ExecuteItemAsync) parks this item in
+    // the enumerator CTS's callback list; released on completion so the CTS doesn't root every
+    // completed item for the pipeline's lifetime (the Idle_* retention guards watch for that).
+    CancellationTokenRegistration _shutdownRegistration;
+    public void AttachShutdownRegistration(CancellationTokenRegistration registration)
+        => _shutdownRegistration = registration;
+
     public void Complete(Exception? exception)
     {
+        _shutdownRegistration.Dispose();
         Exception = exception;
         IsCompleted = true;
         OnComplete?.Invoke();
@@ -208,8 +216,8 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
         // walk; the pipeline's signal to items is this token). Without it a pending item
         // legitimately blocks CompleteAsync forever.
         if (item.CompleteAsync && cancellationToken.CanBeCanceled)
-            cancellationToken.UnsafeRegister(
-                static (state, token) => ((TestPipelineItem)state!).TryCancelPipelineTask(token), item);
+            item.AttachShutdownRegistration(cancellationToken.UnsafeRegister(
+                static (state, token) => ((TestPipelineItem)state!).TryCancelPipelineTask(token), item));
 
         var task = item.GetExecuteTask();
         item.SignalExecuted();

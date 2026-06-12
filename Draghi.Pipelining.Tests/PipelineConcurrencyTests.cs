@@ -1124,7 +1124,8 @@ public class PipelineConcurrencyTests
 
         WeakReference? itemRef = null;
         Action? completer = null;
-        EnqueueTailWaiterItem(pipeline, ref itemRef, ref completer);
+        var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        EnqueueTailWaiterItem(pipeline, completed, ref itemRef, ref completer);
 
         // Wait for executor to suspend (pre-idle CommitTailWaiter has run, item is in _waiters).
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -1132,23 +1133,36 @@ public class PipelineConcurrencyTests
         // Drain via the captured completer. Null both refs after firing so nothing external pins.
         completer!();
         completer = null;
-        await Task.Delay(50);  // let advancer drain + CompleteItem fire
+        // Deterministic barrier: CompleteItem fired (the OnComplete hook holds the TCS, never
+        // the item), so the only residual roots are transient (drain-thread stack slots).
+        await completed.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        for (var i = 0; i < 3; i++)
+        Assert.IsNotNull(itemRef);
+        // Bounded retry: transient stack rooting settles within a few rounds; a REAL retention
+        // (a pipeline field holding the item) never dies, so the guard keeps its teeth.
+        await AssertDiesAsync(itemRef,
+            "Item still alive after pipeline drained — committed tail not cleared (_tailWaiter / _executingItem).");
+    }
+
+    /// Forces a few gen2 collections, retrying while the reference is alive (transient stack
+    /// rooting on freshly parked threads settles; structural retention never does).
+    static async Task AssertDiesAsync(WeakReference reference, string message)
+    {
+        for (var attempt = 0; attempt < 20; attempt++)
         {
             GC.Collect(2, GCCollectionMode.Forced);
             GC.WaitForPendingFinalizers();
+            if (!reference.IsAlive)
+                return;
+            await Task.Delay(25);
         }
-
-        Assert.IsNotNull(itemRef);
-        Assert.IsFalse(itemRef.IsAlive,
-            "Item still alive after pipeline drained — _tailWaiter slot not cleared on commit-to-waiters.");
+        Assert.IsFalse(reference.IsAlive, message);
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    static void EnqueueTailWaiterItem(ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline, ref WeakReference? itemRef, ref Action? completer)
+    static void EnqueueTailWaiterItem(ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TaskCompletionSource completed, ref WeakReference? itemRef, ref Action? completer)
     {
-        var item = new TestPipelineItem { CompleteAsync = true };
+        var item = new TestPipelineItem { CompleteAsync = true, OnComplete = completed.SetResult };
         itemRef = new WeakReference(item);
         completer = item.CompletePipelineTask;
         pipeline.Enqueue(item).Execute();
@@ -1169,40 +1183,37 @@ public class PipelineConcurrencyTests
         WeakReference? waiterRef = null;
         WeakReference? deferredRef = null;
         Action? waiterCompleter = null;
-        EnqueueDeferredScenario(pipeline, ref waiterRef, ref deferredRef, ref waiterCompleter);
+        var waiterCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        EnqueueDeferredScenario(pipeline, waiterCompleted, ref waiterRef, ref deferredRef, ref waiterCompleter);
 
         // Wait for executor to suspend. By this point: waiter is in _waiters, deferred item has been
         // dequeued through the deferred-publish path, sync-completed, ClearExecutingItem ran.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Drain the waiter so it leaves _waiters too, then drop the completer ref.
+        // Drain the waiter so it leaves _waiters too, then drop the completer ref. The barrier
+        // TCS lives in the OnComplete hook, which never roots the item.
         waiterCompleter!();
         waiterCompleter = null;
-        await Task.Delay(50);
-
-        for (var i = 0; i < 3; i++)
-        {
-            GC.Collect(2, GCCollectionMode.Forced);
-            GC.WaitForPendingFinalizers();
-        }
+        await waiterCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.IsNotNull(waiterRef);
-        Assert.IsFalse(waiterRef.IsAlive, "Waiter item leaked after drain.");
+        await AssertDiesAsync(waiterRef, "Waiter item leaked after drain.");
         Assert.IsNotNull(deferredRef);
-        Assert.IsFalse(deferredRef.IsAlive,
+        await AssertDiesAsync(deferredRef,
             "Deferred item leaked — _executingItem slot not cleared in ClearExecutingItem's race-win branch.");
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
     static void EnqueueDeferredScenario(
         ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline,
+        TaskCompletionSource waiterCompleted,
         ref WeakReference? waiterRef,
         ref WeakReference? deferredRef,
         ref Action? waiterCompleter)
     {
         // Waiter (CompleteAsync) lands in _waiters first. The next item then takes the deferred path
         // because waiterQueueCount > 0 when it's dequeued.
-        var waiter = new TestPipelineItem { CompleteAsync = true };
+        var waiter = new TestPipelineItem { CompleteAsync = true, OnComplete = waiterCompleted.SetResult };
         var deferred = new TestPipelineItem();  // sync success, hits ClearExecutingItem's race-win
         waiterRef = new WeakReference(waiter);
         deferredRef = new WeakReference(deferred);
