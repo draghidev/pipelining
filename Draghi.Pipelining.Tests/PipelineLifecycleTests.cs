@@ -41,7 +41,7 @@ public class PipelineLifecycleTests
     }
 
     /// CompletionToken is also observable from OnExecutionIdleAsync. A policy that uses idle
-    /// time for housekeeping (or just parks on a cancellable wait) should unblock on shutdown.
+    /// time for housekeeping (or just suspends on a cancellable wait) should unblock on shutdown.
     [TestMethod]
     [Ignore("Source-vantage divergence: the OCE-faults-CompleteAsync half can no longer be reproduced. " +
         "The idle hook now fires inside MoveNextAsync, and the executor's main-loop catch " +
@@ -53,7 +53,7 @@ public class PipelineLifecycleTests
     public async Task CompleteAsync_SignalsCompletionTokenObservedByIdle()
     {
         var idleObservedCancellation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        // The source's onIdle hook parks on the completion token and rethrows the cancellation,
+        // The source's onIdle hook waits on the completion token and rethrows the cancellation,
         // mirroring a policy that used idle time for a cancellable wait. The throw propagates out
         // of MoveNextAsync so CompleteAsync's task faults (old OnExecutionIdleAsync semantics).
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
@@ -64,8 +64,8 @@ public class PipelineLifecycleTests
                 catch (OperationCanceledException) { idleObservedCancellation.TrySetResult(); throw; }
             });
 
-        // Enqueue an item to push the executor past the cold park into the post-batch idle hook.
-        // Without this, the executor parks at the wake signal without ever firing onIdle.
+        // Enqueue an item to push the executor past the cold wait into the post-batch idle hook.
+        // Without this, the executor suspends at the wake signal without ever firing onIdle.
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
         await item.WaitForCompleteAsync();
@@ -115,7 +115,7 @@ public class PipelineLifecycleTests
             new(runEnqueueAsynchronously: true),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
 
-        // Phase 1: enqueue async items + wait for executor to park. These end up in _waiters.
+        // Phase 1: enqueue async items + wait for the executor to suspend. These end up in _waiters.
         var waitersItems = new TestPipelineItem[3];
         for (var i = 0; i < waitersItems.Length; i++)
         {
@@ -125,7 +125,7 @@ public class PipelineLifecycleTests
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Phase 2: enqueue more items WITHOUT calling Execute. They sit in the source queue with the
-        // executor parked. CompleteAsync = true so they register the shutdown-token escalation: when
+        // executor suspended. CompleteAsync = true so they register the shutdown-token escalation: when
         // CompleteAsync wakes the executor, the source's drain-first MoveNextAsync still hands these
         // queued items back, the executor runs them, and the cancelled token settles them via OCE.
         var queueItems = new TestPipelineItem[3];

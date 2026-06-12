@@ -63,7 +63,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// <summary>Returns a struct enumerator that the pipeline drives via <c>await foreach</c>.</summary>
     /// <remarks>
     /// Registers a callback on <paramref name="cancellationToken"/> that completes the wake signal,
-    /// ensuring that consumer cancellation propagates to a parked MoveNextAsync. Without this,
+    /// ensuring that consumer cancellation propagates to a waiting MoveNextAsync. Without this,
     /// the enumerator would wait forever on the wake signal while the pipeline considers itself
     /// shut down.
     /// </remarks>
@@ -87,7 +87,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         public readonly CancellationToken CancellationToken;
 
         // The active enumeration's combined (source + per-call) token, published by the enumerator
-        // at construction. The park path reads it to translate cancellation into a completed
+        // at construction. The wait path reads it to translate cancellation into a completed
         // result, matching the WakeSignal.IsCompleted check.
         public CancellationToken EnumerationToken;
 

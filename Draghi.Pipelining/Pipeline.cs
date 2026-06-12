@@ -207,7 +207,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // source returns false once its queue is empty and its wake signal is completed.
             while (true)
             {
-                // Commit the previous iteration's pending tail to the waiter queue BEFORE parking
+                // Commit the previous iteration's pending tail to the waiter queue BEFORE waiting
                 // on MoveNextAsync. If the source has nothing more to yield, the tail would
                 // otherwise sit in _tailWaiter forever with no UnsafeOnCompleted callback wired,
                 // and a producer that completes its pipeline task would have nobody listening.
@@ -217,7 +217,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 if (commitWork is not null)
                 {
                     // Cold suspension (trailing recovery): clear the per-item locals first, same
-                    // retention rationale as the park-path clear below.
+                    // retention rationale as the wait-path clear below.
                     if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                         item = default!;
                     itemResult = default;
@@ -1597,7 +1597,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     _phase = 1;
                     // Visibility-only window: the in-flight item is held on _executingItem before
                     // being committed elsewhere. Without yielding it here, heartbeat-style
-                    // consumers can't see the flow during dispatch (parked-body abort propagation
+                    // consumers can't see the flow during dispatch (waiting-body abort propagation
                     // needs this). Volatile.Read pairs with the executor's Volatile.Write on
                     // _hasInFlightItem.
                     if (Volatile.Read(ref _pipeline._hasInFlightItem) && _pipeline._executingItem is { } inFlight)

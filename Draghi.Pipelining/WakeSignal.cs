@@ -11,13 +11,13 @@ public enum WakeOutcome
     GotItem,
     /// The source is completed/cancelled and drained. Complete the pull with false.
     Completed,
-    /// Nothing available; park until the next Signal, then re-resolve.
-    Park,
+    /// Nothing available; wait until the next Signal, then re-resolve.
+    Wait,
 }
 
 /// <summary>
 /// Single-producer single-consumer wake signal and rendezvous for a pipeline source's pull. Owns
-/// the entire park lifecycle: the wake lock, the value-task source backing a parked pull, the
+/// the entire wait lifecycle: the wake lock, the value-task source backing a waiting pull, the
 /// re-resolve-on-wake loop, and the scheduler-vs-inline dispatch of the wake. A source supplies a
 /// resolver (its dequeue, run under the wake lock) and calls <see cref="Signal()"/> when it makes
 /// an item visible.
@@ -26,7 +26,7 @@ public enum WakeOutcome
 /// The source's pull collapses to <c>=&gt; _wake.Rendezvous(_resolve)</c>: a pull that finds an item
 /// (or observes completion) returns an already-completed <see cref="ValueTask{TResult}"/> with no
 /// state-machine box, no ExecutionContext capture, and none of the per-invocation save/restore an
-/// async method pays. Only an actual park hands out an <see cref="IValueTaskSource{TResult}"/>-backed
+/// async method pays. Only an actual wait hands out an <see cref="IValueTaskSource{TResult}"/>-backed
 /// task; the wake re-resolves and completes it.
 /// <para>
 /// A spinlock guards the rendezvous because the critical section is a few field reads/writes with at
@@ -50,16 +50,16 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     int _wakeLock;
     // ManualResetValueTaskSourceCore on purpose: a bespoke single-consumer core (continuation
     // field as the whole state machine, sentinel for completed-before-registered, no version/
-    // status bookkeeping) was built and MEASURED SLOWER on the park shape - 88.0ns vs 83.6ns
+    // status bookkeeping) was built and MEASURED SLOWER on the wait-per-item shape - 88.0ns vs 83.6ns
     // with MRVTSC, even with the no-RMW plain-read fast path on the completion side. The
     // runtime's tuned core wins; don't re-litigate without numbers.
     ManualResetValueTaskSourceCore<bool> _core;
-    // Park-protocol continuation (TryMoveNext/ParkAsync sources): a bare delegate the wake
+    // Wait-protocol continuation (TryGetNext/WaitForNextAsync sources): a bare delegate the wake
     // invokes directly, no value-task source in between. Cached across cycles (the async-method
-    // builder reuses the box's action), so the ReferenceEquals in ParkOnCompleted skips the
-    // write after the first park. A signal instance serves exactly one source, which uses
-    // exactly one protocol: _resolve set = rendezvous protocol, _resolve null = park protocol.
-    Action? _parkContinuation;
+    // builder reuses the box's action), so the ReferenceEquals in WaitOnCompleted skips the
+    // write after the first wait. A signal instance serves exactly one source, which uses
+    // exactly one protocol: _resolve set = rendezvous protocol, _resolve null = wait protocol.
+    Action? _waitContinuation;
 
     public PipelineScheduler Scheduler { get; } = scheduler;
     public CancellationToken CompletionToken => _cts.Token;
@@ -85,22 +85,22 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
 
     /// <summary>
     /// Drives one pull. The resolver runs under the wake lock; on a synchronous outcome the returned
-    /// task is already completed (no box). On Park the returned task completes when the next Signal
+    /// task is already completed (no box). On Wait the returned task completes when the next Signal
     /// re-resolves to GotItem/Completed. The resolver is expected to be a cached delegate on the
     /// source's state, so this allocates nothing on the hot path.
     /// </summary>
     /// <param name="resolveUnderLock">The source's dequeue, invoked under the wake lock. Sets the
     /// source's Current and returns GotItem, observes completion and returns Completed, or returns
-    /// Park when nothing is available.</param>
-    /// <param name="onPark">
-    /// Optional async work to run each time the pull parks (e.g. an idle-flush, or a test
+    /// Wait when nothing is available.</param>
+    /// <param name="onWaiting">
+    /// Optional async work to run each time the pull waits (e.g. an idle-flush, or a test
     /// observation hook). Runs OUTSIDE the wake lock and AFTER <c>_pending</c> is armed: it is user
     /// code that may re-enqueue (which takes the wake lock and Signals), so it must not run under the
-    /// lock, and a re-enqueue from it must find the park already armed so its Signal wakes this very
-    /// pull. Supplying a hook makes only the PARK path async; the dequeue-hit fast path stays
+    /// lock, and a re-enqueue from it must find the wait already armed so its Signal wakes this very
+    /// pull. Supplying a hook makes only the WAIT path async; the dequeue-hit fast path stays
     /// zero-box. Pure sources pass none and never box.
     /// </param>
-    public ValueTask<bool> Rendezvous(Func<WakeOutcome> resolveUnderLock, Func<ValueTask>? onPark = null)
+    public ValueTask<bool> Rendezvous(Func<WakeOutcome> resolveUnderLock, Func<ValueTask>? onWaiting = null)
     {
         _resolve = resolveUnderLock;
         switch (Pump())
@@ -110,24 +110,24 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             case WakeOutcome.Completed:
                 return new ValueTask<bool>(false);
             default:
-                return onPark is null
+                return onWaiting is null
                     ? new ValueTask<bool>(this, _core.Version)
-                    : AwaitPark(onPark);
+                    : AwaitWaiting(onWaiting);
         }
     }
 
-    // One resolve attempt under the wake lock. The lock spans the resolve through the park-arm so an
+    // One resolve attempt under the wake lock. The lock spans the resolve through the wait-arm so an
     // Enqueue+Signal racing in between cannot be lost: a producer must take the lock to Signal, and
     // by then either our resolve already took the item or we have armed _pending.
     //
-    // The value-task core is never touched here: GetResult resets it after each consumed park
+    // The value-task core is never touched here: GetResult resets it after each consumed wait
     // (the canonical resettable-VTS pattern), so by the time any pull re-arms, the core already
     // carries the next version. Synchronous outcomes never touch the core at all.
     WakeOutcome Pump()
     {
         AcquireWakeLock();
         var outcome = _resolve!();
-        if (outcome != WakeOutcome.Park)
+        if (outcome != WakeOutcome.Wait)
         {
             ReleaseWakeLock();
             return outcome;
@@ -135,18 +135,18 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
 
         _pending = true;
         ReleaseWakeLock();
-        return WakeOutcome.Park;
+        return WakeOutcome.Wait;
     }
 
-    // Park path with an async hook. _pending is already armed (see Pump), so a re-enqueue from the
-    // hook will Signal this park. Run the hook, then await the value task the wake completes. The
+    // Wait path with an async hook. _pending is already armed (see Pump), so a re-enqueue from the
+    // hook will Signal this wait. Run the hook, then await the value task the wake completes. The
     // hook running before the await is deliberate: the core stores a result set before its
     // continuation is registered, so a reentrant wake during the hook is not lost. A throwing hook
     // propagates out of MoveNextAsync, faulting the executor (matching the old
     // OnExecutionIdleAsync semantics).
-    async ValueTask<bool> AwaitPark(Func<ValueTask> onPark)
+    async ValueTask<bool> AwaitWaiting(Func<ValueTask> onWaiting)
     {
-        await onPark().ConfigureAwait(false);
+        await onWaiting().ConfigureAwait(false);
         return await new ValueTask<bool>(this, _core.Version).ConfigureAwait(false);
     }
 
@@ -169,8 +169,8 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     /// </summary>
     public void WaitOnCompleted(Action continuation)
     {
-        if (!ReferenceEquals(_parkContinuation, continuation))
-            _parkContinuation = continuation;
+        if (!ReferenceEquals(_waitContinuation, continuation))
+            _waitContinuation = continuation;
         ReleaseWakeLock();
 
         if (IsCompleted)
@@ -184,13 +184,13 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     /// the consumer's continuation runs inline on the calling thread (the call site takes over the
     /// executor for one turn). Use when a producer chooses dispatch per item.
     /// </summary>
-    /// <returns><c>true</c> if a parked pull was claimed and woken, <c>false</c> if no one was
+    /// <returns><c>true</c> if a waiting pull was claimed and woken, <c>false</c> if no one was
     /// waiting (the signal was a no-op).</returns>
     public bool Signal(bool runContinuationsAsynchronously) => SignalCore(runContinuationsAsynchronously);
 
     bool SignalCore(bool runContinuationsAsynchronously)
     {
-        // Park protocol: claim and dispatch the bare continuation directly. The lock-through-
+        // Wait protocol: claim and dispatch the bare continuation directly. The lock-through-
         // OnCompleted discipline guarantees the continuation is stored before _pending can be
         // claimed (a Signal blocks on the lock until registration released it).
         if (_resolve is null)
@@ -210,7 +210,7 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             if (runContinuationsAsynchronously)
                 Scheduler.SubmitDetached(this, preferLocal: true);
             else
-                _parkContinuation!();
+                _waitContinuation!();
             return true;
         }
 
@@ -248,7 +248,7 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             _pending = false;
 
             outcome = _resolve!();
-            if (outcome == WakeOutcome.Park)
+            if (outcome == WakeOutcome.Wait)
                 _pending = true;  // spurious wake: re-arm under the same hold
         }
         finally
@@ -256,7 +256,7 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             ReleaseWakeLock();
         }
 
-        if (outcome != WakeOutcome.Park)
+        if (outcome != WakeOutcome.Wait)
             SetResultCore(outcome == WakeOutcome.GotItem);
         return true;
     }
@@ -264,7 +264,7 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     void IThreadPoolWorkItem.Execute()
     {
         if (_resolve is null)
-            _parkContinuation!();
+            _waitContinuation!();
         else
             OnWake();
     }
@@ -281,11 +281,11 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             case WakeOutcome.Completed:
                 SetResultCore(false);
                 break;
-            // Park: spurious wake, _pending re-armed, nothing to complete.
+            // Wait: spurious wake, _pending re-armed, nothing to complete.
         }
     }
 
-    /// <summary>Marks the source completed and wakes any parked pull.</summary>
+    /// <summary>Marks the source completed and wakes any waiting pull.</summary>
     public void Complete()
     {
         _cts.Cancel();
@@ -297,8 +297,8 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     bool IValueTaskSource<bool>.GetResult(short token)
     {
         var result = _core.GetResult(token);
-        // Canonical resettable-VTS pattern: the consumer observes a park's result exactly once, so
-        // resetting here readies the core for the next park - on the resume path, outside the wake
+        // Canonical resettable-VTS pattern: the consumer observes a wait's result exactly once, so
+        // resetting here readies the core for the next wait - on the resume path, outside the wake
         // lock, and race-free (no Signal can target the core again until the next Pump arms
         // _pending, which happens-after this pull returns). Synchronous pulls never touch the core.
         _core.Reset();

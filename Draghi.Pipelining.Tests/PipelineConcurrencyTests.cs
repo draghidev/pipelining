@@ -147,7 +147,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task PipelinedCompletionOrder()
     {
-        // Wait for executor to park before completing tasks so all items are in _waiters with
+        // Wait for executor to suspend before completing tasks so all items are in _waiters with
         // callbacks registered. Otherwise items still at _tailWaiter get completed via the
         // executor's CommitTailWaiter sync-success path, breaking the FIFO completion order.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -354,7 +354,7 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task ConcurrentWaiterCompletions()
     {
-        // Wait for executor to park (all items committed to _waiters via pre-idle commit) before
+        // Wait for executor to suspend (all items committed to _waiters via pre-idle commit) before
         // completing tasks. Otherwise some items are still at _tailWaiter when CompletePipelineTask
         // fires, and executor's CommitTailWaiter handles them via sync-success branch instead of the
         // advancer path - mixed routing that pulls the test away from what it's supposed to exercise.
@@ -510,7 +510,7 @@ public class PipelineConcurrencyTests
         await a.WaitForExecutedAsync();
 
         // B: async pipeline + async trailing. Goes through deferred path (A is waiter, count>0)
-        // and parks the executor at await trailing. This is the key difference from the
+        // and suspends the executor at await trailing. This is the key difference from the
         // ClearExecutingItem test - B's pipeline is pending so it becomes _tailWaiter, and
         // tail-commit (not inline ClearExecutingItem) is the path that races the advancer.
         var b = new ActivationOrderingItem { PipelineTaskAsync = true, HasTrailingTaskAsync = true };
@@ -947,18 +947,18 @@ public class PipelineConcurrencyTests
             {
                 var diagnosis = $"iter {iter}: hang - idleTask={idleTask.Status}, completeTask={completeTask.Status}, " +
                     $"item completed={item.IsCompleted}, depth={pipeline.Depth}";
-                // Park instead of failing when a debugger/dump harness wants the live state
-                // (DRAGHI_STRESS_PARK_ON_HANG=1): the hang's async graph is the evidence and
+                // Suspend instead of failing when a debugger/dump harness wants the live state
+                // (DRAGHI_STRESS_WAIT_ON_HANG=1): the hang's async graph is the evidence and
                 // Assert.Fail would tear it down.
-                if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_PARK_ON_HANG") == "1")
+                if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_WAIT_ON_HANG") == "1")
                 {
-                    // Shed the accumulated per-iteration garbage so a dump of the parked
+                    // Shed the accumulated per-iteration garbage so a dump of the suspended
                     // process contains only the hang's live object graph (a full heap of
                     // dead pipelines makes dumpasync's walk take tens of minutes).
                     GC.Collect(2, GCCollectionMode.Forced);
                     GC.WaitForPendingFinalizers();
                     GC.Collect(2, GCCollectionMode.Forced);
-                    Console.WriteLine($"PARKED: {diagnosis}");
+                    Console.WriteLine($"SUSPENDED: {diagnosis}");
                     await Task.Delay(Timeout.Infinite);
                 }
                 Assert.Fail(diagnosis);
@@ -975,7 +975,7 @@ public class PipelineConcurrencyTests
     /// enqueue still sees waiters present (the deferred-activation branch). Iterations via
     /// DRAGHI_STRESS_ITERATIONS (default 200); on a hang it reports WHICH stage stuck plus
     /// every item's executed/completed state - the localizing facts a bare timeout hides.
-    /// DRAGHI_STRESS_PARK_ON_HANG=1 parks (after a GC shed) for live dump capture.
+    /// DRAGHI_STRESS_WAIT_ON_HANG=1 suspends (after a GC shed) for live dump capture.
     [TestMethod]
     public async Task DeferredActivationUnderSustainedLoad_Stress()
     {
@@ -1036,14 +1036,14 @@ public class PipelineConcurrencyTests
                 states.Append(item.IsExecuted ? 'E' : 'e').Append(item.IsCompleted ? 'C' : 'c').Append(',');
             var diagnosis = $"iter {iter}: hang at {stage} - depth={pipeline.Depth}, pile=[{states}] " +
                 $"tail={(tail is null ? "-" : $"{(tail.IsExecuted ? "E" : "e")}{(tail.IsCompleted ? "C" : "c")}")}";
-            if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_PARK_ON_HANG") == "1")
+            if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_WAIT_ON_HANG") == "1")
             {
-                // Shed accumulated per-iteration garbage so a dump of the parked process
+                // Shed accumulated per-iteration garbage so a dump of the suspended process
                 // contains only the hang's live object graph.
                 GC.Collect(2, GCCollectionMode.Forced);
                 GC.WaitForPendingFinalizers();
                 GC.Collect(2, GCCollectionMode.Forced);
-                Console.WriteLine($"PARKED: {diagnosis}");
+                Console.WriteLine($"SUSPENDED: {diagnosis}");
                 await Task.Delay(Timeout.Infinite);
             }
             Assert.Fail(diagnosis);
@@ -1064,8 +1064,8 @@ public class PipelineConcurrencyTests
         var idleCanReturn = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         WeakReference? itemRef = null;
 
-        // The source onIdle hook gates the executor at the park: it signals idleEntered, then blocks
-        // on idleCanReturn before letting MoveNextAsync park. GC is forced while the executor is held
+        // The source onIdle hook gates the executor at the wait: it signals idleEntered, then blocks
+        // on idleCanReturn before letting MoveNextAsync suspend. GC is forced while the executor is held
         // at the suspension point, so the assertion observes whether the last-processed item is still
         // rooted by the executor's state-machine box across idle.
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
@@ -1126,7 +1126,7 @@ public class PipelineConcurrencyTests
         Action? completer = null;
         EnqueueTailWaiterItem(pipeline, ref itemRef, ref completer);
 
-        // Wait for executor to park (pre-idle CommitTailWaiter has run, item is in _waiters).
+        // Wait for executor to suspend (pre-idle CommitTailWaiter has run, item is in _waiters).
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Drain via the captured completer. Null both refs after firing so nothing external pins.
@@ -1171,7 +1171,7 @@ public class PipelineConcurrencyTests
         Action? waiterCompleter = null;
         EnqueueDeferredScenario(pipeline, ref waiterRef, ref deferredRef, ref waiterCompleter);
 
-        // Wait for executor to park. By this point: waiter is in _waiters, deferred item has been
+        // Wait for executor to suspend. By this point: waiter is in _waiters, deferred item has been
         // dequeued through the deferred-publish path, sync-completed, ClearExecutingItem ran.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 

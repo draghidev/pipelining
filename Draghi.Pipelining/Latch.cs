@@ -20,7 +20,7 @@ namespace Draghi.Pipelining;
 ///     it, re-acquires, and serves) or after it (the depositor's CAS sees free and wins the
 ///     latch itself). The lost-wake window is gone by construction.
 ///
-/// There are no waiter semantics: nobody parks, the pending bit carries no identity or
+/// There are no waiter semantics: nobody waits, the pending bit carries no identity or
 /// count. It is one bit of "somebody bailed against this hold", and a spurious serve pass
 /// costs one no-op drain probe.
 ///

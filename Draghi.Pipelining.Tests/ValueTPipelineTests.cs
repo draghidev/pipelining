@@ -35,7 +35,7 @@ public class ValueTPipelineTests
     }
 
     /// Enumeration with value-type T. Exercises the Enumerator's reads of _tailWaiter / _waiters
-    /// for value-T (no GC barrier on the ref write side). After executor parks, all items should
+    /// for value-T (no GC barrier on the ref write side). After the executor suspends, all items should
     /// be observable via the enumerator in enqueue order.
     [TestMethod]
     public async Task ValueTypeT_EnumeratorYieldsAllItems()
@@ -154,7 +154,7 @@ public class ValueTPipelineTests
             pipeline.Enqueue(new ValueItem(ids[i])).Execute();
         }
 
-        // Wait until executor parks (all items in _waiters with callbacks registered).
+        // Wait until the executor suspends (all items in _waiters with callbacks registered).
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Complete pipeline tasks in order.

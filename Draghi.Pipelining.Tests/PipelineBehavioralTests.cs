@@ -278,7 +278,7 @@ public class PipelineBehavioralTests
 
     /// Reentrant Enqueue from OnExecutionIdleAsync. The "refill a batch" pattern: idle hook
     /// enqueues the next batch, executor picks it up on the outer loop's next iteration without
-    /// parking (queue is non-empty). Gated by a counter to avoid infinite refilling.
+    /// waiting (queue is non-empty). Gated by a counter to avoid infinite refilling.
     [TestMethod]
     public async Task ReentrantEnqueueFromOnExecutionIdleAsync_RefillsBatchUntilGated()
     {

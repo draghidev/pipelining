@@ -29,7 +29,7 @@ sealed class TestPipelineItem
     public bool IsCompleted { get; private set; }
     public bool IsExecuted => _executed.IsSet;
 
-    // Non-asserting waits for stress runners that own their timeout/diagnosis/park handling.
+    // Non-asserting waits for stress runners that own their timeout/diagnosis/suspend handling.
     public bool TryWaitForExecuted(TimeSpan timeout) => _executed.Wait(timeout);
     public bool TryWaitForCompleted(TimeSpan timeout) => _completed.Wait(timeout);
     public Exception? ThrowOnExecute { get; init; }
@@ -197,7 +197,7 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
             throw ex;
 
         // The flow-side escalation half of the shutdown design: the pipeline only drains
-        // gracefully, and items are responsible for settling their own parked sources when
+        // gracefully, and items are responsible for settling their own waiting sources when
         // the shutdown signal fires (the real protocol does this via the heartbeat abort
         // walk; the pipeline's signal to items is this token). Without it a pending item
         // legitimately blocks CompleteAsync forever.

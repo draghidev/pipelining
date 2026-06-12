@@ -19,7 +19,7 @@ namespace Draghi.Pipelining;
 /// tasks are first-class and flow through <see cref="TryRecoverItemFailure"/>. That is the
 /// supported way to surface failure from an item.
 /// <para>
-/// Production-side concerns (when items arrive, how the executor parks while waiting, dispatch
+/// Production-side concerns (when items arrive, how the executor suspends while waiting, dispatch
 /// scheduling between enqueue and execute) live on the source, not the policy. The policy is
 /// purely about what to do with each item as it flows through the pipeline.
 /// </para>
