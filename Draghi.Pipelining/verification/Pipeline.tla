@@ -493,8 +493,18 @@ vars == <<loc, taskDone, activations, callbackFired, failed,
 \* InSlotPending: the slot commit's CAS landed but the field writes haven't (SplitSlotFieldOps;
 \* the slot-tier mirror of InWaitersPending). The slot is claimable in this state - a claim
 \* Exchange here reads the previous tenure's cleared fields (NoDefaultSlotClaim's window).
+\* RecoveringInline: a DRAIN-side park (the drain's GetResult faulted on a committed waiter;
+\* RecoverWaiter on the advancer thread). Distinct from "Recovering" (executor-side parks)
+\* because the two recovery lifecycles diverge in code: the executor-side substitute mirrors
+\* the main loop (deferred publish / tail / CommitTailWaiter, Pipeline.cs RecoverItem ~536),
+\* while the drain-side substitute is activated unconditionally and completes IN PLACE under
+\* the held advancer latch (RecoverWaiter ~1418 -> CompleteRecoveryWaiter) - it NEVER enters
+\* the store. Funneling drain-side substitutes through the shared tail/commit/store actions
+\* let TLC manufacture code-impossible double activations (the inline-activated substitute
+\* re-activated by the store's wasEmpty/D-path arms once it queued behind a live successor).
 Locations == {"Nowhere", "Executing", "InTail", "InSlot", "InSlotPending", "InEscalation",
-              "InWaitersPending", "InWaiters", "Recovering", "Draining", "Completed"}
+              "InWaitersPending", "InWaiters", "Recovering", "RecoveringInline", "Draining",
+              "Completed"}
 
 (* ===========================================================================
    Init
@@ -642,9 +652,20 @@ SourceYieldDeferred ==
                  taskDone, activations, callbackFired, failed, waiters, esc_vars, drainer_vars>>
 
 \* Executor stores item as tail after ExecuteItemAsync returns (async pipelineTask).
+\* ~hasTail: _tailWaiter is a single executor-owned cell, written only after the previous
+\* tail's CommitTailWaiter consumed it (top-of-loop ordering). Vacuous while only one item
+\* can be Executing; load-bearing under RecoverySplit, where a drain-side park's substitute
+\* and the executor's own item are concurrently Executing - without it a second SetTail
+\* would overwrite (orphan) an uncommitted tail, a code-impossible state.
 ExecSetTail ==
-  \E i \in Item :
+  /\ ~hasTail
+  /\ \E i \in Item :
     /\ loc[i] = "Executing"
+    \* Drain-side substitutes (bound to a RecoveringInline park) live the IN-PLACE lifecycle
+    \* (RecoverWaiter executes and completes them on the advancer; they never become the
+    \* executor's tail). Executor-side substitutes (bound to "Recovering") DO re-enter the
+    \* normal tail flow (Pipeline.cs RecoverItem ~536) and are admitted here.
+    /\ (IF recoveryOf[i] = NoItem THEN TRUE ELSE loc[recoveryOf[i]] # "RecoveringInline")
     /\ loc' = [loc EXCEPT ![i] = "InTail"]
     /\ tailWaiter' = i
     /\ hasTail' = TRUE
@@ -759,6 +780,47 @@ ExecCommitTailExecutorLoses ==
                 /\ drainSignal' = drainSignal
   /\ UNCHANGED <<publish_vars, adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+
+\* Pre-faulted commit (RecoverySplit, Phase D). CommitTailWaiter observes the tail's pipeline
+\* task already SETTLED and FAULTED at commit time - the code's
+\*   `if (task.IsCompleted) { if (IsCompletedSuccessfully) {...complete...}
+\*    return RecoverCommittedTailWaiterAsync(item, task).AsTask(); }`
+\* branch (Pipeline.cs ~698-707). The recovery is awaited INLINE on the executor's logical
+\* thread (NOT via the advancer - that preserves the SPSC producer role on _waiters and the
+\* commit ordering), so the faulted tail parks in "Recovering" and the executor's next yield
+\* stays blocked until the substitute resolves (the SourceYield* Recovering guard IS the
+\* inline await). The store is untouched: the fault is caught before CommitWaiter ever runs.
+\* The _hasExecutingItem Exchange precedes the IsCompleted check in code, so the publish
+\* consume mirrors the Wins/Loses pair in one action: a won Exchange (own-thread hasExecuting
+\* observation) clears the publish, a lost one leaves it. The fault is the nondeterministic
+\* alternative to the sync-success arm of ExecCommitTailExecutorWins/Loses (a settled tail
+\* either succeeded -> those, or faulted -> here); the parked item then resolves via
+\* RecoverInstallWins/Loses / RecoverRefuse. RecoverCommittedTailWaiterAsync's GetResult
+\* consumed the task, so any tenure the tail held releases here (sync-success's twin rule).
+ExecCommitTailRecovers ==
+  /\ RecoverySplit
+  /\ failed = {}                 \* single-failure bound (shared with the other injection points)
+  /\ hasTail
+  /\ escPhase = "idle"
+  /\ LET i == tailWaiter IN
+       /\ i \in taskDone          \* settled at commit; the fault face of the sync arm
+       /\ recoveryOf[i] = NoItem  \* first-level (a substitute's guarded tail completes directly)
+       /\ loc' = [loc EXCEPT ![i] = "Recovering"]
+       /\ failed' = failed \cup {i}
+       /\ tailWaiter' = NoItem
+       /\ hasTail' = FALSE
+       /\ tenure' = IF tenure = i THEN NoItem ELSE tenure
+       /\ (IF hasExecuting  \* own-thread observation: the Exchange preceded the IsCompleted check
+            THEN /\ hasExecuting' = FALSE
+                 /\ hasExecutingVisible' = FALSE
+                 /\ executingItem' = NoItem
+                 /\ executingItemVisible' = NoItem
+            ELSE UNCHANGED publish_vars)
+  /\ UNCHANGED <<adv_vars, counters, slot_vars, waiters,
+                 taskDone, activations, callbackFired, esc_vars, drainer_vars,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
+                 callbackSignaled, recoveryOf>>
 
 (* ===========================================================================
    Truthful queue commit (SplitCountCommit): TryEscalateOrEnqueue's post-
@@ -1512,6 +1574,12 @@ SlotDrainCount ==
   \* fused claim (its guard required taskDone); load-bearing under SplitSlotFieldOps,
   \* where a hijack claim can hold a successor whose task is still running.
   /\ drainItem \in taskDone
+  \* A drain-side recovery park (SlotHeadRecovers) suspends the drain HERE: the thread's PC
+  \* is inside RecoverWaiter until the park resolves (refuse, or substitute completion +
+  \* binding discharge), and only then does the decrement run - the code's advance = true /
+  \* AdvanceAndDrainRecovery rejoin. Mid-recovery firing would be another thread inside the
+  \* held advancer latch - code-impossible.
+  /\ \A i \in Item : loc[i] # "RecoveringInline"
   /\ StoreDecrementCount
   /\ assertFailed' = IF storeCount - 1 # 0 THEN TRUE ELSE assertFailed
   \* The atomic decrement's return value, captured for the SlotDrainComplete* branch choice
@@ -1687,10 +1755,67 @@ SlotDrainCompleteCPath ==
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
 
+\* Trailing read fault on a committed SLOT waiter (RecoverySplit, Phase D) - the slot-tier
+\* twin of DrainHeadRecovers. DrainSlotInline consumed the claimed task and its GetResult
+\* FAULTED (the try/catch at Pipeline.cs ~1013-1020); the catch routes to RecoverWaiter
+\* instead of CompleteWaiterDeferred. Fires at drainPhase = "claimed" - the GetResult
+\* linearization point (SlotDrainCount's drainItem \in taskDone guard IS the GetResult; this
+\* is its nondeterministic fault face) - and parks the drain THERE: loc -> "RecoveringInline",
+\* drainPhase/drainItem UNTOUCHED. The parked drain's PC sits inside RecoverWaiter; the
+\* position's count is still HELD (no decrement yet), so the executor's Count==0 inline gate
+\* cannot cede the head position to a fresh reader while the recovery owns it, and the
+\* advancer latch release (drainPhase = "idle" gated) is structurally unreachable until the
+\* rejoin below runs - both exactly the in-place recovery's ownership story. Resolution:
+\*   - REFUSE (RecoverRefuse) / substitute completes (RecoverInstallInline ->
+\*     RecoverInlineCompletes -> BindingDischarge): the parked item leaves
+\*     "RecoveringInline", unblocking SlotDrainCount (its RecoveringInline gate), and the
+\*     drain REJOINS the standard SlotDrainCount -> SlotDrainComplete* steps - the
+\*     decrement + activation partition (chain / handoff / <=0 C-path arms) run ONCE,
+\*     post-resolution. This is the code's advance = true rejoin (refuse/sync) and
+\*     AdvanceAndDrainRecovery's post-recovery drain (install) in one shape, with no
+\*     partition duplication. (The complete arms' loc update on the already-Completed
+\*     drainItem is idempotent; DrainConsistent's Draining clause admits the recovery locs.)
+\* No counted-occupant gate is needed (DrainHeadRecovers' storeCount > 0 twin): the old
+\* "counted"-point firing had to exclude the hijack-claimed mid-commit pair because its -1
+\* skew mis-partitioned the fused arms; here the partition rides the standard skew-tolerant
+\* rejoin, and a hijacked settled pair faulting at GetResult is truthfully recoverable.
+\* SlotChainActivation-gated: the recovery tree models the fixed drain (the legacy complete
+\* has no recovery-routing twin; every RecoverySplit config runs the fixed tree).
+\*
+\* CODE FINDING (June 2026, this round): Pipeline.cs's DrainSlotInline decrements BEFORE the
+\* fault decision (~1022 precedes the RecoverWaiter call at ~1043), unlike DrainReadyWaiters
+\* (decrement at ~1229 AFTER the advance = true rejoin). That early decrement (a) opens the
+\* executor's Count==0 inline-activation gate while the faulted position is still being
+\* recovered - the unconditional ActivateHeadItem in RecoverWaiter (~1418) then makes a
+\* SECOND active reader (NoSimultaneousActiveReader's class); and (b) double-decrements on
+\* the install path, whose continuation runs AdvanceAndDrain's queue-flavored DecrementCount
+\* (~1637) again - and whose >0 arm peeks the QUEUE, tripping the count>0-no-head
+\* Debug.Assert on a slot-tier successor. This action models the INTENDED order (fault
+\* decision before decrement, slot site mirroring the queue site); DrainSlotInline needs the
+\* reorder before this floor is real in code.
+SlotHeadRecovers ==
+  /\ RecoverySplit
+  /\ SlotChainActivation
+  /\ failed = {}                 \* single-failure bound (shared with the other injection points)
+  /\ drainPhase = "claimed"
+  /\ LET i == drainItem IN
+       /\ i \in taskDone          \* settled at GetResult; the fault face of SlotDrainCount's gate
+       /\ recoveryOf[i] = NoItem  \* first-level (a substitute's guarded task completes directly)
+       /\ loc' = [loc EXCEPT ![i] = "RecoveringInline"]
+       /\ failed' = failed \cup {i}
+       /\ tenure' = IF ~ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 taskDone, activations, callbackFired, esc_vars, drainer_vars,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny,
+                 advancingPending, callbackSignaled, recoveryOf>>
+
 \* Drainer's release step. Mirrors DrainSlotInline's _advancing.Release() tail. Between
 \* SlotCallbackDrains and this release, the slot is empty but the advancer is still held.
 \* A follow-up commit can land a new item in the slot, and SlotCallbackBailsOut fires if
 \* that item's task is done. The race window the failing test exercises.
+\* (A drain-side recovery park needs no extra gate here: it parks at drainPhase = "claimed",
+\* so the "idle" guard already keeps the latch held until the post-recovery rejoin ran.)
 SlotDrainerRelease ==
   /\ advancing
   /\ drainerActive
@@ -2594,17 +2719,66 @@ RecoverInstallLoses ==
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
 
+\* Install for a DRAIN-side park (RecoveringInline; Phase C/D's RecoverWaiter, Pipeline.cs
+\* ~1410-1443): the policy accepted, the substitute is activated UNCONDITIONALLY
+\* (ActivateHeadItem at ~1418 - no count gate, no deferred-publish branch: the faulted head's
+\* position is vacant by construction and the recovery item takes it over immediately) and
+\* executes IN PLACE on the advancer thread, under the advancer latch the parked drain still
+\* holds (advance = false return). It never publishes, never becomes the tail, never enters
+\* the store - completion is RecoverInlineCompletes below. NO tenure interaction: the
+\* substitute is a distinct recovery flow with its own promise (the code's
+\* RecoveryDrainFlow), not a dispatch on the pipeline's shared promise - the executor's
+\* TryStart tenure word is untouched.
+RecoverInstallInline ==
+  /\ RecoverySplit
+  /\ \E i \in Item :
+       /\ loc[i] = "RecoveringInline"
+       /\ recoveryOf[i] = NoItem  \* first-level (a substitute's own fault is never re-recovered)
+       /\ LET j == SubSlot IN
+            /\ loc[j] = "Nowhere"
+            /\ recoveryOf[j] = NoItem
+            /\ j \notin failed
+            /\ loc' = [loc EXCEPT ![j] = "Executing"]
+            /\ activations' = [activations EXCEPT ![j] = @ + 1]
+            /\ recoveryOf' = [recoveryOf EXCEPT ![j] = i]
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 taskDone, callbackFired, failed, esc_vars, drainer_vars,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+
+\* In-place completion of a drain-side substitute: its pipeline task settled and the recovery
+\* continuation runs CompleteRecoveryWaiter (Pipeline.cs ~1548/~1571) - the item completes at
+\* the parked drain's position, store untouched (it was never committed). The bound failed
+\* item discharges via BindingDischarge, which unparks the drain's rejoin (SlotDrainCount's
+\* RecoveringInline gate) - the model's AdvanceAndDrainRecovery. The faulted-substitute
+\* alternative is RecoverOnRecoveryFails (shared with the executor-side lifecycle). No
+\* tenure interaction (see RecoverInstallInline).
+RecoverInlineCompletes ==
+  /\ RecoverySplit
+  /\ \E j \in Item :
+       /\ loc[j] = "Executing"
+       /\ recoveryOf[j] # NoItem
+       /\ loc[recoveryOf[j]] = "RecoveringInline"  \* drain-side substitute (in-place lifecycle)
+       /\ j \in taskDone   \* the recovery continuation fired; GetResult observed (no fault face here)
+       /\ j \notin failed
+       /\ loc' = [loc EXCEPT ![j] = "Completed"]
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+
 \* The binding discharge: the substitute reached "Completed" (its normal lifecycle), so the
 \* failed item it was bound to completes too (CompleteItem completes the bound failed flow with
 \* the failure exception). A separate fair step - the window between the substitute's completion
-\* and the discharge is the code's sequence inside CompleteItem.
+\* and the discharge is the code's sequence inside CompleteItem. Covers both park flavors
+\* (executor-side "Recovering" and drain-side "RecoveringInline").
 BindingDischarge ==
   /\ RecoverySplit
   /\ \E j \in Item :
        /\ recoveryOf[j] # NoItem
        /\ loc[j] = "Completed"
        /\ LET i == recoveryOf[j] IN
-            /\ loc[i] = "Recovering"
+            /\ loc[i] \in {"Recovering", "RecoveringInline"}
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
        /\ recoveryOf' = [recoveryOf EXCEPT ![j] = NoItem]
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
@@ -2620,12 +2794,21 @@ BindingDischarge ==
 \* DIRECTLY with its own exception, no substitute installed. The other branch from a parked
 \* first-level Recovering item (RecoverInstall installs a substitute); TLC explores both - the
 \* policy decision is nondeterministic. RecoveryCompletes still holds (Recovering ~> Completed
-\* via this direct route).
+\* via this direct route). Covers both park flavors: executor-side ("Recovering",
+\* CompleteWaiter at RecoverItem/RecoverCommittedTailWaiterAsync) and drain-side
+\* ("RecoveringInline", CompleteWaiterDeferred at RecoverWaiter ~1413 - the advance = true
+\* return whose partition the park action already ran).
 RecoverRefuse ==
   /\ RecoverySplit
   /\ \E i \in Item :
-       /\ loc[i] = "Recovering"
+       /\ loc[i] \in {"Recovering", "RecoveringInline"}
        /\ recoveryOf[i] = NoItem  \* first-level
+       \* Refuse and install are the two faces of ONE TryRecoverItemFailure call: once a
+       \* substitute is bound to this park, the refuse face is spent. (Without this guard a
+       \* post-install refuse double-resolves the park - completing the failed item while
+       \* the substitute still runs - stranding the in-place substitute's completion guard
+       \* and the binding discharge.)
+       /\ ~\E j \in Item : recoveryOf[j] = i
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
@@ -2756,11 +2939,14 @@ Next ==
   \/ RecoverItemLosesW
   \/ RecoverInstallWins
   \/ RecoverInstallLoses
+  \/ RecoverInstallInline
+  \/ RecoverInlineCompletes
   \/ BindingDischarge
   \/ RecoverRefuse
   \/ RecoverOnRecoveryFails
   \/ ExecCommitTailExecutorWins
   \/ ExecCommitTailExecutorLoses
+  \/ ExecCommitTailRecovers
   \/ ExecCommitQueueVisibleWinsW
   \/ ExecCommitQueueVisibleLosesW
   \/ ExecCommitQueueCountWinsW
@@ -2810,6 +2996,7 @@ Next ==
   \/ SlotDrainHandoffReclaim
   \/ SlotDrainHandoffTrust
   \/ SlotDrainCompleteCPath
+  \/ SlotHeadRecovers
   \/ ExecEscalationCompensate
   \/ SlotDrainerReclaim
   \/ SlotDrainerReleaseW
@@ -2861,7 +3048,12 @@ Spec == Init /\ [][Next]_vars
         \* OR the policy refuses and it completes directly), and a completed substitute must
         \* discharge its binding. Both are obligations. RecoverOnRecoveryFails carries NO WF -
         \* a substitute's own failure is a possibility, not an obligation (like ExecItemFailure).
-        /\ WF_vars(RecoverInstallWins \/ RecoverInstallLoses \/ RecoverRefuse)
+        /\ WF_vars(RecoverInstallWins \/ RecoverInstallLoses \/ RecoverInstallInline
+                   \/ RecoverRefuse)
+        \* The drain-side substitute's completion is the recovery continuation running
+        \* CompleteRecoveryWaiter - an obligation once its task settles (taskDone via the
+        \* fair CompleteTask).
+        /\ WF_vars(RecoverInlineCompletes)
         /\ WF_vars(BindingDischarge)
         \* One fairness anchor over every commit-entry variant: the commit's first step
         \* eventually fires whichever route (fused, queue split, slot CAS-first, slot
@@ -3045,7 +3237,14 @@ DrainConsistent ==
   \* must not require it) or NoItem (NoDefaultSlotClaim's subject, not this invariant's).
   /\ (drainPhase \in {"claimed", "counted"}) => (drainItem # NoItem)
   /\ (drainItem # NoItem) => (drainPhase \in {"claimed", "counted", "cl_read"})
-  /\ (drainItem # NoItem /\ drainPhase # "cl_read") => loc[drainItem] = "Draining"
+  \* The recovery admission: a drain-side fault park (SlotHeadRecovers) re-locates the
+  \* claimed item to RecoveringInline while the drain PC stays parked at "claimed", and the
+  \* post-resolution rejoin runs the count/complete steps with the item already Completed
+  \* (refuse / discharge ran first). Outside recovery the original clause is unchanged.
+  /\ (drainItem # NoItem /\ drainPhase # "cl_read") =>
+       \/ loc[drainItem] = "Draining"
+       \/ (RecoverySplit /\ drainItem \in failed
+           /\ loc[drainItem] \in {"RecoveringInline", "Completed"})
   /\ \A i \in Item : (loc[i] = "Draining") => (drainItem = i)
   \* cl_pendReacq / sl_serve are the drainer phases that hold the method alive PAST a release
   \* (the obligation re-acquire windows: claim-fail exit and the main release's deposit serve).
@@ -3095,11 +3294,12 @@ EscalationConsistent ==
   \* fields landed, flag pending = InSlotPending (TriState write-first form); fields landed,
   \* count pending = InSlot - or already hijack-claimed (Draining) or even completed by a
   \* stale-token reclaim that won the mid-commit window (the same consumability class the
-  \* queue's Completed admission covers).
+  \* queue's Completed admission covers). RecoveringInline is that class's FAULT face: the
+  \* hijack claim's GetResult faulted and SlotHeadRecovers parked the mid-commit pair.
   /\ (escPhase \in {"slot_cas_act", "slot_cas_noact", "slot_w_act", "slot_w_noact"})
        => (loc[escTail] = "InSlotPending")
   /\ (escPhase \in {"slot_f_act", "slot_f_noact"})
-       => (loc[escTail] \in {"InSlot", "Draining", "Completed"})
+       => (loc[escTail] \in {"InSlot", "Draining", "Completed", "RecoveringInline"})
   /\ \A i \in Item : (loc[i] = "InEscalation") => (escTail = i)
 
 \* Slot occupancy consistency. The slotItem field and the InSlot location always agree
@@ -3207,6 +3407,40 @@ NoNullActivation ==
 NoDefaultSlotClaim ==
   (drainPhase = "cl_read") => (drainItem # NoItem)
 
+\* Mid-escalation Executing-fault coverage (Phase D finding, TLC-adjudicated - the first cut
+\* of this invariant claimed the overlap unreachable OUTRIGHT and TLC refuted it in 5s).
+\* Two regimes:
+\*
+\* PRE-FAILURE (failed = {}): the overlap "an item is Executing while escPhase # idle" is
+\* structurally unreachable - the executor is one thread (escalation and every split-commit
+\* phase are synchronous segments of CommitTailWaiter, complete before the next
+\* ExecuteItemAsync can throw) and every Executing-entry action (SourceYield*,
+\* RecoverInstall*, RecoverItem*) is gated escPhase = "idle" /\ ~hasTail. So the FIRST
+\* failure - ExecItemFailure's whole domain under the one-failure bound, and every
+\* first-level injection point - can never itself occur mid-escalation. THIS invariant pins
+\* that half.
+\*
+\* POST-FAILURE: the overlap is REAL and exercised. A drain-side park (DrainHeadRecovers /
+\* SlotHeadRecovers fires on the advancer thread) leaves the executor's own item mid-
+\* lifecycle; the substitute install then puts TWO items in "Executing" - truthful to the
+\* code, where RecoverWaiter's substitute executes on the DRAINER thread concurrently with
+\* the executor - and one of them commits while the other still executes (the slot-tier
+\* shape: the executor's own item commits its slot pair while the IN-PLACE substitute is
+\* Executing under the held latch). RecoverOnRecoveryFails (escPhase-agnostic, like
+\* ExecItemFailure) is enabled across that overlap, so the substitute's failure DURING an
+\* in-flight commit/escalation is explored, and its routing is adjudicated by the standing
+\* invariants + RecoveryCompletes. No additional action needed: the escPhase-agnostic
+\* failure actions cover the overlap that exists, and this invariant proves empty the
+\* overlap that doesn't. (The first cut of this round let the drain-side substitute reach
+\* the executor's tail/commit - believed "an over-approximation that adds interleavings,
+\* none excluded". TLC refuted the "none excluded" half: the substitute's commit stole the
+\* executor item's deferred publish (the Exchange-wins guard presumes the publish is the
+\* committer's OWN) and the wasEmpty arm double-activated it - ActivatedAtMostOnce, 19
+\* states. Hence the RecoveringInline split: drain-side substitutes complete in place, as
+\* the code does.)
+ExecutorQuiescentMidCommitPreFailure ==
+  (escPhase # "idle" /\ failed = {}) => (\A i \in Item : loc[i] # "Executing")
+
 (* ===========================================================================
    Liveness
    =========================================================================== *)
@@ -3232,7 +3466,7 @@ EventuallyCompleted ==
 \* the "recovery fails one level up" hazard). Vacuous under ~RecoverySplit (the legacy
 \* identity-reuse re-dispatches the failed item, which then completes via the normal paths).
 RecoveryCompletes ==
-  \A i \in Item : (loc[i] = "Recovering") ~> (loc[i] = "Completed")
+  \A i \in Item : (loc[i] \in {"Recovering", "RecoveringInline"}) ~> (loc[i] = "Completed")
 
 \* Every yielded item is eventually activated (or has already left the pipeline). The property
 \* EventuallyCompleted cannot see lost activations: with completion gated on activation (see
@@ -3261,9 +3495,11 @@ EventuallyActivated ==
       self-activate gate. Covered in every config that sets SplitCountCommit
       (Contract included).
 
-   2. RecoverCommittedTailWaiterAsync path - the executor's "task already
-      faulted at commit time" branch. This was the source of the most recent
-      test bug (CompleteAsync_DuringActiveRecovery_DrainsCleanly).
+   2. [DONE June 2026] RecoverCommittedTailWaiterAsync path - the executor's
+      "task already faulted at commit time" branch. This was the source of the
+      most recent test bug (CompleteAsync_DuringActiveRecovery_DrainsCleanly).
+      Modeled as ExecCommitTailRecovers (see backlog #5's Phase D entry,
+      including the unconditional-activation code note).
 
    3. [DONE June 2026 - VERIFIED SOUND] Multiple concurrent callback firings.
       SplitCallbackOps un-fuses the queue callback's `_drainSignal = true` store
@@ -3302,12 +3538,55 @@ EventuallyActivated ==
         - [DONE] Phase C: trailing READ fault on a committed queue waiter
           (DrainHeadRecovers, the recovery-routing twin of AdvancerDrainHead - the
           wire-fault case; gated storeCount > 0 = a counted waiter).
-        - Still to add: trailing fault on a SLOT waiter; RecoverCommittedTail-
-          WaiterAsync (CommitTailWaiter observing a pre-faulted pipelineTask);
-          mid-escalation failure (Executing throw while escPhase != idle); the
-          partial-write-mid-frame case (if the encoder can fault after emitting);
+        - [DONE] Phase D: trailing READ fault on a committed SLOT waiter
+          (SlotHeadRecovers). Landed as the IN-PLACE lifecycle, not the shared
+          one: drain-side parks go to "RecoveringInline" and resolve via
+          RecoverInstallInline (unconditional activation, advancer thread) +
+          RecoverInlineCompletes (completes at the parked position, store
+          untouched) - funneling the substitute through the shared tail/commit
+          actions let TLC double-activate it (publish steal at the commit
+          Exchange; D-path re-activation once queued behind a successor), both
+          code-impossible. The park fires at drainPhase = "claimed" (the
+          GetResult point, BEFORE the decrement) and leaves drainPhase/drainItem
+          parked; the post-resolution rejoin IS the standard SlotDrainCount ->
+          SlotDrainComplete* steps (= the partition + AdvanceAndDrainRecovery),
+          gated on no RecoveringInline. TWO CODE FINDINGS pinned in the action
+          comment: DrainSlotInline decrements BEFORE the fault decision (~1022)
+          - (a) opens the executor's Count==0 inline gate mid-recovery (second
+          active reader vs RecoverWaiter's unconditional ActivateHeadItem),
+          (b) double-decrements via AdvanceAndDrain's queue-flavored rejoin
+          (whose >0 arm also queue-peeks; a slot successor trips its assert).
+          The model encodes the intended order (decision before decrement,
+          mirroring DrainReadyWaiters); DrainSlotInline needs the reorder.
+        - [DONE] Phase D: pre-faulted commit (ExecCommitTailRecovers - the
+          RecoverCommittedTailWaiterAsync branch: CommitTailWaiter observes a
+          settled-and-faulted tail task and recovers executor-inline; publish
+          consume covers both Exchange outcomes; store untouched). Resolves via
+          RecoverInstallWins/Loses (count-gated activation). CODE NOTE: the
+          code's RecoverCommittedTailWaiterAsync activates UNCONDITIONALLY
+          (~749) even with prior waiters in flight - the eager-activation shape
+          RecoverItem's count gate (~506) exists to prevent; the model encodes
+          the gated (intended) semantics. Coverage: fires (98 transitions in the
+          witness) but adds 0 distinct states - its park state coincides with
+          ExecItemFailure firing on a task-settled Executing item (the executor
+          loop's sync pipeline-task-fault branch, ~359), a real distinct code
+          route that converges in the model.
+        - [DONE - FINDING, no action needed] mid-escalation failure (Executing
+          throw while escPhase != idle): split verdict, TLC-adjudicated. PRE-
+          failure the overlap is structurally unreachable (executor sequencing;
+          pinned by ExecutorQuiescentMidCommitPreFailure - whose unconditional
+          first cut TLC REFUTED, which is the point of checking). POST-failure
+          it is real and exercised: a drain-side park's substitute executes
+          concurrently with the executor (two Executing items, truthful to
+          RecoverWaiter's drainer-thread substitute) and the escPhase-agnostic
+          RecoverOnRecoveryFails covers its failure during an in-flight commit;
+          the refutation trace doubles as the joint-reachability witness
+          (substitute Executing at escPhase = "slot_w_act"). See the invariant's
+          comment.
+        - Still to add: the partial-write-mid-frame case (if the encoder can
+          fault after emitting - needs a design decision);
           multi-failure (needs more reserved substitute identities; the single
-          SubSlot reservoir + failed = {} bound is Phase A/B/C scope). Reserved
+          SubSlot reservoir + failed = {} bound is Phase A/B/C/D scope). Reserved
           substitute identity (SubSlot = NumItems) + one-failure bound keep the
           NumItems = 3 pool from being drained out from under recovery.
         - Payoff target: confirm refusal-completes-directly so the code's
