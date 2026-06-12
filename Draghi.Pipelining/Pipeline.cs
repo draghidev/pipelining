@@ -1904,7 +1904,11 @@ public static class Pipeline
 
         /// <summary>
         /// Called by a completer after <see cref="DecrementDepth"/> returns 0. Disarms and
-        /// signals the pending drain waiter, if any.
+        /// signals the pending drain waiter, if any - revalidating depth first, because the
+        /// zero verdict is bump-instant and this call may have been DEFERRED (the drain paths
+        /// signal after releasing the advancer): a producer and a NEW WaitForEmptyAsync arm
+        /// can land in the deferral window, and a blind fire would wake that caller on a zero
+        /// predating its arm (its entry check saw depth > 0).
         /// </summary>
         public void OnDepthReachedZero()
         {
@@ -1913,7 +1917,35 @@ public static class Pipeline
             // missed - that side's re-check covers it (see GetIdleTask).
             if (Volatile.Read(ref _drainTcs) is null)
                 return;
-            SignalDrainWaiter();
+
+            while (true)
+            {
+                var tcs = Interlocked.Exchange(ref _drainTcs, null);
+                if (tcs is null)
+                    return;
+
+                // Fire only against a still-zero depth: the armer's momentary-zero contract
+                // covers zeros that occur AT or AFTER its arm; a stale pre-arm zero does not.
+                if (Depth is 0)
+                {
+                    tcs.TrySetResult();
+                    return;
+                }
+
+                // Stale zero against a newer arm: hand the tcs back. The CAS can only fail
+                // against a caller that cancelled its wait (the WaitAsync wrapper frees the
+                // single-caller API early) and re-armed - the held tcs has no waiter and is
+                // dropped; the new arm did its own publish-recheck.
+                if (Interlocked.CompareExchange(ref _drainTcs, tcs, null) is not null)
+                    return;
+
+                // The put-back is itself an arm: a completer that hit zero while we held the
+                // tcs read the slot as empty and skipped its fire. Re-check depth after the
+                // put-back (same publish-then-recheck discipline as GetIdleTask) and loop
+                // back to re-take if a fresh zero materialized.
+                if (Depth is not 0)
+                    return;
+            }
         }
 
         void SignalDrainWaiter()
