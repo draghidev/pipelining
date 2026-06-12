@@ -41,9 +41,13 @@ public enum WakeOutcome
 /// </para>
 /// </remarks>
 [Experimental("DRAGHI001")]
-public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineScheduler scheduler)
+public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineScheduler scheduler, bool enableWaitForSuspended = false)
     : IValueTaskSource<bool>, IThreadPoolWorkItem
 {
+    // Suspension observation for sync-handoff producers (see WaitForSuspended). Opt-in so
+    // sources without a handoff seam don't pay the per-wait MRES traffic.
+    readonly ManualResetEventSlim? _suspendedMres = enableWaitForSuspended ? new(false) : null;
+
     readonly CancellationTokenSource _cts = new();
     Func<WakeOutcome>? _resolve;
     bool _pending;
@@ -172,10 +176,24 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
         if (!ReferenceEquals(_waitContinuation, continuation))
             _waitContinuation = continuation;
         ReleaseWakeLock();
+        // Suspension observation fires AFTER the lock release: the observing producer's
+        // Signal must find the lock free and the continuation stored (lock-through closed
+        // the registration gap; the order here keeps the wake path uncontended).
+        _suspendedMres?.Set();
 
         if (IsCompleted)
             SignalCore(runContinuationsAsynchronously: true);
     }
+
+    /// <summary>
+    /// Blocks until the consumer's wait is armed and its continuation registered (the suspension
+    /// observation a sync-handoff producer rendezvouses on before claiming the wait inline with
+    /// <see cref="Signal(bool)"/>). Requires construction with <c>enableWaitForSuspended</c>.
+    /// Every claim clears the observation before dispatch so it stays accurate across resume -
+    /// a stale observation would let a later handoff producer skip its wait and return with its
+    /// flow unexecuted. Verified in verification/WaitProtocol.tla (ClearOnClaimFix witness).
+    /// </summary>
+    public void WaitForSuspended() => _suspendedMres!.Wait();
 
     public bool Signal() => SignalCore(runContinuationsAsynchronously);
 
@@ -206,6 +224,11 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             {
                 ReleaseWakeLock();
             }
+
+            // Clear the suspension observation BEFORE dispatch so it stays accurate across
+            // resume: a stale observation would let a sync-handoff producer skip its
+            // rendezvous (WaitProtocol.tla, ClearOnClaimFix witness).
+            _suspendedMres?.Reset();
 
             if (runContinuationsAsynchronously)
                 Scheduler.SubmitDetached(this, preferLocal: true);
