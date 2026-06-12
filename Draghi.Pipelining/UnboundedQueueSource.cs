@@ -31,6 +31,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// <param name="runContinuationsAsynchronously">When true, signal continuations dispatch to the scheduler.
     /// When false, signal continuations run inline on the caller's thread.</param>
     /// <param name="executionScheduler">Scheduler used for inline-async dispatch. Falls back to ThreadPool when null.</param>
+    /// <param name="cancellationToken">The cancellation token used to complete the executor.</param>
     public static UnboundedQueueSource<T> Create(bool runContinuationsAsynchronously = true, PipelineScheduler? executionScheduler = null, CancellationToken cancellationToken = default)
         => new(new State(runContinuationsAsynchronously, executionScheduler ?? PipelineScheduler.ThreadPool, cancellationToken));
 

@@ -11,9 +11,9 @@ namespace Draghi.Pipelining.Tests;
 //            pull so the executor faults (CompleteAsync(ex) + drain + rethrow), matching the old
 //            OnExecutionIdleAsync semantics.
 //
-// Built on WakeSignal.Rendezvous: the pure dequeue is the resolver (run under the wake lock), and
-// onIdle rides the async onWaiting seam (fired out-of-lock so a reentrant enqueue from it can't
-// deadlock). When no onIdle is supplied the pull is the zero-box production path.
+// Built on the wait protocol with peek semantics: the async WaitForNextAsync fires the onIdle
+// hook out-of-lock (a reentrant enqueue from it can't deadlock; the post-hook peek covers the
+// arrival), then peeks-or-arms under the wake lock in a loop. TryGetNext is the consuming pull.
 [System.Diagnostics.CodeAnalysis.Experimental("DRAGHI001")]
 readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservableQueueSource<T>.Enumerator>
 {
@@ -59,13 +59,9 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
         public readonly CancellationToken CancellationToken;
         public CancellationToken EnumerationToken;
         public readonly Func<CancellationToken, ValueTask>? OnIdle;
-        // Items returned since the last genuine wait. Mutated under the wake lock (the resolver's
-        // GotItem ++ and the wait hook's read+reset) so the wake-thread resolve and the consumer's
-        // wait hook don't race on it.
+        // Items returned since the last genuine wait. Consumer-thread-only: TryGetNext
+        // increments, the wait hook reads/resets, and nothing on the wake side touches it.
         public int DequeuedSinceWait;
-
-        readonly Func<WakeOutcome> _resolvePeek;
-        readonly Func<ValueTask> _onWaiting;
 
         public State(
             bool runContinuationsAsynchronously,
@@ -76,27 +72,38 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
             WakeSignal = new(runContinuationsAsynchronously, scheduler);
             OnIdle = onIdle;
             CancellationToken = cancellationToken;
-            _resolvePeek = ResolvePeek;
-            _onWaiting = OnWaitingAsync;
         }
 
-        // Wait via the rendezvous protocol with a PEEK resolver: a wake observes availability
-        // without consuming, the value task resolves true, and the executor's TryGetNext retry
-        // takes the item. Keeps the onIdle observation hook on WakeSignal's onWaiting seam.
-        public ValueTask<bool> WaitForNextAsync() => WakeSignal.Rendezvous(_resolvePeek, OnIdle is null ? null : _onWaiting);
-
-        // Runs under the wake lock (WakeSignal.Pump holds it across this call). Never consumes.
-        WakeOutcome ResolvePeek()
+        // The wait protocol with PEEK semantics: a wake observes availability without consuming
+        // (the executor's TryGetNext retry takes the item). The observation hook fires once per
+        // wait, out of any lock (it may enqueue reentrantly); the post-hook peek covers a
+        // reentrant arrival, so the pre-arm hook position loses no wake. Spurious wakes loop
+        // back to the peek without re-firing the hook, preserving once-per-wait semantics.
+        public async ValueTask<bool> WaitForNextAsync()
         {
-            NotEmpty = false;
+            await OnWaitingAsync().ConfigureAwait(false);
 
-            if (Queue.TryPeek(out _))
-                return WakeOutcome.GotItem;
+            while (true)
+            {
+                var wakeSignal = WakeSignal;
+                wakeSignal.AcquireWakeLock();
+                NotEmpty = false;
 
-            if (WakeSignal.IsCompleted || EnumerationToken.IsCancellationRequested)
-                return WakeOutcome.Completed;
+                if (Queue.TryPeek(out _) || NotEmpty)
+                {
+                    wakeSignal.ReleaseWakeLock();
+                    return true;
+                }
 
-            return WakeOutcome.Wait;
+                if (wakeSignal.IsCompleted || EnumerationToken.IsCancellationRequested)
+                {
+                    wakeSignal.ReleaseWakeLock();
+                    return false;
+                }
+
+                // Lock-through registration; a wake loops back to re-peek.
+                await wakeSignal.Arm();
+            }
         }
 
         // Runs out-of-lock when the pull suspends, before the wait. DequeuedSinceWait is

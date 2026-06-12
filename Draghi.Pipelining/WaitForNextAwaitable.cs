@@ -105,9 +105,7 @@ public readonly struct WaitForNextAwaitable
             switch (_wait._kind)
             {
                 case Kind.Signal:
-#pragma warning disable DRAGHI001
                     _wait._signal!.WaitOnCompleted(continuation);
-#pragma warning restore DRAGHI001
                     break;
                 case Kind.Task:
                     _taskAwaiter.UnsafeOnCompleted(continuation);
