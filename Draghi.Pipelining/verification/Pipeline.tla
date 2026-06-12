@@ -303,7 +303,15 @@ CONSTANTS
                              \* transient (callbackSignaled tracks "set, not yet acquired"). The
                              \* manual enumeration says every set is deposit-paired or the
                              \* materializing-token (both verified) - this converts that argument
-                             \* to a checked fact. FALSE = the 9 configs (fused, unaffected); TRUE
+                             \* to a checked fact. Extended (June 2026 audit round) to the SLOT
+                             \* callback: CallbackSetSignal's InSlot arm + the claim entries'
+                             \* signaled precondition + CallbackAcquireLose (the slot bail's
+                             \* deposit window) + SlotCallbackSpent (occupant reclaimed between
+                             \* set and acquire). Same round: CallbackAcquireLose had been
+                             \* unsatisfiable since written (callbackSignaled double-bound in
+                             \* its UNCHANGED), so the deposit-on-lose interleaving had never
+                             \* actually been explored - now live for both arms.
+                             \* FALSE = the 9 configs (fused, unaffected); TRUE
                              \* = Pipeline_SplitCallbackWitness.cfg (expect green, or a surprise).
   ,
   RecoverySplit             \* The recovery round (June 2026, backlog #2/#5). FALSE = legacy
@@ -1261,7 +1269,9 @@ ExecutorInlineCallbackBailsOut ==
 \* This is the transition that exposes the mixed-state race window the atomic original
 \* spec collapsed away.
 SlotCallbackBailsDuringEscalation ==
-  \E i \in Item :
+  /\ ~SplitCallbackOps  \* fused set+acquire+empty-pass; CallbackSetSignal (slot arm) +
+                        \* CallbackAcquireWin (escalated route) are the un-fusing
+  /\ \E i \in Item :
     /\ i \in taskDone
     /\ loc[i] = "InSlot"
     /\ slotItem = i
@@ -1293,13 +1303,16 @@ SlotDrainClaim ==
   /\ \E i \in Item :
     /\ i \in taskDone
     /\ loc[i] = "InSlot"
-    /\ i \notin callbackFired
+    \* Under SplitCallbackOps the set already ran (CallbackSetSignal's slot arm) and this
+    \* action is acquire+claim only; fused, it covers set+acquire+claim in one step.
+    /\ IF SplitCallbackOps THEN i \in callbackSignaled ELSE i \notin callbackFired
     /\ ~advancingVisible
     /\ hasSlot
     /\ slotItem = i
     /\ ~escalated
     /\ drainPhase = "idle"
     /\ callbackFired' = callbackFired \cup {i}
+    /\ callbackSignaled' = callbackSignaled \ {i}
     /\ advancing' = TRUE
     /\ advancingVisible' = TRUE
     /\ drainerActive' = TRUE
@@ -1309,11 +1322,12 @@ SlotDrainClaim ==
     /\ drainItem' = i
     /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
     \* Set-then-acquire-then-pass-top-clear, fused (slot pass start). Replaces the old
-    \* counter's "bump + decrement = net zero" accounting.
+    \* counter's "bump + decrement = net zero" accounting. Under SplitCallbackOps the set
+    \* happened earlier; the pass-start clear lands the same FALSE.
     /\ drainSignal' = FALSE
     /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                    taskDone, activations, esc_vars, failed, drainRemaining, pendingHeadActivation,
-                   tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                   tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, recoveryOf>>
 
 (* ===========================================================================
    Truthful slot claim (SplitSlotFieldOps): the two entry routes (callback fire,
@@ -1333,22 +1347,26 @@ SlotDrainClaimEntry ==
   /\ \E i \in Item :
        /\ i \in taskDone
        /\ loc[i] = "InSlot"
-       /\ i \notin callbackFired
+       \* Under SplitCallbackOps the set already ran (CallbackSetSignal's slot arm); this
+       \* entry is the acquire onward. Fused, it covers set+acquire in one step.
+       /\ IF SplitCallbackOps THEN i \in callbackSignaled ELSE i \notin callbackFired
        /\ i # escTail  \* wiring runs after the commit's count step
        /\ ~advancingVisible
        /\ ~escalated
        /\ drainPhase = "idle"
        /\ callbackFired' = callbackFired \cup {i}
+       /\ callbackSignaled' = callbackSignaled \ {i}
   /\ advancing' = TRUE
   /\ advancingVisible' = TRUE
   /\ drainerActive' = TRUE
   /\ drainSignal' = TRUE  \* set-then-acquire: the callback's plain store precedes the win;
-                          \* the token stays visible until the post-claim clear
+                          \* the token stays visible until the post-claim clear (under
+                          \* SplitCallbackOps the earlier set already landed this TRUE)
   /\ drainPhase' = "cl_acq"
   /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, esc_vars, failed, drainItem, drainRemaining,
                  pendingHeadActivation, tenure, tenureClash, assertFailed, nullActivation,
-                 qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 qDrainPhase, qDrainedAny, advancingPending, recoveryOf>>
 
 \* Reclaim-path entry, the TRUTHFUL gate: drainSignal + the latch win. No identity, no
 \* taskDone, no callbackFired knowledge - the fused SlotDrainerReclaim's
@@ -1991,6 +2009,8 @@ SlotDrainerReclaim ==
 \* republish hoist widened the hold). Field-reproduced as the lost-activation timeout.
 \* The recovery is SlotDrainerReclaim (gated on SlotReclaimEnabled), not this gate.
 SlotCallbackBailsOut ==
+  /\ ~SplitCallbackOps  \* fused set+failed-acquire+deposit; CallbackSetSignal (slot arm) +
+                        \* CallbackAcquireLose are the un-fusing
   /\ \E i \in Item :
        /\ i \in taskDone
        /\ loc[i] = "InSlot"
@@ -2044,7 +2064,14 @@ CallbackSetSignal ==
   /\ SplitCallbackOps
   /\ \E i \in Item :
        /\ i \in taskDone
-       /\ loc[i] = "InWaiters"
+       \* InWaiters: OnWaiterTaskCompleted's store. InSlot occupant: OnCommittedTaskCompleted's
+       \* store - the SLOT bail's set, un-fused from its acquire (the audit's last granularity
+       \* item). The escTail exclusion mirrors SlotDrainClaimEntry (wiring runs after the
+       \* commit's count step). A mid-move transient (loc still InSlot, slotItem already
+       \* cleared) defers the set one step to the InWaiters arm - no reader distinguishes the
+       \* plain store's timing within that window.
+       /\ \/ loc[i] = "InWaiters"
+          \/ (loc[i] = "InSlot" /\ slotItem = i /\ i # escTail)
        /\ i \notin callbackFired
        /\ i \notin callbackSignaled
        /\ callbackSignaled' = callbackSignaled \cup {i}
@@ -2060,6 +2087,11 @@ CallbackSetSignal ==
 \* re-raise is the sibling's, carried by ITS deposit when it later loses).
 CallbackAcquireWin ==
   /\ SplitCallbackOps
+  /\ escalated  \* the IsEscalated route: acquire -> DrainReadyWaiters. Queue items are
+                \* escalated by construction; a PRE-escalation slot occupant's win routes
+                \* through SlotDrainClaim/SlotDrainClaimEntry's signaled precondition instead
+                \* (acquire -> DrainSlotInline), and a mid-escalation occupant lands here
+                \* draining nothing - the un-fused SlotCallbackBailsDuringEscalation.
   /\ \E i \in callbackSignaled :
        /\ i \notin callbackFired
        /\ ~advancingVisible
@@ -2086,10 +2118,39 @@ CallbackAcquireLose ==
        /\ callbackFired' = callbackFired \cup {i}
        /\ callbackSignaled' = callbackSignaled \ {i}
        /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
+       \* (June 2026 audit round: callbackSignaled previously ALSO sat in this UNCHANGED
+       \* tuple, contradicting the assignment above - the action was unsatisfiable and the
+       \* deposit-on-lose interleaving was never explored; the witness config passed with
+       \* the lose arm dead because the held latch eventually releases and the win arm
+       \* covers liveness. Slot-bail coverage relies on this arm, so it is now live.)
        /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                       esc_vars, drainer_vars, loc, taskDone, activations, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                      tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, recoveryOf>>
+                      tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, recoveryOf>>
+
+\* The signaled slot occupant was drained out from under its own callback: the holder's
+\* reclaim took it between the set and the acquire (reachable precisely because the
+\* reclaim's gate is the signal token our set raised). The callback's acquire then wins
+\* against a slot that no longer holds its item - DrainSlotInline's claim-fail branch
+\* releases and exits, net zero. The release's deposit-serve is approximated as
+\* not-consumed: the deposit stays for the next acquirer, service is delayed never lost
+\* (fairness on the reclaim/callback entries delivers it) - trading the finer serve
+\* interleaving for state space. The lose face (latch held) is CallbackAcquireLose, which
+\* carries no loc guard. The escalated faces route through CallbackAcquireWin.
+SlotCallbackSpent ==
+  /\ SplitCallbackOps
+  /\ \E i \in callbackSignaled :
+       /\ i \notin callbackFired
+       /\ ~escalated
+       /\ loc[i] # "InSlot"
+       /\ ~advancingVisible
+       /\ callbackFired' = callbackFired \cup {i}
+       /\ callbackSignaled' = callbackSignaled \ {i}
+       /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                      esc_vars, drainer_vars, loc, taskDone, activations, failed,
+                      drainPhase, drainItem, drainRemaining, pendingHeadActivation,
+                      tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
+                      advancingPending, recoveryOf>>
 
 (* ===========================================================================
    Advancer actions
@@ -3007,6 +3068,7 @@ Next ==
   \/ CallbackSetSignal
   \/ CallbackAcquireWin
   \/ CallbackAcquireLose
+  \/ SlotCallbackSpent
   \/ AdvancerDrainHead
   \/ DrainHeadRecovers
   \/ AdvancerCPathW
@@ -3140,10 +3202,13 @@ Spec == Init /\ [][Next]_vars
         /\ WF_vars(SlotCallbackBailsOutW)
         /\ WF_vars(CallbackBecomesAdvancerW)
         /\ WF_vars(CallbackBailsOutW)
-        \* Un-fused queue callback (SplitCallbackOps): the set is the callback's first program
-        \* step (WF so a ready item's callback eventually runs), and the acquire follows it.
+        \* Un-fused callbacks (SplitCallbackOps), queue AND slot arms: the set is the
+        \* callback's first program step (WF so a ready item's callback eventually runs),
+        \* and the acquire follows it - via the escalated route (AcquireWin/Lose), the
+        \* slot claim entries (SlotDrainClaim/SlotDrainClaimEntry's signaled precondition),
+        \* or the spent cleanup when the occupant was reclaimed out from under it.
         /\ WF_vars(CallbackSetSignal)
-        /\ WF_vars(CallbackAcquireWin \/ CallbackAcquireLose)
+        /\ WF_vars(CallbackAcquireWin \/ CallbackAcquireLose \/ SlotCallbackSpent)
         /\ WF_vars(ExecutorRegistersCallbackW)
         /\ WF_vars(ExecutorInlineCallbackBecomesAdvancerW)
         /\ WF_vars(ExecutorInlineCallbackBailsOutW)
