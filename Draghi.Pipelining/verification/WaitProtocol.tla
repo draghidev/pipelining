@@ -169,11 +169,11 @@ SignalNoop ==
 \* The claim DEFERS during the handoff window, same as async signals: TLC
 \* exhibited the steal otherwise (Complete claims the suspended wait between
 \* the handoff producer's observe and its inline claim, running the sync flow
-\* on the wrong thread). NOTE: this gate is MISSING in the shipped
-\* PgClientFlowSource (State.Complete calls Vts.SetResult directly, bypassing
-\* Execute's HandoffActive check) - a real shutdown-vs-sync-handoff hazard the
-\* port must fix. Deferral loses no liveness: the handoff's inline claim wakes
-\* the executor, whose next wait resolves Completed.
+\* on the wrong thread). The gate IS shipped: PgClientFlowSource.State.Complete
+\* checks HandoffActive before signalling (with the close-out re-delivering a
+\* completion deferred mid-window; the close-out's fences are audit C2).
+\* Deferral loses no liveness: the handoff's inline claim wakes the executor,
+\* whose next wait resolves Completed.
 CompleteWakes ==
   /\ ppc = "idle" /\ enqueued = MaxItems /\ ~completed /\ ~lock
   /\ completed' = TRUE
