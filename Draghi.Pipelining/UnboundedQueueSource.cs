@@ -1,3 +1,5 @@
+using System.Diagnostics.CodeAnalysis;
+using System.Runtime.CompilerServices;
 using Draghi.Pipelining.Internal;
 
 namespace Draghi.Pipelining;
@@ -74,66 +76,25 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     static void ThrowCompleted() => throw new InvalidOperationException("The source has been completed.");
 
     /// <summary>Reference-typed inner state shared across struct copies.</summary>
-    /// <remarks>
-    /// <c>Current</c> lives here (rather than on the struct enumerator) because the enumerator is a
-    /// struct that callers hold and copy: a write to a struct field would land on a copy and be
-    /// lost. Routing the produced item through the class-backed state keeps it observable.
-    /// <para>
-    /// The pull is <c>=&gt; WakeSignal.Rendezvous(_resolve)</c>: the wake signal owns the park
-    /// lifecycle and value-task plumbing, and this state supplies only a cached resolver run under
-    /// the wake lock. A pull that finds an item (or observes completion) returns an already-completed
-    /// task with no state-machine box; only an actual park hands out an IValueTaskSource-backed one.
-    /// </para>
-    /// </remarks>
     internal sealed class State
     {
         public readonly SingleProducerSingleConsumerQueue<T> Queue = new();
         public bool NotEmpty;
         public readonly WakeSignal WakeSignal;
-        public T Current = default!;
         public Action? OnEnqueue;
         // Source-level cancellation. Per-enumeration CT (passed to GetAsyncEnumerator) gets
         // linked with this in the Enumerator's CTS construction.
         public readonly CancellationToken CancellationToken;
 
         // The active enumeration's combined (source + per-call) token, published by the enumerator
-        // at construction. The resolver reads it to translate cancellation into a completed (false)
+        // at construction. The park path reads it to translate cancellation into a completed
         // result, matching the WakeSignal.IsCompleted check.
         public CancellationToken EnumerationToken;
-
-        readonly Func<WakeOutcome> _resolve;
 
         public State(bool runContinuationsAsynchronously, PipelineScheduler scheduler, CancellationToken cancellationToken)
         {
             WakeSignal = new(runContinuationsAsynchronously, scheduler);
             CancellationToken = cancellationToken;
-            _resolve = Resolve;
-        }
-
-        public ValueTask<bool> MoveNextAsync() => WakeSignal.Rendezvous(_resolve);
-
-        // Runs under the wake lock (WakeSignal.Pump holds it across this call). Pure: a single
-        // dequeue attempt, no user code, so no reentrancy or park-hook concern.
-        WakeOutcome Resolve()
-        {
-            NotEmpty = false;
-
-            if (Queue.TryDequeue(out var current))
-            {
-                Current = current!;
-                return WakeOutcome.GotItem;
-            }
-
-            // No item to hand back: release the previously-yielded Current so the last item is not
-            // GC-rooted by this field across the park. The executor only reads Current after a
-            // GotItem, so clearing it on a non-GotItem outcome is safe.
-            if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                Current = default!;
-
-            if (WakeSignal.IsCompleted || EnumerationToken.IsCancellationRequested)
-                return WakeOutcome.Completed;
-
-            return WakeOutcome.Park;
         }
     }
 
@@ -184,12 +145,42 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
             _completionToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
         }
 
-        public T Current => _state.Current;
         public CancellationToken CompletionToken => _completionToken;
 
         public void Complete() => _cts.Cancel();
 
-        public ValueTask<bool> MoveNextAsync() => _state.MoveNextAsync();
+        /// <summary>Lock-free synchronous pull: the SPSC consumer side needs no synchronization,
+        /// the wake lock exists only for the miss-then-wait rendezvous (see <see cref="WaitForNextAsync"/>).</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool TryGetNext([MaybeNullWhen(false)] out T item) => _state.Queue.TryDequeue(out item);
+
+        /// <summary>
+        /// Miss path. Re-checks availability under the wake lock; a genuine wait arms the signal
+        /// with the lock held through the awaiter's continuation registration
+        /// (lock-through-OnCompleted), so a producer's Enqueue+Signal racing the miss either
+        /// resolves this call to an immediate retry or wakes the armed wait - never a lost wake.
+        /// </summary>
+        public WaitForNextAwaitable WaitForNextAsync()
+        {
+            var wakeSignal = _state.WakeSignal;
+            wakeSignal.AcquireWakeLock();
+            // Best-effort window-narrower: the producer sets NotEmpty before its queue write, so
+            // an in-flight enqueue whose item is not yet visible resolves to a retry instead of
+            // a suspended wait. Its loss is harmless - the producer's Signal covers the armed wait.
+            _state.NotEmpty = false;
+            if (_state.Queue.IsEmpty && !_state.NotEmpty)
+            {
+                if (wakeSignal.IsCompleted || _completionToken.IsCancellationRequested)
+                {
+                    wakeSignal.ReleaseWakeLock();
+                    return WaitForNextAwaitable.Completed();
+                }
+                return wakeSignal.Arm();
+            }
+
+            wakeSignal.ReleaseWakeLock();
+            return WaitForNextAwaitable.Retry();
+        }
 
         public ValueTask DisposeAsync()
         {

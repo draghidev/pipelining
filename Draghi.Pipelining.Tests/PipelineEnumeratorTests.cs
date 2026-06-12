@@ -5,12 +5,11 @@ using Draghi.Pipelining.Internal;
 [TestClass]
 public class PipelineEnumeratorTests
 {
-    // Verifies that the C# await foreach pattern still binds to GetAsyncEnumerator after the
-    // signature gained an optional Action? onEnqueue parameter. The compiler looks for a
-    // GetAsyncEnumerator method whose only required parameter is a CancellationToken (or none);
-    // optional params with defaults must not prevent binding. Test passes if it compiles.
+    // await-foreach compat lives in PipelineSourceAsyncEnumerable, not on the source enumerator (the
+    // pipeline drives the TryGetNext/WaitForNextAsync pull directly). Verifies the adapter binds and
+    // yields the source's items in order.
     [TestMethod]
-    public async Task AwaitForeach_BindsToSourceGetAsyncEnumerator()
+    public async Task AwaitForeach_OverAdapter_YieldsItems()
     {
         var source = UnboundedQueueSource<int>.Create();
         source.Enqueue(1);
@@ -19,10 +18,11 @@ public class PipelineEnumeratorTests
 
         using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
 
+        var adapter = new PipelineSourceAsyncEnumerable<int, UnboundedQueueSource<int>, UnboundedQueueSource<int>.Enumerator>(source);
         var observed = new List<int>();
         try
         {
-            await foreach (var item in source)
+            await foreach (var item in adapter)
             {
                 observed.Add(item);
                 if (observed.Count == 3)

@@ -224,41 +224,28 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     await commitWork.ConfigureAwait(false);
                 }
 
-                // The source doubles as the wake signal, so this is an await per item. When items
-                // are backlogged (a pull finds one already queued) MoveNextAsync completes
-                // synchronously - unwrap that result by hand rather than paying the
-                // ConfiguredValueTaskAwaitable + awaiter + state-machine dance the compiler emits
-                // even for an already-completed ValueTask. The real await still runs (with
-                // ConfigureAwait(false)) when MoveNextAsync genuinely parks on the wake.
-                // NOTE: this exact shape is measured. The seemingly-leaner single plain await
-                // benched +8.6ns on the park shape, and the ternary form +4ns - if/else with the
-                // clears in the else is the empirical winner (96.6 / 92.2 / 88.0ns); see the
-                // pipeline benchmark history before restructuring.
-                var moveNext = _enumerator.MoveNextAsync();
-                bool hasNext;
-                if (moveNext.IsCompletedSuccessfully)
+                // The pull seam: a backlogged item is taken synchronously by TryGetNext (lock-free
+                // on the queue source, no ValueTask machinery, no Current store). A miss goes to
+                // WaitForNextAsync, whose awaitable re-checks under the source's wake lock and
+                // either resolves synchronously (retry/completed) or suspends on the bare-delegate
+                // wait protocol - the wake invokes the executor's continuation directly, with no
+                // value-task-source dispatch in between.
+                if (!_enumerator.TryGetNext(out item!))
                 {
-                    hasNext = moveNext.Result;
-                }
-                else
-                {
-                    // Genuine park. item/itemResult are hoisted into the executor's state-machine
-                    // box (they live across the in-iteration awaits), so without this clear the box
-                    // keeps the last-processed item and its tasks GC-rooted across the whole idle
-                    // period (the post-loop clear only runs on termination). Clearing only on the
-                    // suspend branches keeps the backlogged loop free of these dead stores; the box
-                    // spill happens at the await, so clearing after the sync-completion check is
-                    // sufficient. Both are reassigned below before any use, and the recovery
-                    // `continue` paths route back through here too.
+                    // About to (possibly) suspend. item/itemResult are hoisted into the executor's
+                    // state-machine box (they live across the in-iteration awaits), so without this
+                    // clear the box keeps the last-processed item and its tasks GC-rooted across
+                    // the whole idle period (the post-loop clear only runs on termination).
+                    // Clearing only on the miss path keeps the backlogged loop free of these dead
+                    // stores. Both are reassigned before any use, and the recovery `continue`
+                    // paths route back through here too.
                     if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                         item = default!;
                     itemResult = default;
-                    hasNext = await moveNext.ConfigureAwait(false);
+                    if (!await _enumerator.WaitForNextAsync())
+                        break;
+                    continue;
                 }
-                if (!hasNext)
-                    break;
-
-                item = _enumerator.Current;
 
                 // Publish _executingItem and the visibility flag before either activation path.
                 // _hasInFlightItem signals GetEnumerator that the in-flight item is yieldable during

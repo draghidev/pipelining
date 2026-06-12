@@ -49,14 +49,12 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
 
     static void ThrowCompleted() => throw new InvalidOperationException("The source has been completed.");
 
-    // Reference-typed inner state shared across struct copies. Current lives here for the same
-    // struct-copy reason documented on UnboundedQueueSource.State.
+    // Reference-typed inner state shared across struct copies.
     internal sealed class State
     {
         public readonly SingleProducerSingleConsumerQueue<T> Queue = new();
         public bool NotEmpty;
         public readonly WakeSignal WakeSignal;
-        public T Current = default!;
         public Action? OnEnqueue;
         public readonly CancellationToken CancellationToken;
         public CancellationToken EnumerationToken;
@@ -66,7 +64,7 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
         // park hook don't race on it.
         public int DequeuedSincePark;
 
-        readonly Func<WakeOutcome> _resolve;
+        readonly Func<WakeOutcome> _resolvePeek;
         readonly Func<ValueTask> _onPark;
 
         public State(
@@ -78,29 +76,22 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
             WakeSignal = new(runContinuationsAsynchronously, scheduler);
             OnIdle = onIdle;
             CancellationToken = cancellationToken;
-            _resolve = Resolve;
+            _resolvePeek = ResolvePeek;
             _onPark = OnParkAsync;
         }
 
-        // No onPark when there is no idle hook: that is the zero-box production pull.
-        public ValueTask<bool> MoveNextAsync() => WakeSignal.Rendezvous(_resolve, OnIdle is null ? null : _onPark);
+        // Wait via the rendezvous protocol with a PEEK resolver: a wake observes availability
+        // without consuming, the value task resolves true, and the executor's TryGetNext retry
+        // takes the item. Keeps the onIdle observation hook on WakeSignal's onPark seam.
+        public ValueTask<bool> WaitForNextAsync() => WakeSignal.Rendezvous(_resolvePeek, OnIdle is null ? null : _onPark);
 
-        // Runs under the wake lock (WakeSignal.Pump holds it across this call).
-        WakeOutcome Resolve()
+        // Runs under the wake lock (WakeSignal.Pump holds it across this call). Never consumes.
+        WakeOutcome ResolvePeek()
         {
             NotEmpty = false;
 
-            if (Queue.TryDequeue(out var current))
-            {
-                Current = current!;
-                DequeuedSincePark++;
+            if (Queue.TryPeek(out _))
                 return WakeOutcome.GotItem;
-            }
-
-            // Release the previously-yielded Current so it is not GC-rooted across the park (matches
-            // UnboundedQueueSource; the executor only reads Current after a GotItem).
-            if (System.Runtime.CompilerServices.RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                Current = default!;
 
             if (WakeSignal.IsCompleted || EnumerationToken.IsCancellationRequested)
                 return WakeOutcome.Completed;
@@ -108,16 +99,15 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
             return WakeOutcome.Park;
         }
 
-        // Runs out-of-lock when the pull parks. Take the lock only to read+reset DequeuedSincePark
-        // (shared with the resolver), release it, THEN await onIdle: onIdle is user code that may
-        // re-enqueue (which takes the wake lock), so it must not run under the lock. Fire only when
-        // an active batch drained, mirroring the old "idle after a batch, never on a cold park."
+        // Runs out-of-lock when the pull parks, before the wait. DequeuedSincePark is
+        // consumer-thread-only now (TryGetNext increments, this gate reads/resets; the peek
+        // resolver never touches it), so no locking is needed. onIdle is user code that may
+        // re-enqueue; it must not run under the wake lock and does not here. Fires only when an
+        // active batch drained, mirroring the old "idle after a batch, never on a cold park."
         async ValueTask OnParkAsync()
         {
-            WakeSignal.AcquireWakeLock();
             var fire = DequeuedSincePark > 0;
             DequeuedSincePark = 0;
-            WakeSignal.ReleaseWakeLock();
 
             if (fire && OnIdle is { } onIdle)
                 await onIdle(EnumerationToken).ConfigureAwait(false);
@@ -154,12 +144,21 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
             _completionToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
         }
 
-        public T Current => _state.Current;
         public CancellationToken CompletionToken => _completionToken;
 
         public void Complete() => _cts.Cancel();
 
-        public ValueTask<bool> MoveNextAsync() => _state.MoveNextAsync();
+        public bool TryGetNext([System.Diagnostics.CodeAnalysis.MaybeNullWhen(false)] out T item)
+        {
+            if (_state.Queue.TryDequeue(out item))
+            {
+                _state.DequeuedSincePark++;
+                return true;
+            }
+            return false;
+        }
+
+        public WaitForNextAwaitable WaitForNextAsync() => WaitForNextAwaitable.FromTask(_state.WaitForNextAsync());
 
         public ValueTask DisposeAsync()
         {
