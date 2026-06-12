@@ -34,7 +34,9 @@ public class PipelineBenchmarks
     [GlobalCleanup]
     public void Cleanup()
     {
-        _pipeline.CompleteAsync().AsTask().GetAwaiter().GetResult();
+        // Null-guarded: targeted GlobalSetups mean only one of these exists per benchmark.
+        _pipeline?.CompleteAsync().AsTask().GetAwaiter().GetResult();
+        _structPipeline?.CompleteAsync().AsTask().GetAwaiter().GetResult();
     }
 
     [Benchmark]
@@ -77,6 +79,50 @@ public class PipelineBenchmarks
         // on the last is waiting on all.
         _pipeline.Enqueue(last).Execute();
         last.Wait();
+    }
+
+    QueuedPipeline<BareItemHandle, BareHandlePolicy> _structPipeline = null!;
+
+    [GlobalSetup(Target = nameof(EnqueueCompleteStructT))]
+    public void SetupStructT()
+    {
+        _structPipeline = Pipeline.Create<BareItemHandle, BareHandlePolicy>(new BareHandlePolicy(), runContinuationsAsynchronously: RunAsync);
+        _item = new BareItem();
+    }
+
+    /// Forced-specialization A/B: T is a single-ref struct wrapper, so the instantiation is fully
+    /// specialized (struct type arguments never share __Canon code) - every constrained call on the
+    /// enumerator inlines and the generic-dictionary/instantiating-stub dispatch the ref-T shape
+    /// pays disappears. The delta against EnqueueComplete is the shared-generics tax.
+    [Benchmark]
+    public void EnqueueCompleteStructT()
+    {
+        var item = _item;
+        item.Reset();
+        _structPipeline.Enqueue(new BareItemHandle(item)).Execute();
+        item.Wait();
+    }
+}
+
+readonly struct BareItemHandle(BareItem item)
+{
+    public readonly BareItem Item = item;
+}
+
+struct BareHandlePolicy : IPipelinePolicy<BareItemHandle>
+{
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItemHandle item, CancellationToken cancellationToken)
+        => new(new PipelineItemResult(ValueTask.CompletedTask));
+
+    public void ActivateHeadItem(BareItemHandle item, bool preferAsync = true) { }
+
+    public void CompleteItem(BareItemHandle item, int remainingDepth, Exception? exception)
+        => item.Item.SignalComplete();
+
+    public bool TryRecoverItemFailure(in PipelineItemFailureContext context, BareItemHandle failedItem, CancellationToken cancellationToken, out BareItemHandle recoveryItem)
+    {
+        recoveryItem = default;
+        return false;
     }
 }
 

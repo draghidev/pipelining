@@ -159,6 +159,8 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         /// with the lock held through the awaiter's continuation registration
         /// (lock-through-OnCompleted), so a producer's Enqueue+Signal racing the miss either
         /// resolves this call to an immediate retry or wakes the armed wait - never a lost wake.
+        /// NOTE: no AggressiveInlining here - measured +3ns WORSE with it on the wait-per-item
+        /// shape (forced inline bloats the executor's state machine for a once-per-wait call).
         /// </summary>
         public WaitForNextAwaitable WaitForNextAsync()
         {
