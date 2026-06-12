@@ -126,28 +126,54 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
         // discipline guarantees the continuation is stored before _pending can be claimed
         // (a Signal blocks on the lock until registration released it).
         AcquireWakeLock();
+        bool claimed;
         try
         {
-            if (!_pending)
-                return false;
-            _pending = false;
-            // Clear the suspension observation UNDER the lock (pairing with the registration's
-            // under-lock Set - the lock totally orders Set/Reset) and before dispatch, so it
-            // stays accurate across resume: a stale observation would let a sync-handoff
-            // producer skip its rendezvous (WaitProtocol.tla ClearOnClaimFix witness;
-            // atomicity-fidelity audit C1).
-            _suspendedMres?.Reset();
+            claimed = TryClaimLocked();
         }
         finally
         {
             ReleaseWakeLock();
         }
 
+        if (!claimed)
+            return false;
+        DispatchClaimed(runContinuationsAsynchronously);
+        return true;
+    }
+
+    /// <summary>
+    /// Claims an armed wait under the wake lock WITHOUT dispatching, for callers that compose
+    /// their own gate read with the claim in one lock hold (a producer whose signal must defer
+    /// while some window is open: the gate re-read and the claim must be atomic against the
+    /// window's rendezvous, or a gate verdict taken before the window opened can pair with a
+    /// claim landing after its owner committed to the armed wait - the rendezvous steal). Call between
+    /// <see cref="AcquireWakeLock"/>/<see cref="ReleaseWakeLock"/>; pair a true return with
+    /// <see cref="DispatchClaimed"/> AFTER the release.
+    /// </summary>
+    public bool TryClaimLocked()
+    {
+        if (!_pending)
+            return false;
+        _pending = false;
+        // Clear the suspension observation UNDER the lock (pairing with the registration's
+        // under-lock Set - the lock totally orders Set/Reset) and before dispatch, so it
+        // stays accurate across resume: a stale observation would let a sync-handoff
+        // producer skip its rendezvous (WaitProtocol.tla ClearOnClaimFix witness;
+        // atomicity-fidelity audit C1).
+        _suspendedMres?.Reset();
+        return true;
+    }
+
+    /// <summary>Dispatches a wait claimed via <see cref="TryClaimLocked"/>. Call after
+    /// <see cref="ReleaseWakeLock"/> (an inline dispatch re-enters the protocol on this
+    /// thread; holding the lock across it would deadlock the continuation's own wait path).</summary>
+    public void DispatchClaimed(bool runContinuationsAsynchronously)
+    {
         if (runContinuationsAsynchronously)
             Scheduler.SubmitDetached(this, preferLocal: true);
         else
             _waitContinuation!();
-        return true;
     }
 
     void IThreadPoolWorkItem.Execute() => _waitContinuation!();
