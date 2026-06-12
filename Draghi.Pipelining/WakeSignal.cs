@@ -85,11 +85,15 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     {
         if (!ReferenceEquals(_waitContinuation, continuation))
             _waitContinuation = continuation;
-        ReleaseWakeLock();
-        // Suspension observation fires AFTER the lock release: the observing producer's
-        // Signal must find the lock free and the continuation stored (lock-through closed
-        // the registration gap; the order here keeps the wake path uncontended).
+        // Suspension observation set UNDER the lock (before the release), pairing with the
+        // claim's Reset which is also under the lock: the lock totally orders Set/Reset.
+        // An out-of-lock Set raced a claim's out-of-lock Reset (Set landing after) leaving a
+        // STALE TRUE - a later handoff producer would skip its rendezvous and its inline
+        // claim would find nothing pending (atomicity-fidelity audit C1; the previous
+        // "uncontended wake path" ordering was the bug). The woken producer's Signal briefly
+        // spins on the lock until this release - correctness over a few ns.
         _suspendedMres?.Set();
+        ReleaseWakeLock();
 
         if (IsCompleted)
             SignalCore(runContinuationsAsynchronously: true);
@@ -127,16 +131,17 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             if (!_pending)
                 return false;
             _pending = false;
+            // Clear the suspension observation UNDER the lock (pairing with the registration's
+            // under-lock Set - the lock totally orders Set/Reset) and before dispatch, so it
+            // stays accurate across resume: a stale observation would let a sync-handoff
+            // producer skip its rendezvous (WaitProtocol.tla ClearOnClaimFix witness;
+            // atomicity-fidelity audit C1).
+            _suspendedMres?.Reset();
         }
         finally
         {
             ReleaseWakeLock();
         }
-
-        // Clear the suspension observation BEFORE dispatch so it stays accurate across
-        // resume: a stale observation would let a sync-handoff producer skip its
-        // rendezvous (WaitProtocol.tla, ClearOnClaimFix witness).
-        _suspendedMres?.Reset();
 
         if (runContinuationsAsynchronously)
             Scheduler.SubmitDetached(this, preferLocal: true);
