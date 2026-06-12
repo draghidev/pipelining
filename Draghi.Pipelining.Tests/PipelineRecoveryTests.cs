@@ -793,4 +793,188 @@ public class PipelineRecoveryTests
             "The policy must never be consulted about an item it returned as a recovery.");
         Assert.IsFalse(item.IsCompleted, "Original was substituted, not independently completed.");
     }
+
+    /// Audit reorder (a), June 2026: a slot drain that parks for recovery must leave the
+    /// position's count credit in place until the rejoin. The old shape decremented BEFORE the
+    /// fault decision, which opened the executor's Count==0 inline-activation gate mid-recovery
+    /// (successors activated against the live recovery item - a second active reader) and
+    /// double-decremented the position when the rejoin's AdvanceAndDrain ran its own decrement.
+    /// Model: Pipeline.tla SlotHeadRecovers parks at drainPhase "claimed", ahead of SlotDrainCount.
+    [TestMethod]
+    public async Task SlotRecoveryPark_SuccessorsCommitDuringRecovery_SingleActivationEach()
+    {
+        var recovery = new TestPipelineItem { Name = "R", ExecuteAsync = true };
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
+
+        var faulting = new TestPipelineItem { Name = "A", CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
+        pipeline.Enqueue(faulting).Execute();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)); // A committed (slot tier)
+
+        // Fault the committed waiter: the drain claims the slot, the policy substitutes R, and
+        // the drain parks on R's pending execute task with the advancer held.
+        faulting.CompletePipelineTask();
+        await recovery.WaitForExecutedAsync();
+
+        // Successors committed during the park: B refills the freed slot, C forces escalation.
+        var b = new TestPipelineItem { Name = "B", CompleteAsync = true };
+        idleTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pipeline.Enqueue(b).Execute();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var c = new TestPipelineItem { Name = "C", CompleteAsync = true };
+        idleTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pipeline.Enqueue(c).Execute();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // The recovered position still holds its count credit, so neither successor may have
+        // been activated (the old order's executor-side Count==0 gate activated B here).
+        Assert.AreEqual(0, b.ActivationCount, "Successor B activated while the recovery occupies the head position.");
+        Assert.AreEqual(0, c.ActivationCount, "Successor C activated while the recovery occupies the head position.");
+
+        // Resume the recovery; its continuation rejoins the advancer chain, which decrements
+        // the recovered position exactly once and activates B (queue head after escalation).
+        recovery.CompleteExecuteTask();
+        await recovery.WaitForCompleteAsync();
+        await b.WaitForActivationAsync();
+
+        b.CompletePipelineTask();
+        await b.WaitForCompleteAsync();
+        await c.WaitForActivationAsync();
+        c.CompletePipelineTask();
+        await c.WaitForCompleteAsync();
+
+        Assert.AreEqual(1, recovery.ActivationCount);
+        Assert.AreEqual(1, b.ActivationCount, "Successor B must be activated exactly once.");
+        Assert.AreEqual(1, c.ActivationCount, "Successor C must be activated exactly once.");
+        Assert.IsFalse(faulting.IsCompleted, "Original was substituted, not independently completed.");
+
+        await pipeline.CompleteAsync();
+    }
+
+    /// The non-escalated face of the same reorder: with a SINGLE successor the store never
+    /// escalates, so the recovery rejoin must run the slot-mode partition. The queue-flavored
+    /// rejoin peeked an empty queue (the successor lives in the slot) and lost B's activation.
+    [TestMethod]
+    public async Task SlotRecoveryPark_SlotSuccessor_RejoinActivatesFromSlot()
+    {
+        var recovery = new TestPipelineItem { Name = "R", ExecuteAsync = true };
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
+
+        var faulting = new TestPipelineItem { Name = "A", CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
+        pipeline.Enqueue(faulting).Execute();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        faulting.CompletePipelineTask();
+        await recovery.WaitForExecutedAsync();
+
+        var b = new TestPipelineItem { Name = "B", CompleteAsync = true };
+        idleTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        pipeline.Enqueue(b).Execute();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        Assert.AreEqual(0, b.ActivationCount, "Slot successor activated while the recovery occupies the head position.");
+
+        recovery.CompleteExecuteTask();
+        await recovery.WaitForCompleteAsync();
+        await b.WaitForActivationAsync();
+
+        b.CompletePipelineTask();
+        await b.WaitForCompleteAsync();
+
+        Assert.AreEqual(1, b.ActivationCount, "Slot successor must be activated exactly once by the rejoin's slot partition.");
+        Assert.IsFalse(faulting.IsCompleted, "Original was substituted, not independently completed.");
+
+        await pipeline.CompleteAsync();
+    }
+
+    /// Audit reorder (b), June 2026: a tail whose pipeline task is already settled-and-faulted at
+    /// commit time recovers via RecoverCommittedTailWaiterAsync. With a PRIOR committed waiter
+    /// still in flight, the recovery install must be count-gated (mirroring RecoverItem): the
+    /// prior waiter is the active reader and the recovery defers, completing unactivated when its
+    /// work finishes first. The old shape activated unconditionally - a second active reader.
+    /// Model: Pipeline.tla ExecCommitTailRecovers resolving via RecoverInstallWins/Loses.
+    [TestMethod]
+    public async Task CommittedTailFaultsAtCommit_PriorWaiterInFlight_RecoveryActivationGated()
+    {
+        var recovery = new TestPipelineItem { Name = "R" };
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+
+        var prior = new TestPipelineItem { Name = "W", CompleteAsync = true };
+        pipeline.Enqueue(prior).Execute();
+        await prior.WaitForExecutedAsync();
+
+        // The faulting tail. The trailing await is the only deterministic suspension between the
+        // tail transition and the next iteration's CommitTailWaiter; the pipeline task faults
+        // inside that window, so the commit observes a settled, faulted task.
+        var gate = new AwaitObservedTrailingSource();
+        var tail = new TestPipelineItem
+        {
+            Name = "X",
+            CompleteAsync = true,
+            PipelineTaskException = new InvalidOperationException("faulted at commit"),
+            TrailingTaskSource = gate,
+        };
+        pipeline.Enqueue(tail).Execute();
+        await gate.Awaited.WaitAsync(TimeSpan.FromSeconds(5));
+
+        tail.CompletePipelineTask();
+        gate.Complete();
+
+        await recovery.WaitForCompleteAsync();
+        Assert.IsNull(recovery.Exception);
+        Assert.AreEqual(0, recovery.ActivationCount,
+            "The prior waiter was in flight; a count-gated install completes the recovery unactivated.");
+        Assert.AreEqual(1, prior.ActivationCount);
+        Assert.IsFalse(tail.IsCompleted, "Original was substituted, not independently completed.");
+        Assert.IsFalse(prior.IsCompleted);
+
+        prior.CompletePipelineTask();
+        await prior.WaitForCompleteAsync();
+        await pipeline.CompleteAsync();
+    }
+
+    /// Trailing task source whose await registration is observable. The executor suspending on
+    /// the trailing await is the deterministic window in which a tail's pipeline task can fault
+    /// before CommitTailWaiter observes it (the RecoverCommittedTailWaiterAsync branch).
+    /// Single-use, single-awaiter; the test serializes Complete after Awaited.
+    sealed class AwaitObservedTrailingSource : System.Threading.Tasks.Sources.IValueTaskSource
+    {
+        readonly TaskCompletionSource _awaited = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        Action<object?>? _continuation;
+        object? _state;
+        bool _completed;
+
+        public Task Awaited => _awaited.Task;
+        public ValueTask Task => new(this, 0);
+
+        public void Complete()
+        {
+            Volatile.Write(ref _completed, true);
+            if (Interlocked.Exchange(ref _continuation, null) is { } continuation)
+                continuation(_state);
+        }
+
+        public System.Threading.Tasks.Sources.ValueTaskSourceStatus GetStatus(short token)
+            => Volatile.Read(ref _completed)
+                ? System.Threading.Tasks.Sources.ValueTaskSourceStatus.Succeeded
+                : System.Threading.Tasks.Sources.ValueTaskSourceStatus.Pending;
+
+        public void GetResult(short token)
+        {
+        }
+
+        public void OnCompleted(Action<object?> continuation, object? state, short token, System.Threading.Tasks.Sources.ValueTaskSourceOnCompletedFlags flags)
+        {
+            _state = state;
+            Volatile.Write(ref _continuation, continuation);
+            _awaited.TrySetResult();
+        }
+    }
 }

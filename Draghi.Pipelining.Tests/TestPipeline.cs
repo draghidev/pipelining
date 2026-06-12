@@ -38,6 +38,10 @@ sealed class TestPipelineItem
     public bool CompleteAsync { get; init; }
     public bool ExecuteAsync { get; init; }
     public bool HasTrailingTask { get; init; }
+    // Custom trailing-task backing source (takes precedence over the TCS-backed trailing task).
+    // Lets tests observe the executor's trailing await registration - the only deterministic
+    // suspension between the tail transition and the next iteration's CommitTailWaiter.
+    public System.Threading.Tasks.Sources.IValueTaskSource? TrailingTaskSource { get; init; }
     public Action? OnComplete { get; init; }
 
     public void Complete(Exception? exception)
@@ -161,9 +165,11 @@ sealed class TestPipelineItem
     {
         if (!ExecuteAsync)
         {
-            var trailingTask = TrailingTaskException is not null || HasTrailingTask
-                ? new ValueTask(_trailingTaskTcs.Task)
-                : default;
+            var trailingTask = TrailingTaskSource is { } source
+                ? new ValueTask(source, 0)
+                : TrailingTaskException is not null || HasTrailingTask
+                    ? new ValueTask(_trailingTaskTcs.Task)
+                    : default;
             return new(new PipelineItemResult(trailingTask, GetPipelineTask()));
         }
         return new(_executeTaskTcs.Task);

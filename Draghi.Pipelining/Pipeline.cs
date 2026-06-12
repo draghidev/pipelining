@@ -672,7 +672,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return;
         }
 
-        ActivateHeadItem(recoveryItem, preferAsync: false);
+        // Republish and gate activation on the count, mirroring RecoverItem: activating
+        // unconditionally while prior waiters are in flight would put a second active reader on the
+        // wire.
+        _executingItem = recoveryItem;
+        Volatile.Write(ref _hasInFlightItem, true);
+        var recoveryActivated = false;
+        if (_waiters.Count is 0)
+        {
+            ActivateHeadItem(recoveryItem, preferAsync: false);
+            recoveryActivated = true;
+        }
+        else
+        {
+            Volatile.Write(ref _hasExecutingItem, true);
+        }
 
         PipelineItemResult result;
         try
@@ -681,6 +695,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         catch (Exception recoveryEx)
         {
+            ClearExecutingItem(recoveryActivated);
             CompleteWaiter(recoveryItem, recoveryEx);
             return;
         }
@@ -693,6 +708,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
             catch (Exception ex)
             {
+                ClearExecutingItem(recoveryActivated);
                 CompleteWaiter(recoveryItem, ex);
                 return;
             }
@@ -701,6 +717,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         var pipelineTask = result.PipelineTask;
         if (pipelineTask.IsCompleted)
         {
+            ClearExecutingItem(recoveryActivated);
             Exception? pipelineException = null;
             try
             {
@@ -717,6 +734,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // Pipeline shutdown while recovery's async work was in flight. EnqueueWaiter at this
             // point would leak: OnWaiterTaskCompleted bails on wake completion, and DrainOnCompletionAsync
             // has likely already passed. Complete directly so depth tracking and CompleteItem still fire.
+            ClearExecutingItem(recoveryActivated);
             CompleteWaiter(recoveryItem, _completionException);
         }
         else
@@ -724,7 +742,18 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // The recovery enters the store as an ordinary waiter; its identity travels in the TASK
             // (the guard wrapper rethrows late faults as RecoveryItemFaultException, see the marker
             // type), not in pipeline state - no fields, no value-T-unsound item comparisons.
-            CommitWaiter(recoveryItem, activated: true, GuardRecoveryTask(pipelineTask));
+            //
+            // Consume the publish with CommitTailWaiter's Exchange discipline before the commit (this
+            // runs inside the executor's commit await, so the tail slot is not an option). A lost
+            // Exchange means the advancer's C-path is mid-activation under its lock; the empty lock
+            // acquire synchronizes-with its release so the commit below cannot race ActivateHeadItem.
+            var alreadyActivated = !Interlocked.Exchange(ref _hasExecutingItem, false);
+            if (!alreadyActivated && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                _executingItem = default!;
+            if (alreadyActivated && !recoveryActivated && _activationLock is { } activationLock)
+                lock (activationLock) { }
+            Volatile.Write(ref _hasInFlightItem, false);
+            CommitWaiter(recoveryItem, activated: alreadyActivated, GuardRecoveryTask(pipelineTask));
         }
     }
 
@@ -927,6 +956,20 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             taskException = ex;
         }
 
+        // Fault decision BEFORE the decrement, mirroring the queue drain. Decrementing first would
+        // publish the freed position mid-recovery: the executor's Count==0 inline-activation gate
+        // could dispatch a successor against the recovery's own activation (a second active reader),
+        // and the recovery rejoin's AdvanceAndDrain would decrement the SAME position again (a double
+        // decrement, which the -1 skew arm then misattributes to a counted successor).
+        bool emptyReached = false;
+        if (taskException is not null && !RecoverWaiter(item, taskException, out emptyReached))
+        {
+            // Recovery item taking over; the count still carries this position. The advancer
+            // flag stays held, and the recovery continuation decrements exactly once and
+            // re-runs the activation partition via AdvanceAndDrainRecovery's slot-mode rejoin.
+            return;
+        }
+
         var count = _waiters.DecrementCount();
         // -1 floor, not 0: a claimable-but-uncounted commit (fields/flag precede the increment)
         // consumed here sends the count transiently negative, bounded at -1 by the single producer.
@@ -936,24 +979,54 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // _hasSlot CAS is the ownership contract, not the count. The returned count is the
         // activation-responsibility partition below, same as DrainReadyWaiters' drain loop.
 
-        bool advance;
-        bool emptyReached;
         if (taskException is null)
-        {
             emptyReached = CompleteWaiterDeferred(item, null);
-            advance = true;
-        }
-        else
-        {
-            advance = RecoverWaiter(item, taskException, out emptyReached);
-        }
 
-        if (!advance)
-        {
-            // Recovery item taking over. Advancer flag stays held, recovery continuation releases.
-            return;
-        }
+        ActivateNextAfterSlotAdvance(count);
 
+        // Capture the deposit consumed by the release: a contended acquirer (a callback, the nudge)
+        // that bailed against this hold flagged the latch word. The obligation must be SERVED, not
+        // delegated to the flag - the slot drain's own claim cleared _drainSignal at consume time, so
+        // a deposit whose companion flag the claim ate would vanish if the reclaim below read only the
+        // flag (stranding the queue head). OR-ing the deposit into the reclaim gate carries the
+        // obligation past the flag's self-consumption.
+        var serveDeposit = _advancing.ReleaseAndCheckPending();
+        // Signal AFTER advancer release: prevents a WaitForEmptyAsync awaiter from resuming and
+        // committing a new slot waiter whose callback would then race the still-held advancer
+        // (the callback's failed acquire deposits, costing the holder a serve pass).
+        if (emptyReached)
+            _depthState.OnDepthReachedZero();
+        SignalDrainWakeupIfWaiting();
+
+        // Reclaim, mirroring the queue drain's tail: a successor's waiter that completed
+        // while we held the advancer had its callback deposit-and-bail - with no
+        // reclaim the activation chain dies there (field signature: "Operation timed out
+        // waiting for activation"). In non-escalated slot mode, a set drain signal implies
+        // the bailed waiter IS the current slot occupant with a completed task (a commit
+        // against an occupied slot escalates instead), so looping back to the claim is safe.
+        // Verified: Pipeline.tla SlotDrainerReclaim / Pipeline_StrandWitness.cfg
+        // (SlotReclaimEnabled=FALSE reproduces the lost-activation liveness violation; TRUE
+        // holds EventuallyCompleted and NoTripleActivation across the full state space).
+        if (!_enumerator.CompletionToken.IsCancellationRequested
+            && (serveDeposit || Volatile.Read(ref _drainSignal))
+            && _advancing.TryAcquireOrFlagPending())
+        {
+            if (_waiters.IsEscalated)
+            {
+                DrainReadyWaiters();
+                return;
+            }
+            continue;
+        }
+        return;
+        }
+    }
+
+    /// The slot-mode activation partition on a DecrementCount result, shared by DrainSlotInline's
+    /// advance path and the recovery rejoin (AdvanceAndDrain's slot branch). Caller holds the
+    /// advancer latch.
+    void ActivateNextAfterSlotAdvance(int count)
+    {
         if (count > 0)
         {
             // Slot-mode D-path, mirroring DrainReadyWaiters' count > 0 arm: the successor's
@@ -1013,46 +1086,6 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     ActivateHeadItem(executing, preferAsync: true);
                 }
             }
-        }
-
-        // Capture the deposit consumed by the release: a contended acquirer (a callback, the
-        // nudge) that bailed against this hold flagged the latch word. The obligation must be
-        // SERVED, not delegated to the flag - the slot drain's own claim cleared _drainSignal at
-        // consume time, so a deposit whose companion flag the claim ate would vanish if the
-        // reclaim below read only the flag (the tri-state round's liveness counterexample: a
-        // queue inline-callback bail's deposit consumed by a slot release that then read the
-        // self-cleared flag and exited, stranding the queue head). OR-ing the deposit into the
-        // reclaim gate carries the obligation past the flag's self-consumption. Verified:
-        // Pipeline.tla SlotDrainerRelease + SlotServeReacq* (PendingWordLatch arm).
-        var serveDeposit = _advancing.ReleaseAndCheckPending();
-        // Signal AFTER advancer release: prevents a WaitForEmptyAsync awaiter from resuming and
-        // committing a new slot waiter whose callback would then race the still-held advancer
-        // (the callback's failed acquire deposits, costing the holder a serve pass).
-        if (emptyReached)
-            _depthState.OnDepthReachedZero();
-        SignalDrainWakeupIfWaiting();
-
-        // Reclaim, mirroring the queue drain's tail: a successor's waiter that completed
-        // while we held the advancer had its callback deposit-and-bail - with no
-        // reclaim the activation chain dies there (field signature: "Operation timed out
-        // waiting for activation"). In non-escalated slot mode, a set drain signal implies
-        // the bailed waiter IS the current slot occupant with a completed task (a commit
-        // against an occupied slot escalates instead), so looping back to the claim is safe.
-        // Verified: Pipeline.tla SlotDrainerReclaim / Pipeline_StrandWitness.cfg
-        // (SlotReclaimEnabled=FALSE reproduces the lost-activation liveness violation; TRUE
-        // holds EventuallyCompleted and NoTripleActivation across the full state space).
-        if (!_enumerator.CompletionToken.IsCancellationRequested
-            && (serveDeposit || Volatile.Read(ref _drainSignal))
-            && _advancing.TryAcquireOrFlagPending())
-        {
-            if (_waiters.IsEscalated)
-            {
-                DrainReadyWaiters();
-                return;
-            }
-            continue;
-        }
-        return;
         }
     }
 
@@ -1446,6 +1479,13 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _waiterRecoveryItem = default!;
         CompleteWaiter(recoveryItem, _completionException);
+        // The recovery park holds its position's count credit (the fault decision precedes the
+        // decrement in both drains). Every park resolution settles it exactly once: the sync advance
+        // paths decrement in their drain loop, the normal continuation decrements via AdvanceAndDrain,
+        // and this bailout settles it here - without it the credit strands and DrainOnCompletionAsync's
+        // count wait never falls to zero.
+        var count = _waiters.DecrementCount();
+        Debug.Assert(count >= -1);
         // Shutdown bailout: a deposit consumed here is deliberately dropped - completion
         // ownership has transferred to DrainOnCompletionAsync's queue sweep, which waits on
         // advancer-idle (signaled below) and sweeps without consulting the signal flag.
@@ -1498,6 +1538,18 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         var count = _waiters.DecrementCount();
         Debug.Assert(count >= -1); // -1 floor, see DrainReadyWaiters.
+
+        // Slot-mode rejoin (a slot drain parked for recovery; the count still carried the recovered
+        // position - see DrainSlotInline's recovery return): the successor, if any, lives in the SLOT,
+        // not the queue. The queue partition below would peek nothing and lose its activation (its
+        // count > 0 arm asserts on the empty queue). Run the slot partition instead and re-enter the
+        // slot claim loop, which serves deposits and releases the advancer.
+        if (!_waiters.IsEscalated)
+        {
+            ActivateNextAfterSlotAdvance(count);
+            DrainSlotInline();
+            return;
+        }
 
         // <= 0 partition + checked peek, mirroring DrainReadyWaiters (this advance is the
         // recovery path's drain step and shares the count-skew exposure).

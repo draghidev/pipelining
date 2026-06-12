@@ -3551,22 +3551,28 @@ EventuallyActivated ==
           parked; the post-resolution rejoin IS the standard SlotDrainCount ->
           SlotDrainComplete* steps (= the partition + AdvanceAndDrainRecovery),
           gated on no RecoveringInline. TWO CODE FINDINGS pinned in the action
-          comment: DrainSlotInline decrements BEFORE the fault decision (~1022)
-          - (a) opens the executor's Count==0 inline gate mid-recovery (second
-          active reader vs RecoverWaiter's unconditional ActivateHeadItem),
-          (b) double-decrements via AdvanceAndDrain's queue-flavored rejoin
-          (whose >0 arm also queue-peeks; a slot successor trips its assert).
-          The model encodes the intended order (decision before decrement,
-          mirroring DrainReadyWaiters); DrainSlotInline needs the reorder.
+          comment, BOTH FIXED (June 2026 audit round): DrainSlotInline decremented
+          BEFORE the fault decision (~1022) - (a) opened the executor's Count==0
+          inline gate mid-recovery (second active reader vs RecoverWaiter's
+          unconditional ActivateHeadItem), (b) double-decremented via
+          AdvanceAndDrain's queue-flavored rejoin (whose >0 arm also queue-peeks;
+          a slot successor tripped its assert). The code now matches the model's
+          order (fault decision at "claimed", decrement only on advance; the
+          recovery rejoin runs the slot partition + DrainSlotInline re-entry via
+          AdvanceAndDrain's IsEscalated branch). Guarded by
+          PipelineRecoveryTests.SlotRecoveryPark_* (fail on the old order).
         - [DONE] Phase D: pre-faulted commit (ExecCommitTailRecovers - the
           RecoverCommittedTailWaiterAsync branch: CommitTailWaiter observes a
           settled-and-faulted tail task and recovers executor-inline; publish
           consume covers both Exchange outcomes; store untouched). Resolves via
-          RecoverInstallWins/Loses (count-gated activation). CODE NOTE: the
-          code's RecoverCommittedTailWaiterAsync activates UNCONDITIONALLY
-          (~749) even with prior waiters in flight - the eager-activation shape
-          RecoverItem's count gate (~506) exists to prevent; the model encodes
-          the gated (intended) semantics. Coverage: fires (98 transitions in the
+          RecoverInstallWins/Loses (count-gated activation). CODE NOTE, FIXED
+          (June 2026 audit round): RecoverCommittedTailWaiterAsync activated
+          UNCONDITIONALLY (~749) even with prior waiters in flight - the
+          eager-activation shape RecoverItem's count gate (~506) exists to
+          prevent. The code now installs count-gated (republish + deferred
+          publish at Count > 0, matching the model); guarded by
+          PipelineRecoveryTests.CommittedTailFaultsAtCommit_PriorWaiterInFlight_*.
+          Coverage: fires (98 transitions in the
           witness) but adds 0 distinct states - its park state coincides with
           ExecItemFailure firing on a task-settled Executing item (the executor
           loop's sync pipeline-task-fault branch, ~359), a real distinct code
