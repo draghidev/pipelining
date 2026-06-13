@@ -1276,7 +1276,7 @@ ExecutorInlineCallbackBailsOut ==
                    taskDone, activations, storeCount, esc_vars, drainer_vars, failed>>
 
 (* ===========================================================================
-   Callbacks (OnWaiterTaskCompleted / OnCommittedTaskCompleted).
+   Callback (OnWaiterTaskCompleted).
 
    Slot callbacks (item still in InSlot when task completes) have two outcomes:
      - Drain inline: slot CAS wins, processes item directly.
@@ -2180,7 +2180,7 @@ CallbackSetSignal ==
   /\ SplitCallbackOps
   /\ \E i \in Item :
        /\ i \in taskDone
-       \* InWaiters: OnWaiterTaskCompleted's store. InSlot occupant: OnCommittedTaskCompleted's
+       \* InWaiters: queued-entry callback's store. InSlot occupant: slot-tier callback's
        \* store - the SLOT bail's set, un-fused from its acquire (the audit's last granularity
        \* item). The escTail exclusion mirrors SlotDrainClaimEntry (wiring runs after the
        \* commit's count step). A mid-move transient (loc still InSlot, slotItem already

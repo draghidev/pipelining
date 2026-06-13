@@ -133,14 +133,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     // Activation.
     readonly Action _onWaiterTaskCompletedAction;
-    readonly Action _onCommittedTaskCompletedAction;
     readonly Action _incrementDepthAction;
 
     internal Pipeline(TPolicy policy, TSource source)
     {
         // Delegate references bind to `this` and don't change.
         _onWaiterTaskCompletedAction = OnWaiterTaskCompleted;
-        _onCommittedTaskCompletedAction = OnCommittedTaskCompleted;
         _incrementDepthAction = IncrementDepth;
         Initialize(policy, source);
     }
@@ -872,12 +870,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// Commits a waiter to the store and coordinates activation with the execution loop. The
     /// store routes to the inline slot when empty (zero alloc), otherwise it escalates to the
-    /// SPSC queue (allocates queue + lock on first overlap). The wired completion callback is
-    /// chosen accordingly: the slot path uses _onCommittedTaskCompletedAction (which morphs into
-    /// the advancer-wake path after a later escalation, since the slot contents get moved to
-    /// queue head and the callback's drain still finds them as the head item). The queue path
-    /// uses _onWaiterTaskCompletedAction directly. All call sites run on the executor's logical
-    /// thread, preserving the SPSC single-producer contract.
+    /// SPSC queue (allocates queue + lock on first overlap). All call sites run on the executor's
+    /// logical thread, preserving the SPSC single-producer contract. The wired completion
+    /// callback dispatches on _waiters.IsEscalated at fire time (slot occupant -> DrainSlotInline,
+    /// queued or post-escalation moved-to-head -> DrainReadyWaiters).
     void CommitWaiter(T item, bool activated, ValueTask waiterTask)
     {
         // Allocate the activation lock on first commit (slot or queue): the count==0 handoff
@@ -886,7 +882,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // allocation per Pipeline lifetime, amortized across all subsequent commits and runs.
         _activationLock ??= new Lock();
 
-        var count = _waiters.TryEscalateOrEnqueue(item, waiterTask, out var isSlot, out var slotWasMoved);
+        var count = _waiters.TryEscalateOrEnqueue(item, waiterTask, out _, out var slotWasMoved);
         var wasEmpty = count is 1;
 
         // The atomic _executingItemActivationPending claim already happened in CommitTailWaiter /
@@ -902,11 +898,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
         }
 
-        var callback = isSlot ? _onCommittedTaskCompletedAction : _onWaiterTaskCompletedAction;
         if (waiterTask.IsCompleted)
-            callback();
+            _onWaiterTaskCompletedAction();
         else
-            waiterTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(callback);
+            waiterTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(_onWaiterTaskCompletedAction);
 
         // Compensation check for the slot drainer's chain arm: if our escalation's move raced
         // the drainer's head peek, the drainer published its activation obligation instead of
@@ -931,7 +926,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             DrainReadyWaiters();
     }
 
-    /// Called when a waiter's pipeline task completes. Signals readiness and tries to become the advancer.
+    /// Called when a committed waiter's task completes. Dispatches to the drain matching the
+    /// store's tier at fire time: slot occupant (pre-escalation) -> DrainSlotInline; queued
+    /// entry, or a slot occupant whose contents were moved to queue head by a later
+    /// escalation, -> DrainReadyWaiters.
     void OnWaiterTaskCompleted()
     {
         // Plain store: the acquire RMW below is the full fence that publishes it. The flag
@@ -950,34 +948,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return;
         }
 
-        DrainReadyWaiters();
-    }
-
-    /// Wired on the slot-tier UnsafeOnCompleted. The same callback covers both pre- and
-    /// post-escalation: if the store has not escalated when this fires, the slot drain happens
-    /// inline. If escalation moved the slot contents to queue head before this fired, the
-    /// callback functions as OnWaiterTaskCompleted and the standard advancer drains the queue.
-    void OnCommittedTaskCompleted()
-    {
-        // Plain store, published by the acquire RMW (see OnWaiterTaskCompleted).
-        _drainSignal = true;
-
-        // Process even during shutdown (see OnWaiterTaskCompleted).
-        if (!_advancing.TryAcquireOrFlagPending())
-        {
-            // Obligation deposited in the latch word; the holder's release serves it.
-            return;
-        }
-
         if (_waiters.IsEscalated)
-        {
-            // The slot's (item, task) was moved to queue head by EscalateAndEnqueue, and head's
-            // task is the one that just completed. Standard drain picks it up.
             DrainReadyWaiters();
-            return;
-        }
-
-        DrainSlotInline();
+        else
+            DrainSlotInline();
     }
 
     /// Slot-mode drain. Advancer latch is held by the caller. CAS-claims the slot and processes
@@ -1176,7 +1150,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// The advancer loop: processes completed waiters from the head of the queue in order.
     /// Only one thread runs this at a time, ensuring head-first processing and ordered completion.
     /// Reachable only after a waiter was committed and escalated to the queue (slot-mode drains
-    /// run inline in OnCommittedTaskCompleted), so _activationLock is non-null and _waiters.Queue
+    /// route through DrainSlotInline), so _activationLock is non-null and _waiters.Queue
     /// is non-null on every code path here.
     void DrainReadyWaiters()
     {
