@@ -1,5 +1,9 @@
 namespace Draghi.Pipelining.Tests;
 
+// Catch-all for tests that can't be made deterministic via hooks (idleTcs, WaitForExecutedAsync).
+// Most tests here use deterministic hooks and parallelize fine; the two *_Stress runners opt out
+// per-method below - their 200-iteration loops with 10s timeouts can be skewed by cross-test TP
+// pressure into spurious hangs.
 [TestClass]
 public class PipelineConcurrencyTests
 {
@@ -539,9 +543,9 @@ public class PipelineConcurrencyTests
 
     sealed class ActivationOrderingItem
     {
-        readonly ManualResetEventSlim _executed = new(false);
-        readonly ManualResetEventSlim _completed = new(false);
-        readonly ManualResetEventSlim _activationStarted = new(false);
+        readonly TaskCompletionSource _executedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        readonly TaskCompletionSource _completedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        readonly TaskCompletionSource _activationStartedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         readonly TaskCompletionSource _pipelineTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         readonly TaskCompletionSource _trailingTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         readonly TaskCompletionSource<PipelineItemResult> _executeTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -554,16 +558,20 @@ public class PipelineConcurrencyTests
 
         public bool ActivationFinishedBeforeComplete => _completeActivationState == 1;
 
-        public Task WaitForExecutedAsync() => _executed.IsSet
-            ? Task.CompletedTask
-            : Task.Run(() => Assert.IsTrue(_executed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for execute."));
+        public async Task WaitForExecutedAsync()
+        {
+            try { await _executedTcs.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
+            catch (TimeoutException) { Assert.Fail("Timed out waiting for execute."); }
+        }
 
-        public Task WaitForCompleteAsync() => _completed.IsSet
-            ? Task.CompletedTask
-            : Task.Run(() => Assert.IsTrue(_completed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for complete."));
+        public async Task WaitForCompleteAsync()
+        {
+            try { await _completedTcs.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
+            catch (TimeoutException) { Assert.Fail("Timed out waiting for complete."); }
+        }
 
         public void WaitForActivationStart() =>
-            Assert.IsTrue(_activationStarted.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for activation start.");
+            Assert.IsTrue(_activationStartedTcs.Task.Wait(TimeSpan.FromSeconds(10)), "Timed out waiting for activation start.");
 
         public void CompletePipelineTask() => _pipelineTaskTcs.SetResult();
         public void CompleteTrailingTask() => _trailingTaskTcs.SetResult();
@@ -574,13 +582,13 @@ public class PipelineConcurrencyTests
 
         internal ValueTask<PipelineItemResult> RunExecute()
         {
-            _executed.Set();
+            _executedTcs.TrySetResult();
             return ExecuteAsync ? new(_executeTaskTcs.Task) : new(new PipelineItemResult(GetTrailingTask(), GetPipelineTask()));
         }
 
         internal void RunActivate()
         {
-            _activationStarted.Set();
+            _activationStartedTcs.TrySetResult();
             // Slow activation: gives the executor time to race toward CompleteWaiter.
             Thread.Sleep(50);
             Volatile.Write(ref _activationFinished, 1);
@@ -591,7 +599,7 @@ public class PipelineConcurrencyTests
             // Snapshot whether activation has finished AT THIS MOMENT. Without the fix, this is
             // racy and will commonly observe 0 while activation is still sleeping.
             _completeActivationState = Volatile.Read(ref _activationFinished);
-            _completed.Set();
+            _completedTcs.TrySetResult();
         }
     }
 
@@ -923,7 +931,7 @@ public class PipelineConcurrencyTests
     /// against the post-chain-activation tree; not yet reproduced in 40 contended suite runs).
     /// Iterations via DRAGHI_STRESS_ITERATIONS (default 200, keeps suite cost ~sub-second);
     /// on a hang it reports WHICH task was stuck - the localizing fact a WhenAll timeout hides.
-    [TestMethod]
+    [TestMethod, DoNotParallelize]
     public async Task WaitForEmptyAsync_RacingCompleteAsync_Stress()
     {
         var iterations = int.TryParse(
@@ -976,7 +984,7 @@ public class PipelineConcurrencyTests
     /// DRAGHI_STRESS_ITERATIONS (default 200); on a hang it reports WHICH stage stuck plus
     /// every item's executed/completed state - the localizing facts a bare timeout hides.
     /// DRAGHI_STRESS_WAIT_ON_HANG=1 suspends (after a GC shed) for live dump capture.
-    [TestMethod]
+    [TestMethod, DoNotParallelize]
     public async Task DeferredActivationUnderSustainedLoad_Stress()
     {
         var iterations = int.TryParse(
@@ -995,7 +1003,7 @@ public class PipelineConcurrencyTests
             }
             foreach (var item in pile)
             {
-                if (!await Task.Run(() => item.TryWaitForExecuted(stageTimeout)))
+                if (!await item.TryWaitForExecutedAsync(stageTimeout))
                     await HangAsync(iter, "pile-executed", pipeline, pile, tail: null);
             }
 
@@ -1010,18 +1018,18 @@ public class PipelineConcurrencyTests
             var tail = new TestPipelineItem { CompleteAsync = true };
             pipeline.Enqueue(tail).Execute();
 
-            if (!await Task.Run(() => tail.TryWaitForExecuted(stageTimeout)))
+            if (!await tail.TryWaitForExecutedAsync(stageTimeout))
                 await HangAsync(iter, "tail-executed", pipeline, pile, tail);
 
             tail.CompletePipelineTask();
             await drainTask;
 
-            if (!await Task.Run(() => tail.TryWaitForCompleted(stageTimeout)))
+            if (!await tail.TryWaitForCompletedAsync(stageTimeout))
                 await HangAsync(iter, "tail-completed", pipeline, pile, tail);
 
             foreach (var item in pile)
             {
-                if (!await Task.Run(() => item.TryWaitForCompleted(stageTimeout)))
+                if (!await item.TryWaitForCompletedAsync(stageTimeout))
                     await HangAsync(iter, "pile-completed", pipeline, pile, tail);
             }
         }
@@ -1080,22 +1088,12 @@ public class PipelineConcurrencyTests
 
         await idleEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // idleEntered is signaled at the TOP of onIdle, BEFORE its `await idleCanReturn` actually
-        // suspends the executor. GCing immediately races the executor thread's still-live stack
-        // (registers/spill slots transiently rooting the just-processed item before they spill to
-        // the heap state-machine box on suspension), yielding a false "alive". Let it suspend first,
-        // same as the sibling Idle_* leak tests. After suspension the item is genuinely unreachable
-        // (verified via gcroot: 0 roots), so a real retention regression here still fails the assert.
-        await Task.Delay(50);
-
-        for (var i = 0; i < 3; i++)
-        {
-            GC.Collect(2, GCCollectionMode.Forced);
-            GC.WaitForPendingFinalizers();
-        }
-
         Assert.IsNotNull(itemRef);
-        Assert.IsFalse(itemRef.IsAlive,
+        // idleEntered fires at the TOP of onIdle, BEFORE the `await idleCanReturn` suspends the
+        // executor - transient stack rooting on the executor thread may still pin the just-processed
+        // item for a few ms. AssertDiesAsync's bounded retry rides out the suspension lag; a real
+        // retention regression never dies and still fails the assert.
+        await AssertDiesAsync(itemRef,
             "Item still alive after pre-idle clears - executor state machine retains it.");
 
         idleCanReturn.SetResult();
@@ -1312,14 +1310,8 @@ public class PipelineConcurrencyTests
         item = null!;
         heldRecovery = null!;
 
-        for (var i = 0; i < 3; i++)
-        {
-            GC.Collect(2, GCCollectionMode.Forced);
-            GC.WaitForPendingFinalizers();
-        }
-
         Assert.IsNotNull(recoveryRef);
-        Assert.IsFalse(recoveryRef.IsAlive, "Recovery item still alive after completion.");
+        await AssertDiesAsync(recoveryRef, "Recovery item still alive after completion.");
     }
 
     struct DepthRecordingPolicy : IPipelinePolicy<TestPipelineItem>

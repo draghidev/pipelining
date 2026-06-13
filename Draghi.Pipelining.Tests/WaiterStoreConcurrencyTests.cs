@@ -8,7 +8,7 @@ namespace Draghi.Pipelining.Tests;
 /// hammer exactly that window at the WaiterStore boundary - a far tighter loop than the full
 /// pipeline stress, so a reintroduced tear surfaces fast as a default(0) or a lost/duplicated
 /// marker. DRAGHI_STRESS_ITERATIONS overrides the iteration count.
-[TestClass]
+[TestClass, DoNotParallelize]
 public class WaiterStoreConcurrencyTests
 {
     static int Iterations =>

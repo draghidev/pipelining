@@ -1,6 +1,6 @@
 namespace Draghi.Pipelining.Tests;
 
-[TestClass]
+[TestClass, DoNotParallelize]
 public class LatchConcurrencyTests
 {
     /// Publish-then-acquire pattern with obligation transfer, mirroring the advancer claim in

@@ -2,7 +2,10 @@ namespace Draghi.Pipelining.Tests;
 
 sealed class TestPipelineItem
 {
-    static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(2);
+    // Bumped from 2s to 10s for parallel-test resilience: under method-level parallelism a busy
+    // machine can saturate the TP enough that legitimate progress slips past 2s. The async waits
+    // below are true-async (TCS, no TP-thread block) so the timeout never traps a healthy run.
+    static readonly TimeSpan WaitTimeout = TimeSpan.FromSeconds(10);
 
     static string BuildTimeoutMessage(string description)
     {
@@ -18,20 +21,37 @@ sealed class TestPipelineItem
     }
 
     public string? Name { get; init; }
-    readonly ManualResetEventSlim _completed = new(false);
-    readonly ManualResetEventSlim _activated = new(false);
-    readonly ManualResetEventSlim _executed = new(false);
+    // TCS-backed signals (was ManualResetEventSlim). Async waits now await the Task with timeout
+    // - no Task.Run + MRES.Wait + TP-blocked-worker hop. The sync waits use Task.Wait(timeout)
+    // on the caller's thread; the stress runners' TryWait* return bool the same way MRES did.
+    readonly TaskCompletionSource _completedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly TaskCompletionSource _activatedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+    readonly TaskCompletionSource _executedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly TaskCompletionSource _pipelineTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly TaskCompletionSource<PipelineItemResult> _executeTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly TaskCompletionSource _trailingTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public Exception? Exception { get; private set; }
     public bool IsCompleted { get; private set; }
-    public bool IsExecuted => _executed.IsSet;
+    public bool IsExecuted => _executedTcs.Task.IsCompletedSuccessfully;
 
     // Non-asserting waits for stress runners that own their timeout/diagnosis/suspend handling.
-    public bool TryWaitForExecuted(TimeSpan timeout) => _executed.Wait(timeout);
-    public bool TryWaitForCompleted(TimeSpan timeout) => _completed.Wait(timeout);
+    public bool TryWaitForExecuted(TimeSpan timeout) => _executedTcs.Task.Wait(timeout);
+    public bool TryWaitForCompleted(TimeSpan timeout) => _completedTcs.Task.Wait(timeout);
+
+    // Async TryWait variants: avoid the Task.Run + TP-blocked-worker hop that the sync forms
+    // need at the await sites. Used by stress runners under heavy TP load.
+    public async Task<bool> TryWaitForExecutedAsync(TimeSpan timeout)
+    {
+        try { await _executedTcs.Task.WaitAsync(timeout).ConfigureAwait(false); return true; }
+        catch (TimeoutException) { return false; }
+    }
+
+    public async Task<bool> TryWaitForCompletedAsync(TimeSpan timeout)
+    {
+        try { await _completedTcs.Task.WaitAsync(timeout).ConfigureAwait(false); return true; }
+        catch (TimeoutException) { return false; }
+    }
     public Exception? ThrowOnExecute { get; init; }
     public Exception? PipelineTaskException { get; init; }
     public Exception? TrailingTaskException { get; init; }
@@ -57,30 +77,21 @@ sealed class TestPipelineItem
         Exception = exception;
         IsCompleted = true;
         OnComplete?.Invoke();
-        _completed.Set();
+        _completedTcs.TrySetResult();
     }
 
-    public void SignalExecuted() => _executed.Set();
+    public void SignalExecuted() => _executedTcs.TrySetResult();
 
     public void WaitForExecuted()
     {
-        if (!_executed.Wait(WaitTimeout))
-        {
+        if (!_executedTcs.Task.Wait(WaitTimeout))
             Assert.Fail(BuildTimeoutMessage("Timed out waiting for item execution."));
-        }
     }
 
-    public Task WaitForExecutedAsync()
+    public async Task WaitForExecutedAsync()
     {
-        if (_executed.IsSet)
-            return Task.CompletedTask;
-        return Task.Run(() =>
-        {
-            if (!_executed.Wait(WaitTimeout))
-            {
-                Assert.Fail(BuildTimeoutMessage("Timed out waiting for item execution."));
-            }
-        });
+        try { await _executedTcs.Task.WaitAsync(WaitTimeout).ConfigureAwait(false); }
+        catch (TimeoutException) { Assert.Fail(BuildTimeoutMessage("Timed out waiting for item execution.")); }
     }
 
     int _activationCount;
@@ -89,48 +100,30 @@ sealed class TestPipelineItem
     public void Activate()
     {
         Interlocked.Increment(ref _activationCount);
-        _activated.Set();
+        _activatedTcs.TrySetResult();
     }
     public void WaitForActivation()
     {
-        if (!_activated.Wait(WaitTimeout))
-        {
+        if (!_activatedTcs.Task.Wait(WaitTimeout))
             Assert.Fail(BuildTimeoutMessage("Timed out waiting for item activation."));
-        }
     }
 
-    public Task WaitForActivationAsync()
+    public async Task WaitForActivationAsync()
     {
-        if (_activated.IsSet)
-            return Task.CompletedTask;
-        return Task.Run(() =>
-        {
-            if (!_activated.Wait(WaitTimeout))
-            {
-                Assert.Fail(BuildTimeoutMessage("Timed out waiting for item activation."));
-            }
-        });
+        try { await _activatedTcs.Task.WaitAsync(WaitTimeout).ConfigureAwait(false); }
+        catch (TimeoutException) { Assert.Fail(BuildTimeoutMessage("Timed out waiting for item activation.")); }
     }
 
     public void WaitForComplete()
     {
-        if (!_completed.Wait(WaitTimeout))
-        {
+        if (!_completedTcs.Task.Wait(WaitTimeout))
             Assert.Fail(BuildTimeoutMessage("Timed out waiting for item completion."));
-        }
     }
 
-    public Task WaitForCompleteAsync()
+    public async Task WaitForCompleteAsync()
     {
-        if (_completed.IsSet)
-            return Task.CompletedTask;
-        return Task.Run(() =>
-        {
-            if (!_completed.Wait(WaitTimeout))
-            {
-                Assert.Fail(BuildTimeoutMessage("Timed out waiting for item completion."));
-            }
-        });
+        try { await _completedTcs.Task.WaitAsync(WaitTimeout).ConfigureAwait(false); }
+        catch (TimeoutException) { Assert.Fail(BuildTimeoutMessage("Timed out waiting for item completion.")); }
     }
 
     // TrySet: an explicit completion can race the shutdown-token settlement (see

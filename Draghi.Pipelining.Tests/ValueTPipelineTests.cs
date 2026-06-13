@@ -178,24 +178,24 @@ sealed class ValueItemState
     public bool CompleteAsync;
     public bool Activated;
     public bool Completed;
-    public readonly ManualResetEventSlim _completed = new(false);
+    public readonly TaskCompletionSource _completedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     public readonly TaskCompletionSource _pipelineTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
     public ValueTask GetPipelineTask() => CompleteAsync ? new(_pipelineTaskTcs.Task) : default;
 
     public void CompletePipelineTask() => _pipelineTaskTcs.SetResult();
 
-    public Task WaitForCompleteAsync()
+    public async Task WaitForCompleteAsync()
     {
-        if (_completed.IsSet) return Task.CompletedTask;
-        return Task.Run(() => Assert.IsTrue(_completed.Wait(TimeSpan.FromSeconds(5)), "Timed out waiting for completion."));
+        try { await _completedTcs.Task.WaitAsync(TimeSpan.FromSeconds(10)).ConfigureAwait(false); }
+        catch (TimeoutException) { Assert.Fail("Timed out waiting for completion."); }
     }
 
     public void Activate() => Activated = true;
     public void Complete()
     {
         Completed = true;
-        _completed.Set();
+        _completedTcs.TrySetResult();
     }
 }
 
