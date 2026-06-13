@@ -292,16 +292,23 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 }
                 else if (itemResult.PipelineTask.IsCompleted && !itemResult.PipelineTask.IsCompletedSuccessfully)
                 {
-                    // Pipeline task faulted synchronously. Recovery path. Trailing fate is
-                    // handled separately below.
+                    // Pipeline task faulted synchronously. Recovery path. The failed item's
+                    // TRAILING task may still be in-flight (the per-iteration await at the
+                    // loop's bottom is skipped via `continue` below); pass it through the
+                    // failure context so the substitute can sequence against it before
+                    // touching the shared output - else recovery writes race the still-
+                    // running trailing flush on the writer. Pass the ValueTask directly (no
+                    // AsTask conversion): the recovery is the sole awaiter, single-consume
+                    // is preserved by construction.
                     ClearExecutingItem(activated);
+                    var outstandingTrailing = itemResult.TrailingExecutionTask;
                     try
                     {
                         itemResult.PipelineTask.GetAwaiter().GetResult();
                     }
                     catch (Exception ex)
                     {
-                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex), _enumerator.CompletionToken).ConfigureAwait(false);
+                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex, outstandingTrailing), _enumerator.CompletionToken).ConfigureAwait(false);
                         continue;
                     }
                 }
@@ -478,9 +485,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask RecoverTrailingFailure(T item, bool activated, Exception ex, CancellationToken cancellationToken)
     {
-        var pipelineValueTask = _tailWaiterTask;
-        // Convert to Task so both the policy and the pipeline can safely observe it (ValueTask may be single consume).
-        var pipelineTask = pipelineValueTask.AsTask();
+        // Preserve the pipeline task: the framework re-uses the materialized Task locally below
+        // (no-recovery branch's CommitWaiter), so we want a stable handle that outlives this
+        // method's locals. Wrap it back into a ValueTask for the context's per-construction-
+        // site carrier - the recovery awaits the Task-backed ValueTask idempotently, the
+        // framework's CommitWaiter takes the Task directly.
+        var pipelineTask = _tailWaiterTask.Preserve();
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.TrailingExecutionTask, ex, pipelineTask);
         if (!_policy.TryRecoverItemFailure(context, item, cancellationToken, out var recoveryItem))
         {
@@ -490,7 +500,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             _tailWaiterTask = default;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _tailWaiter = default!;
-            CommitWaiter(item, activated, new(pipelineTask));
+            CommitWaiter(item, activated, pipelineTask);
             return;
         }
 

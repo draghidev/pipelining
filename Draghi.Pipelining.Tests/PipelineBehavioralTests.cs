@@ -126,7 +126,7 @@ public class PipelineBehavioralTests
 
         Assert.AreEqual(1, captured.Count, "Failure context should have been captured once.");
         Assert.AreEqual(PipelineItemFailureKind.TrailingExecutionTask, captured[0].Kind);
-        Assert.IsNotNull(captured[0].PipelineTask, "PipelineTask should be preserved for TrailingExecutionTask failures so the policy can observe its outcome.");
+        Assert.AreNotEqual(default(ValueTask), captured[0].OutstandingPhaseTask, "OutstandingPhaseTask (the still-pending pipeline task) should be preserved for TrailingExecutionTask failures so the policy can observe its outcome (non-default ValueTask).");
         Assert.AreSame(trailingException, captured[0].Exception);
     }
 
