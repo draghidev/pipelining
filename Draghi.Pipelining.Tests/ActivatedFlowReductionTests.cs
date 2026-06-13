@@ -80,16 +80,6 @@ public class ActivatedFlowReductionTests
         public int Activations;
         public int Completions;
         public int PendingReads;
-        // Tenure-reuse diagnostics: how often the re-enqueued tenure's activation landed
-        // inside the completion window vs timed out. All-timeouts means the framework
-        // serialized activation behind CompleteItem and a pass proves nothing about the race.
-        public int ActivationsLandedInWindow;
-        public int WaitTimeouts;
-        // Direct framework-level evidence: the null policy fired while the re-enqueued
-        // tenure's activation had already landed - a live binding was nulled. Counted on the
-        // completing thread (no read-timing coincidence needed); each one is a latent abort
-        // in the real protocol where the live flow's next decoder read derefs the binding.
-        public int LiveNulls;
         public NullPolicy Policy = NullPolicy.AlwaysNull;
 
         public void Activate(SyntheticItem item)
@@ -98,32 +88,21 @@ public class ActivatedFlowReductionTests
             Volatile.Write(ref _activated, item);
         }
 
-        // newTenureIsLive: the caller observed the re-enqueued tenure's activation land
-        // before this call (same thread, no race). If the null policy still fires, it just
-        // severed a live binding.
-        public void Complete(SyntheticItem item, int remainingDepth, bool newTenureIsLive = false)
+        public void Complete(SyntheticItem item, int remainingDepth)
         {
             Interlocked.Increment(ref Completions);
             switch (Policy)
             {
                 case NullPolicy.AlwaysNull:
                     Volatile.Write(ref _activated, null);
-                    if (newTenureIsLive)
-                        Interlocked.Increment(ref LiveNulls);
                     break;
                 case NullPolicy.DepthZeroOnly:
                     if (remainingDepth is 0)
-                    {
                         Volatile.Write(ref _activated, null);
-                        if (newTenureIsLive)
-                            Interlocked.Increment(ref LiveNulls);
-                    }
                     break;
                 case NullPolicy.DepthZeroWithCas:
-                    if (remainingDepth is 0
-                        && Interlocked.CompareExchange(ref _activated, null, item) == item
-                        && newTenureIsLive)
-                        Interlocked.Increment(ref LiveNulls);
+                    if (remainingDepth is 0)
+                        Interlocked.CompareExchange(ref _activated, null, item);
                     break;
                 case NullPolicy.NeverNull:
                     break;
@@ -157,14 +136,12 @@ public class ActivatedFlowReductionTests
         readonly ActivationProbe _probe;
         readonly bool _activateOnTp;
         readonly PipelineHolder? _holder;
-        readonly bool _completionActionFirst;
 
-        public ProbePolicy(ActivationProbe probe, bool activateOnTp, PipelineHolder? holder = null, bool completionActionFirst = false)
+        public ProbePolicy(ActivationProbe probe, bool activateOnTp, PipelineHolder? holder = null)
         {
             _probe = probe;
             _activateOnTp = activateOnTp;
             _holder = holder;
-            _completionActionFirst = completionActionFirst;
         }
 
         public ValueTask<PipelineItemResult> ExecuteItemAsync(SyntheticItem item, CancellationToken cancellationToken)
@@ -226,74 +203,23 @@ public class ActivatedFlowReductionTests
 
         public void CompleteItem(SyntheticItem item, int remainingDepth, Exception? exception)
         {
-            // Mirrors Slon's Policy.CompleteItem ordering question. In the real protocol,
-            // ExecutionControl.Complete() fires the flow's completion action (which for
-            // MaintenanceFlow does Reset + re-enqueue of the SAME instance, synchronously)
-            // and only THEN does Control.OnCompleted run its depth==0
-            // CompareExchange(ref _activatedFlow, null, flow). If the re-enqueued tenure's
-            // Activate(item) lands between those two, the CAS comparand matches the NEW
-            // activation of the same instance (ABA) and nulls a live flow.
-            // Mark the COMPLETING tenure's drain over at entry, before either ordering branch:
-            // the real flow's reads end when its drain ends, which precedes the whole
-            // CompleteItem chain. Capturing the token here matters - in completion-action-first mode the
-            // completion action's Reset() replaces item.CurrentTenure, so marking later would
-            // stamp the NEW tenure (mid-drain!) and suppress exactly the read that catches
-            // the ABA.
+            // Mirrors Slon's Policy.CompleteItem ordering: bookkeeping (Probe.Complete -
+            // the analogue of Control.OnCompleted's depth==0 CompareExchange) runs BEFORE
+            // the flow's completion action, so the re-enqueued tenure's Activate cannot
+            // ABA-defeat the comparand. Mark the completing tenure's drain over at entry so
+            // the completion action's Reset doesn't stamp the new tenure mid-drain.
             item.CurrentTenure.Completed = true;
-            if (_completionActionFirst)
-            {
-                var newTenureIsLive = FireCompletionAction(item, remainingDepth);
-                _probe.Complete(item, remainingDepth, newTenureIsLive);
-            }
-            else
-            {
-                _probe.Complete(item, remainingDepth);
-                FireCompletionAction(item, remainingDepth);
-            }
+            _probe.Complete(item, remainingDepth);
+            FireCompletionAction(item);
         }
 
-        // Returns true if the re-enqueued tenure's activation was observed to land before
-        // returning (i.e. a subsequent null policy application severs a live binding).
-        bool FireCompletionAction(SyntheticItem item, int remainingDepth)
+        void FireCompletionAction(SyntheticItem item)
         {
             if (_holder is null || item.RemainingTenures <= 0)
-                return false;
+                return;
             item.RemainingTenures--;
             item.Reset();
-            var activationsBefore = Volatile.Read(ref _probe.Activations);
             _holder.Pipeline!.Enqueue(item).Execute();
-            // Only the depth==0 completion runs the null policy, so only there can the
-            // re-enqueued tenure's activation race it - and only there CAN it activate
-            // promptly (empty pipeline, executor takes the Count==0 inline path). Waiting at
-            // depth>0 is pure timeout burn: the item can't reach head until the rest drains.
-            // The wait also only exists to widen the PRE-null window, which the safe
-            // (release-before-complete) ordering does not have - the null already happened
-            // before this method ran. Skipping it there removes the suite's long pole
-            // without weakening the regression property (the hazard variants keep it).
-            if (remainingDepth is not 0 || !_completionActionFirst)
-                return false;
-            // Model the completing thread being preempted between the completion action and
-            // Control.OnCompleted: give the re-enqueued tenure's activation a chance to land
-            // first. This is an honest probe of the ordering contract - if the framework
-            // serialized head activation behind CompleteItem, this wait would always time out
-            // (see WaitTimeouts) and the test would pass regardless of null policy. Bounded so
-            // a serializing framework can't deadlock the advancer latch held by our caller.
-            // 2ms cap: when the activation CAN land in-window it lands in microseconds (the
-            // executor inline-activates off the enqueue wake); anything longer is a timeout
-            // by construction (deferred-publish ordering), so a larger cap only adds cost -
-            // the safe-ordering variant pays it on every one of its thousands of tenures.
-            var spinStart = Environment.TickCount64;
-            while (Volatile.Read(ref _probe.Activations) == activationsBefore)
-            {
-                if (Environment.TickCount64 - spinStart >= 2)
-                {
-                    Interlocked.Increment(ref _probe.WaitTimeouts);
-                    return false;
-                }
-                Thread.Yield();
-            }
-            Interlocked.Increment(ref _probe.ActivationsLandedInWindow);
-            return true;
         }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, SyntheticItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out SyntheticItem? recoveryItem)
@@ -357,81 +283,39 @@ public class ActivatedFlowReductionTests
 
     // Tenure-reuse runner: a small number of items ping-pong through the pipeline, each
     // completion at depth==0 re-enqueueing the SAME (reset) instance from inside the
-    // completion callback. completionActionFirst=true reproduces the hazardous ordering
-    // (ExecutionControl.Complete -> completion action -> Control.OnCompleted) where the
-    // depth-0 null policy is ABA-defeated by the re-activated same instance - those runs
-    // EXPECT the repro and fail only if it no longer reproduces (lost harness sensitivity).
-    // false models the fixed ordering Slon ships in Policy.CompleteItem (bookkeeping before
-    // user-visible completion) and expects zero hazards.
-    static async Task RunReuseBatch(int items, int batches, int tenures, NullPolicy nullPolicy, bool completionActionFirst, bool expectHazard)
+    // completion callback. Verifies the shipped ordering (bookkeeping before user-visible
+    // completion) stays hazard-free under tenure reuse.
+    static async Task RunReuseBatch(int items, int batches, int tenures, NullPolicy nullPolicy)
     {
-        var landedTotal = 0;
-        var hazards = 0;
         for (var b = 0; b < batches; b++)
         {
             var probe = new ActivationProbe { Policy = nullPolicy };
             var holder = new PipelineHolder();
-            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp: true, holder, completionActionFirst));
+            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp: true, holder));
             holder.Pipeline = pipeline;
             var expected = items * (1 + tenures);
             for (var i = 0; i < items; i++)
                 pipeline.Enqueue(new SyntheticItem { Id = i, RemainingTenures = tenures }).Execute();
 
-            // No-progress deadline instead of an unbounded spin: the latch-held wait in
-            // FireCompletionAction can strand a waiter (its completion callback TryAcquire-
-            // fails against the advancer latch our wait is holding; the slot-mode strand is
-            // unrecoverable, see Pipeline.DrainSlotInline). A stranded batch can't finish -
-            // abandon it (skip CompleteAsync, which would also hang) and move to a fresh
-            // pipeline. Asserts and in-window landings accumulate across batches either way.
-            var stranded = false;
-            var lastCompletions = -1;
-            var lastProgress = Environment.TickCount64;
             while (Volatile.Read(ref probe.Completions) < expected)
             {
-                var completions = Volatile.Read(ref probe.Completions);
-                if (completions != lastCompletions)
-                {
-                    lastCompletions = completions;
-                    lastProgress = Environment.TickCount64;
-                }
-                else if (Environment.TickCount64 - lastProgress > 2_000)
-                {
-                    stranded = true;
-                    break;
-                }
-                if (Volatile.Read(ref probe.Asserts) > 0 || Volatile.Read(ref probe.LiveNulls) > 0)
+                if (Volatile.Read(ref probe.Asserts) > 0)
                     break;
                 await Task.Yield();
             }
 
-            if (!stranded && probe.Asserts == 0 && probe.LiveNulls == 0)
+            if (probe.Asserts == 0)
             {
                 await pipeline.CompleteAsync();
                 while (Volatile.Read(ref probe.PendingReads) > 0)
                     await Task.Yield();
             }
 
-            hazards += probe.Asserts + probe.LiveNulls;
-            if (!expectHazard && hazards > 0)
+            if (probe.Asserts > 0)
             {
-                Assert.Fail($"live binding severed under supposedly-safe ordering. completionActionFirst={completionActionFirst} policy={nullPolicy} batch={b} items={items} tenures={tenures}: " +
-                            $"liveNulls={probe.LiveNulls} asserts={probe.Asserts} activations={probe.Activations} completions={probe.Completions} " +
-                            $"landedInWindow={probe.ActivationsLandedInWindow} waitTimeouts={probe.WaitTimeouts}");
+                Assert.Fail($"live binding severed under supposedly-safe ordering. policy={nullPolicy} batch={b} items={items} tenures={tenures}: " +
+                            $"asserts={probe.Asserts} activations={probe.Activations} completions={probe.Completions}");
             }
-            landedTotal += probe.ActivationsLandedInWindow;
-            if (expectHazard && hazards > 0)
-                return;
-        }
-
-        // A hazard-expecting pass is only meaningful if the racing activation actually landed
-        // inside the completion window at least some of the time. All-timeouts would mean the
-        // framework serialized the two and the null policy was never under test. The safe
-        // ordering skips the window machinery entirely (see FireCompletionAction), so no
-        // landing requirement applies there.
-        if (expectHazard)
-        {
-            Assert.AreNotEqual(0, landedTotal, "activation never landed inside the completion window; harness exercised nothing");
-            Assert.Fail($"hazardous ordering no longer reproduces (landedInWindow={landedTotal}); harness sensitivity lost or framework ordering changed");
         }
     }
 
@@ -453,13 +337,12 @@ public class ActivatedFlowReductionTests
     [TestMethod] public Task ConcurrentEnqueue_NeverNull_Tp() => RunBatch(true, 200, 50, NullPolicy.NeverNull, concurrentEnqueue: true);
 
     // Tenure reuse (MaintenanceFlow pattern): the same instance is reset and re-enqueued
-    // from inside its completion callback. With the completion-action-first ordering the
-    // depth==0 null is ABA-defeated: the CAS compares against the same reference the new
-    // tenure just activated, severing a live binding (the PgDecoder.cs:26 abort). The
-    // CompleteBeforeRelease runs document that hazard (they EXPECT the repro - failing only
-    // if it stops reproducing, i.e. lost harness sensitivity); ReleaseBeforeComplete is the
-    // ordering Slon ships in Policy.CompleteItem and must stay hazard-free.
-    [TestMethod] public Task TenureReuse_Cas_CompleteBeforeRelease_Hazardous() => RunReuseBatch(1, 20, 500, NullPolicy.DepthZeroWithCas, completionActionFirst: true, expectHazard: true);
-    [TestMethod] public Task TenureReuse_Cas_ReleaseBeforeComplete() => RunReuseBatch(1, 10, 150, NullPolicy.DepthZeroWithCas, completionActionFirst: false, expectHazard: false);
-    [TestMethod] public Task TenureReuse_DepthZeroOnly_CompleteBeforeRelease_Hazardous() => RunReuseBatch(1, 20, 500, NullPolicy.DepthZeroOnly, completionActionFirst: true, expectHazard: true);
+    // from inside its completion callback. With ReleaseBeforeComplete (the ordering Slon
+    // ships in Policy.CompleteItem - bookkeeping before user-visible completion) the
+    // depth==0 null sees the activated instance under its own tenure and never severs a
+    // live binding. The historical CompleteBeforeRelease ordering was ABA-defeated
+    // (PgDecoder.cs:26 abort); the activated-item / decrement reorder structurally closes
+    // that window in the framework so the unsafe variant no longer reproduces - the only
+    // remaining check here is that the shipped ordering stays hazard-free.
+    [TestMethod] public Task TenureReuse_Cas_ReleaseBeforeComplete() => RunReuseBatch(1, 10, 150, NullPolicy.DepthZeroWithCas);
 }

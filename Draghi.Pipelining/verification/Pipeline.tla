@@ -85,15 +85,6 @@ CONSTANTS
                              \* Slon.Tests runs) - the next activation never comes until the
                              \* heartbeat activation timeout rescues the flow. Expect
                              \* EventuallyCompleted to FAIL with FALSE, hold with TRUE.
-  ConsumeBeforeRepublish,    \* The consume-ordering contract under design (June 2026). The slot
-                             \* drain consumes the waiter task (GetResult - the release point for
-                             \* per-item resources such as Slon's shared pipelined-read promise
-                             \* tenure) either BEFORE the count decrement republishes the pipeline
-                             \* position (TRUE, the proposed contract) or AFTER it (FALSE, the
-                             \* code as shipped). FALSE must falsify NoTenureClash: the executor's
-                             \* Count==0 inline-activation gate dispatches a successor against a
-                             \* still-held tenure (Slon's observed ThrowAlreadyStarted at
-                             \* CommandFlow.DispatchPipelinedRead). TRUE must satisfy it.
   SlotChainActivation,       \* The slot-mode D-path under design (June 2026, lost-activation
                              \* round 2). The queue drain partitions activation responsibility on
                              \* the value its atomic DecrementCount returns: count > 0 means a
@@ -314,6 +305,24 @@ CONSTANTS
                              \* FALSE = the 9 configs (fused, unaffected); TRUE
                              \* = Pipeline_SplitCallbackWitness.cfg (expect green, or a surprise).
   ,
+  CompleteBeforeCount        \* DrainSlotInline's Complete-vs-Decrement ordering (June 2026,
+                             \* activated-slot race round). The fault path's RecoverWaiter has
+                             \* always run BEFORE DecrementCount (Pipeline.cs:1132-1138 audit
+                             \* reorder); the non-fault path historically ran DecrementCount
+                             \* BEFORE CompleteWaiterDeferred and only re-aligned with the
+                             \* June 2026 ReorderFix. Decrement-first opens a window in which
+                             \* a concurrent ActivateHeadItem (executor's deferred-publish
+                             \* branch, a successor commit's wasEmpty inline-activate, ...)
+                             \* writes activatedSlot = NEW; the subsequent unconditional
+                             \* clear in CompleteWaiterDeferred then stomps NEW = NoItem, and
+                             \* NEW's body's first decoder read sees NoItem and NREs
+                             \* (Slon's PgDecoder.CurrentExecutionControl, Stress_SequentialReads_
+                             \* NoRecovery ~1/17 Pg-suite runs). TRUE models the shipped fix
+                             \* (Complete fires while count is still > 0, so no concurrent
+                             \* activator can fire - the clear lands on an empty window).
+                             \* FALSE reproduces the witness: NoStompedActivation must HOLD
+                             \* with TRUE, must FAIL with FALSE.
+  ,
   RecoverySplit             \* The recovery round (June 2026, backlog #2/#5). FALSE = legacy
                              \* identity-reuse: the substitute reuses the failed item's identity
                              \* (RecoverItemWins/Loses re-dispatch loc[i]), so a failed item
@@ -410,13 +419,11 @@ VARIABLES
   \* Per-item resource tenure (abstraction of Slon's per-protocol shared pipelined-read
   \* promise). Acquired by an inline-dispatched item at SourceYieldInline (the real
   \* dispatch's TryStart); released when the item's waiter task is CONSUMED (GetResult ->
-  \* Reset): at the slot drain (timing per ConsumeBeforeRepublish), the queue drain head,
+  \* Reset): at the slot drain (bundled with Complete, the shipped path), the queue drain head,
   \* the sync-success commit, or item failure. Deferred-dispatched items are deliberately
   \* NOT modeled: the deferred path's bridge consumes at SetResult time, before any waiter
   \* bookkeeping, and is contract-safe by construction.
   tenure,
-  tenureClash,      \* TRUE when an inline dispatch found the tenure still held
-                    \* (ThrowAlreadyStarted in the real code). Bug witness.
 
   \* TRUE when the slot drain's post-decrement count was non-zero - the code's
   \* Debug.Assert(count == 0) firing (observed as exit-134 in Slon.Tests runs 12/25,
@@ -442,7 +449,25 @@ VARIABLES
   \* RecoveryDrainFlow.BindFailedFlow). NoItem = not a substitute. A distinct substitute identity
   \* (vs the legacy identity-reuse) makes the binding discharge modelable and the activation
   \* bound uniform (each item dispatched once). NoItem for all unless RecoverySplit.
-  recoveryOf
+  recoveryOf,
+
+  \* The shared `_activatedItem` field (Pipeline.cs:90). A single Item-or-NoItem identity
+  \* the policy/consumer reads to find the currently-activated item (Slon's PgDecoder
+  \* reads it via `Control.ActivatedFlow` to attribute incoming messages). Written by
+  \* ActivateHeadItem (set to the activating item) and CompleteWaiterDeferred (cleared).
+  \* Modeled here to capture the bug class where a concurrent ActivateHeadItem on path B
+  \* writes activatedSlot=NEW between path A's DecrementCount and path A's
+  \* CompleteWaiterDeferred clear - A's unconditional clear then stomps NEW's publication
+  \* and a consumer reading the slot before B re-publishes observes NoItem (Slon's
+  \* PgDecoder NRE on CurrentExecutionControl, June 2026). The ReorderFix (Complete-before-
+  \* Decrement, mirroring the recovery-fault path's audit reorder) closes the window
+  \* structurally: the clear lands while count > 0, no concurrent activator can fire.
+  activatedSlot,
+
+  \* TRUE if the slot drain's clear ever wiped activatedSlot while it pointed at an
+  \* item that hadn't yet been completed - the stomp face of the bug. Bug witness for
+  \* NoStompedActivation. Set in SlotDrainCompleteClear and never reset within a run.
+  slotStomped
 
 \* Variable groupings - used as `UNCHANGED group_name` in action bodies for compactness.
 publish_vars == <<executingItem, executingItemVisible, hasExecuting, hasExecutingVisible>>
@@ -454,30 +479,43 @@ drainer_vars == <<drainerActive>>
 item_vars    == <<loc, taskDone, activations, callbackFired, failed>>
 \* June 2026 additions (slot-drain split + tenure). Actions that predate them and don't
 \* interact get UNCHANGED aux_vars applied at the Next relation rather than per-body.
-aux_vars     == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                  tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
-                  callbackSignaled, recoveryOf>>
+\* aux_vars: things actions don't touch (default UNCHANGED via the W-wrappers). activatedSlot
+\* is included here so non-activation actions UNCHANGE it without ceremony; the W-wrappers
+\* for activation actions (which DO write activatedSlot) use aux_vars_act instead, which
+\* drops activatedSlot from the UNCHANGED bundle so the body's write isn't shadowed.
+aux_vars     == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
+                  tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
+                  callbackSignaled, slotStomped, recoveryOf>>
 \* aux minus the queue-drain PC, for wrappers of actions that WRITE qDrainPhase
 \* (the advancer-acquire entries under PassOnceDrain).
 aux_nophase  == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                  tenure, tenureClash, assertFailed, nullActivation, advancingPending,
-                  callbackSignaled, recoveryOf>>
+                  tenure, assertFailed, nullActivation, advancingPending,
+                  callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 \* aux minus the PC and the latch pending bit, for the release steps (they write both).
-aux_relmin   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                  tenure, tenureClash, assertFailed, nullActivation, callbackSignaled, recoveryOf>>
+aux_relmin   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
+                  tenure, assertFailed, nullActivation, callbackSignaled, slotStomped, recoveryOf>>
 \* aux minus only the latch pending bit, for the bail wrappers (failed acquire deposits).
-aux_nopend   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                  tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                  callbackSignaled, recoveryOf>>
+aux_nopend   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
+                  tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
+                  callbackSignaled, slotStomped, recoveryOf>>
+\* aux_vars variants for actions that WRITE activatedSlot (any ActivateHeadItem-equivalent
+\* and any CompleteWaiterDeferred-equivalent slot clear). Identical to the matching aux_*
+\* but DROPS activatedSlot so the W-wrapper doesn't conflict with the body's write.
+aux_vars_act    == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, slotStomped,
+                     tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
+                     callbackSignaled, slotStomped, recoveryOf>>
+aux_nophase_act == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, slotStomped,
+                     tenure, assertFailed, nullActivation, advancingPending,
+                     callbackSignaled, slotStomped, recoveryOf>>
 
 vars == <<loc, taskDone, activations, callbackFired, failed,
           executingItem, executingItemVisible, hasExecuting, hasExecutingVisible,
           tailWaiter, hasTail, advancing, advancingVisible, storeCount, drainSignal,
           hasSlot, slotItem, escalated, waiters,
           escPhase, escTail, escSlotClaimed, escMoved, drainerActive,
-          drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-          tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
-          callbackSignaled, recoveryOf>>
+          drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
+          tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
+          callbackSignaled, slotStomped, recoveryOf>>
 
 \* Item / NoItem come from WaiterStore.tla.
 \* InWaitersPending: transient state inside CommitWaiter's queue path between waiters.Enqueue
@@ -545,9 +583,10 @@ Init ==
   /\ drainRemaining = 0
   /\ pendingHeadActivation = FALSE
   /\ tenure = NoItem
-  /\ tenureClash = FALSE
   /\ assertFailed = FALSE
   /\ nullActivation = FALSE
+  /\ activatedSlot = NoItem
+  /\ slotStomped = FALSE
 
 (* ===========================================================================
    External actions: task completion
@@ -608,35 +647,17 @@ SourceYieldInline ==
   /\ escPhase = "idle"  \* executor only yields next item after current commit completes
   /\ \A i \in Item : loc[i] # "Executing"  \* executor is sequential
   /\ \A i \in Item : loc[i] # "Recovering" \* pending recovery must install before next yield
-  /\ tenure = NoItem  \* the dispatch's TryStart; the held case is SourceYieldInlineClash
+  /\ tenure = NoItem  \* the dispatch's TryStart
   /\ \E i \in Item :
        /\ loc[i] = "Nowhere"  \* item not yet yielded by source
        /\ SourceSlot(i)       \* not the reserved substitute identity (RecoverySplit)
        /\ loc' = [loc EXCEPT ![i] = "Executing"]
        /\ activations' = [activations EXCEPT ![i] = @ + 1]
        /\ tenure' = i
+       /\ activatedSlot' = i  \* ActivateHeadItem writes _activatedItem = item
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
                  taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
-
-\* Bug witness: the executor's Count==0 gate passed but the previous inline tenure is still
-\* held - the dispatch's TryStart lands on a started shared promise. Real-world signature:
-\* InvalidOperationException("The async method is already executing") from
-\* CommandFlow.DispatchPipelinedRead, ~7/50 Slon.Tests suite runs pre-contract. The state
-\* freezes the witness (no further modeling of the ensuing recovery; NoTenureClash flags it).
-SourceYieldInlineClash ==
-  /\ storeCount = 0
-  /\ ~hasTail
-  /\ escPhase = "idle"
-  /\ \A i \in Item : loc[i] # "Executing"
-  /\ \A i \in Item : loc[i] # "Recovering"
-  /\ tenure # NoItem
-  /\ \E i \in Item : loc[i] = "Nowhere" /\ SourceSlot(i)
-  /\ tenureClash' = TRUE
-  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
-                 taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
-                 loc, activations, drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                 tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
 
 \* Source yields next item with existing waiters - deferred publish.
 SourceYieldDeferred ==
@@ -724,6 +745,7 @@ ExecCommitTailExecutorWins ==
           THEN \* sync-success: CompleteWaiter inline, store untouched.
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
+            /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
             /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
@@ -737,6 +759,7 @@ ExecCommitTailExecutorWins ==
                 /\ activations' = IF storeCount = 0
                                   THEN [activations EXCEPT ![i] = @ + 1]
                                   ELSE activations
+                /\ activatedSlot' = IF storeCount = 0 THEN i ELSE activatedSlot
                 /\ drainSignal' = drainSignal
               ELSE \* Post-escalation queue path (escalated guard inside the operator).
                    \* Loosened CAS: no slot manipulation (PostEscalationSlotEmpty).
@@ -748,9 +771,10 @@ ExecCommitTailExecutorWins ==
                 /\ activations' = IF storeCount = 0
                                   THEN [activations EXCEPT ![i] = @ + 1]
                                   ELSE activations
+                /\ activatedSlot' = IF storeCount = 0 THEN i ELSE activatedSlot
                 /\ drainSignal' = drainSignal
   /\ UNCHANGED <<adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
 
 \* CommitTailWaiter, advancer won (alreadyActivated = true). Executor skips _executingItem clear.
 ExecCommitTailExecutorLoses ==
@@ -768,6 +792,7 @@ ExecCommitTailExecutorLoses ==
           THEN
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
+            /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
             /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
@@ -778,6 +803,7 @@ ExecCommitTailExecutorLoses ==
                 /\ StoreSlotCommit(i)
                 /\ loc' = [loc EXCEPT ![i] = "InSlot"]
                 /\ activations' = activations
+                /\ activatedSlot' = activatedSlot
                 /\ drainSignal' = drainSignal
               ELSE \* Post-escalation queue path (loosened CAS, escalated guard in the operator).
                    \* Fused fiction only (see ExecCommitTailExecutorWins's queue arm).
@@ -785,9 +811,10 @@ ExecCommitTailExecutorLoses ==
                 /\ StoreQueueEnqueue(i)
                 /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
                 /\ activations' = activations
+                /\ activatedSlot' = activatedSlot
                 /\ drainSignal' = drainSignal
   /\ UNCHANGED <<publish_vars, adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
 
 \* Pre-faulted commit (RecoverySplit, Phase D). CommitTailWaiter observes the tail's pipeline
 \* task already SETTLED and FAULTED at commit time - the code's
@@ -826,9 +853,9 @@ ExecCommitTailRecovers ==
             ELSE UNCHANGED publish_vars)
   /\ UNCHANGED <<adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
-                 callbackSignaled, recoveryOf>>
+                 callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 (* ===========================================================================
    Truthful queue commit (SplitCountCommit): TryEscalateOrEnqueue's post-
@@ -996,9 +1023,10 @@ ExecCommitSlotPublish ==
 ExecCommitSlotCountWins ==
   /\ escPhase = "slot_f_act"
   /\ LET i == escTail IN
-       activations' = IF storeCount = 0 /\ i \notin taskDone
-                      THEN [activations EXCEPT ![i] = @ + 1]
-                      ELSE activations
+       /\ activations' = IF storeCount = 0 /\ i \notin taskDone
+                         THEN [activations EXCEPT ![i] = @ + 1]
+                         ELSE activations
+       /\ activatedSlot' = IF storeCount = 0 /\ i \notin taskDone THEN i ELSE activatedSlot
   /\ StoreCommitCount("idle")
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
                  callbackFired, failed, drainer_vars>>
@@ -1169,9 +1197,10 @@ ExecEscalationEnqueueTail ==
 ExecEscalationCommitCount ==
   /\ escPhase = "esc_enqueued"
   /\ LET i == escTail IN
-       activations' = IF storeCount = 0 /\ i \notin taskDone
-                      THEN [activations EXCEPT ![i] = @ + 1]
-                      ELSE activations
+       /\ activations' = IF storeCount = 0 /\ i \notin taskDone
+                         THEN [activations EXCEPT ![i] = @ + 1]
+                         ELSE activations
+       /\ activatedSlot' = IF storeCount = 0 /\ i \notin taskDone THEN i ELSE activatedSlot
   /\ StoreCommitCount(IF SlotChainActivation /\ escSlotClaimed THEN "compensate" ELSE "nudge_check")
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
                  callbackFired, failed, drainer_vars>>
@@ -1191,12 +1220,14 @@ ExecEscalationCompensate ==
            /\ activations' = IF target \in taskDone
                              THEN activations
                              ELSE [activations EXCEPT ![target] = @ + 1]
+           /\ activatedSlot' = IF target \in taskDone THEN activatedSlot ELSE target
          ELSE
            /\ pendingHeadActivation' = pendingHeadActivation
            /\ activations' = activations
+           /\ activatedSlot' = activatedSlot
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  loc, taskDone, callbackFired, failed, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainPhase, drainItem, drainRemaining, tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
 
 (* Inline-callback race in CommitWaiter queue path: at the post-Enqueue check, if task is
    already done the executor fires the wired callback inline; otherwise it registers it for
@@ -1295,9 +1326,10 @@ SlotCallbackBailsDuringEscalation ==
 \* method, so the fused action lands drainSignal = FALSE (the flag retype's equivalent of
 \* the old counter's bump+decrement net zero).
 \*
-\* Consume timing: ConsumeBeforeRepublish = TRUE folds the consume (tenure release) into
-\* the claim step - the proposed contract, release happens-before the count republish.
-\* FALSE (shipped code) defers the release to SlotDrainComplete, opening the clash window.
+\* Consume timing: the consume (tenure release) is always bundled with Complete, mirroring
+\* the shipped path. The clash window the old toggle exposed is structurally closed by
+\* CompleteBeforeCount = TRUE (Complete runs before the count republish), so no concurrent
+\* SourceYieldInline can observe a held tenure.
 SlotDrainClaim ==
   /\ ~SplitSlotFieldOps  \* fused fiction; the SlotDrainClaimEntry + SlotClaim* steps are the truth
   /\ \E i \in Item :
@@ -1320,14 +1352,14 @@ SlotDrainClaim ==
     /\ loc' = [loc EXCEPT ![i] = "Draining"]
     /\ drainPhase' = "claimed"
     /\ drainItem' = i
-    /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+    /\ tenure' = tenure
     \* Set-then-acquire-then-pass-top-clear, fused (slot pass start). Replaces the old
     \* counter's "bump + decrement = net zero" accounting. Under SplitCallbackOps the set
     \* happened earlier; the pass-start clear lands the same FALSE.
     /\ drainSignal' = FALSE
     /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                    taskDone, activations, esc_vars, failed, drainRemaining, pendingHeadActivation,
-                   tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, recoveryOf>>
+                   assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, activatedSlot, slotStomped, recoveryOf>>
 
 (* ===========================================================================
    Truthful slot claim (SplitSlotFieldOps): the two entry routes (callback fire,
@@ -1365,8 +1397,8 @@ SlotDrainClaimEntry ==
   /\ drainPhase' = "cl_acq"
   /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, esc_vars, failed, drainItem, drainRemaining,
-                 pendingHeadActivation, tenure, tenureClash, assertFailed, nullActivation,
-                 qDrainPhase, qDrainedAny, advancingPending, recoveryOf>>
+                 pendingHeadActivation, tenure, assertFailed, nullActivation,
+                 qDrainPhase, qDrainedAny, advancingPending, activatedSlot, slotStomped, recoveryOf>>
 
 \* Reclaim-path entry, the TRUTHFUL gate: drainSignal + the latch win. No identity, no
 \* taskDone, no callbackFired knowledge - the fused SlotDrainerReclaim's
@@ -1386,8 +1418,8 @@ SlotDrainerReclaimEntry ==
   /\ drainPhase' = "cl_acq"
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Claim step 1: the Exchange. The flag transfers; the fields are whatever they are.
 SlotClaimExchange ==
@@ -1398,8 +1430,8 @@ SlotClaimExchange ==
   /\ drainPhase' = "cl_xchg"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, waiters,
                  loc, taskDone, activations, callbackFired, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Claim miss: the slot is empty (escalation or a prior claim owned it). Code: IsEscalated
 \* reroutes into DrainReadyWaiters holding the latch (do-top clear and the queue drain's
@@ -1417,8 +1449,8 @@ SlotClaimMiss ==
             /\ UNCHANGED <<qDrainPhase, drainSignal, qDrainedAny>>
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 (* TriStateSlotClaim claim: peek under the stable flag, claim only the completed, consume
    under exclusive ownership. The 1 -> 0 -> 1 cycle that would invalidate the peek is
@@ -1436,8 +1468,8 @@ SlotClaimPeekLive ==
   /\ drainPhase' = "cl_exit"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* The peek, completed verdict: proceed toward the claim CAS. taskDone is monotonic, so the
 \* verdict cannot go stale; the FLAG can (escalation takes the pair) - the own-win/lose pair
@@ -1450,8 +1482,8 @@ SlotClaimPeekDone ==
   /\ drainPhase' = "cl_peeked"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* The claim CAS (1 -> 2) won: the consuming state begins. The word stays non-zero (hasSlot
 \* TRUE + this PC = state 2), so commits route to escalation and the escalation's
@@ -1462,8 +1494,8 @@ SlotClaimOwnWin ==
   /\ drainPhase' = "cl_own"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* The claim CAS lost: the escalation took the pair between our peek and our CAS (the only
 \* possible taker). The occupant is, or is about to be, the queue head - reroute into the
@@ -1478,8 +1510,8 @@ SlotClaimOwnLose ==
   /\ drainPhase' = "idle"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* The consume: read + clear + release (2 -> 0) + the post-claim signal clear. Fused as one
 \* step because state 2 admits no interfering field access BY GUARD - commits need word 0,
@@ -1492,12 +1524,12 @@ SlotClaimConsume ==
   /\ hasSlot' = FALSE
   /\ drainSignal' = FALSE  \* Interlocked.Exchange(_drainSignal, false) after the claim wins
   /\ loc' = [loc EXCEPT ![slotItem] = "Draining"]
-  /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = slotItem THEN NoItem ELSE tenure
+  /\ tenure' = tenure
   /\ drainPhase' = "claimed"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, escalated, waiters,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainRemaining, pendingHeadActivation, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainRemaining, pendingHeadActivation,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 (* The claim-fail exit: the code's fail arm releases the latch and RETURNS - no reclaim
    tail check (that belongs to the successful-drain path). The v5 pending arm applies: a
@@ -1523,8 +1555,8 @@ SlotClaimFailRelease ==
             /\ drainerActive' = FALSE
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 SlotClaimPendReacqWin ==
   /\ drainPhase = "cl_pendReacq"
@@ -1535,8 +1567,8 @@ SlotClaimPendReacqWin ==
   /\ drainerActive' = TRUE
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 SlotClaimPendReacqLose ==
   /\ drainPhase = "cl_pendReacq"
@@ -1547,8 +1579,8 @@ SlotClaimPendReacqLose ==
   /\ advancingPending' = TRUE
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Claim step 2: the field read, TRUTHFUL. drainItem takes slotItem as it is at this
 \* instant - NoItem when the claim won against a commit's CAS before its field writes
@@ -1561,8 +1593,8 @@ SlotClaimRead ==
   /\ drainPhase' = "cl_read"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Claim step 3: the field clear (unconditional, like the code - if a successor's CAS
 \* re-occupied the flag and its writes landed, this WIPES them under _hasSlot = 1), plus
@@ -1575,19 +1607,56 @@ SlotClaimClear ==
   /\ StoreClaimSlotClear
   /\ drainSignal' = FALSE  \* Interlocked.Exchange(_drainSignal, false) after the claim wins
   /\ loc' = [loc EXCEPT ![drainItem] = "Draining"]
-  /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = drainItem THEN NoItem ELSE tenure
+  /\ tenure' = tenure
   /\ drainPhase' = "claimed"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, hasSlot, escalated, waiters,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+
+\* Pipeline.cs:1148-1163 audit reorder, ReorderFix shipped June 2026: CompleteWaiterDeferred
+\* fires BEFORE DecrementCount, mirroring the recovery-fault path's own audit reorder. Active
+\* only under CompleteBeforeCount=TRUE; transitions drainPhase "claimed" -> "completed" so
+\* SlotDrainCount picks up from there. Does loc[i] -> "Completed", tenure release, and the
+\* unconditional activatedSlot clear that the code's `_activatedItem = default!` performs.
+\* Because the clear lands BEFORE the count drop publishes the freed position to the inline-
+\* activation gate, no concurrent activator can have written activatedSlot = NEW yet; the
+\* clear is therefore stomp-free by construction.
+SlotDrainCompleteClear ==
+  /\ CompleteBeforeCount
+  /\ drainPhase = "claimed"
+  /\ drainItem \in taskDone
+  /\ \A i \in Item : loc[i] # "RecoveringInline"
+  /\ LET i == drainItem IN
+       /\ loc' = [loc EXCEPT ![i] = "Completed"]
+       /\ tenure' = IF tenure = i THEN NoItem ELSE tenure
+       \* No stomp check here: SlotDrainCompleteClear runs BEFORE SlotDrainCount under the
+       \* shipped ReorderFix, so storeCount has not been decremented yet and no concurrent
+       \* activator can have fired since the drain started. The clear is structurally safe.
+       \* The separate "Complete clear stomps an already-existing non-drainItem activation"
+       \* class - reachable when an item completes without ever being activated (the slot
+       \* still points at an older live item) - is orthogonal and out of scope here.
+       /\ slotStomped' = slotStomped
+       /\ activatedSlot' = NoItem  \* unconditional clear, matches _activatedItem = default!
+  /\ drainPhase' = "completed"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, drainSignal, storeCount,
+                 taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, assertFailed,
+                 nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
 
 \* Slot drain, step 2 of 3: DecrementCount - the position republish. The executor's Count==0
 \* inline-activation gate (SourceYieldInline's storeCount = 0) can pass the instant this
 \* lands. The shipped code asserts the post-decrement count is 0; a commit that landed in
 \* the freed slot during the claimed window makes it 1 - assertFailed records the firing.
+\*
+\* Phase precondition is gated on CompleteBeforeCount:
+\*   TRUE  (shipped fix): SlotDrainCompleteClear has already fired at "claimed" and the
+\*         phase advanced to "completed"; Count runs from there.
+\*   FALSE (pre-fix): Count runs first at "claimed", and SlotDrainComplete* runs later
+\*         at "counted" - opening the race window where a concurrent ActivateHeadItem
+\*         (gated on storeCount = 0) can write activatedSlot = NEW before the clear stomps it.
 SlotDrainCount ==
-  /\ drainPhase = "claimed"
+  /\ drainPhase = (IF CompleteBeforeCount THEN "completed" ELSE "claimed")
   \* The drain's GetResult blocks until the claimed task completes. Vacuous under the
   \* fused claim (its guard required taskDone); load-bearing under SplitSlotFieldOps,
   \* where a hijack claim can hold a successor whose task is still running.
@@ -1607,7 +1676,7 @@ SlotDrainCount ==
   /\ drainPhase' = "counted"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, drainSignal,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, pendingHeadActivation, tenure, tenureClash, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, pendingHeadActivation, tenure, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Slot drain, step 3 of 3, SHIPPED code (~SlotChainActivation): CompleteWaiter + the
 \* lock-guarded C-path. The lock block consumes the publish whenever held; it re-checks the
@@ -1623,26 +1692,44 @@ SlotDrainCompleteLegacy ==
   /\ ~SlotChainActivation
   /\ drainPhase = "counted"
   /\ LET i == drainItem IN
-       /\ loc' = [loc EXCEPT ![i] = "Completed"]
-       /\ tenure' = IF ~ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+       \* Under CompleteBeforeCount=TRUE the Complete half (loc + tenure release + slot
+       \* clear) already ran in SlotDrainCompleteClear at the "claimed" phase; this action
+       \* is activation-only. Under FALSE it does both halves atomically (the pre-fix
+       \* code's shape) - and that unconditional clear is where the stomp lives.
+       /\ loc' = IF CompleteBeforeCount THEN loc ELSE [loc EXCEPT ![i] = "Completed"]
+       /\ tenure' = IF CompleteBeforeCount THEN tenure
+                    ELSE (IF tenure = i THEN NoItem ELSE tenure)
        /\ IF hasExecutingVisible /\ executingItemVisible # NoItem
             THEN
               /\ activations' = IF storeCount = 0
                                 THEN [activations EXCEPT ![executingItemVisible] = @ + 1]
                                 ELSE activations
+              /\ slotStomped' = IF ~CompleteBeforeCount /\ storeCount # 0
+                                   /\ activatedSlot # NoItem /\ activatedSlot # i
+                                   /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+                                THEN TRUE ELSE slotStomped
+              /\ activatedSlot' = IF storeCount = 0 THEN executingItemVisible
+                                  ELSE (IF CompleteBeforeCount THEN activatedSlot ELSE NoItem)
               /\ hasExecuting' = FALSE
               /\ hasExecutingVisible' = FALSE
               /\ executingItem' = NoItem
               /\ executingItemVisible' = NoItem
             ELSE
               /\ activations' = activations
+              \* Under FALSE this is the bug-shaped unconditional clear matching
+              \* `_activatedItem = default!`; stomps if it lands on a successor's publish.
+              /\ slotStomped' = IF ~CompleteBeforeCount
+                                   /\ activatedSlot # NoItem /\ activatedSlot # i
+                                   /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+                                THEN TRUE ELSE slotStomped
+              /\ activatedSlot' = IF CompleteBeforeCount THEN activatedSlot ELSE NoItem
               /\ UNCHANGED publish_vars
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
   /\ drainRemaining' = 0
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
 
 \* Slot drain, step 3 of 3, FIX, chain arm, slot-visible case (drainRemaining > 0,
 \* ~escalated): a successor's commit landed before our decrement, so it observed count >= 2
@@ -1666,8 +1753,11 @@ SlotDrainCompleteChainSlot ==
   /\ LET i == drainItem
          target == slotItem
      IN
-       /\ loc' = [loc EXCEPT ![i] = "Completed"]
-       /\ tenure' = IF ~ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+       \* Under CompleteBeforeCount=TRUE the loc/tenure/clear half is already done; this
+       \* action is activation-only. Under FALSE both halves run here.
+       /\ loc' = IF CompleteBeforeCount THEN loc ELSE [loc EXCEPT ![i] = "Completed"]
+       /\ tenure' = IF CompleteBeforeCount THEN tenure
+                    ELSE (IF tenure = i THEN NoItem ELSE tenure)
        \* The code's IsCompleted skip (mirrors CommitWaiter's guard): a waiter whose task
        \* already settled - possible without activation via CompleteTaskUnactivated - is
        \* never activated; its callback fired and bailed against our held latch, and the
@@ -1675,12 +1765,19 @@ SlotDrainCompleteChainSlot ==
        /\ activations' = IF target \in taskDone
                          THEN activations
                          ELSE [activations EXCEPT ![target] = @ + 1]
+       /\ slotStomped' = IF ~CompleteBeforeCount /\ target \in taskDone
+                            /\ activatedSlot # NoItem /\ activatedSlot # i
+                            /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+                         THEN TRUE ELSE slotStomped
+       /\ activatedSlot' = IF target \in taskDone
+                           THEN (IF CompleteBeforeCount THEN activatedSlot ELSE NoItem)
+                           ELSE target
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
   /\ drainRemaining' = 0
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
 
 \* Chain arm, escalation-raced case: the peek saw IsEscalated - a first escalation is (or
 \* finished) relocating the head slot -> queue, so the head cannot be named from the slot
@@ -1693,15 +1790,21 @@ SlotDrainCompleteChainHandoff ==
   /\ drainRemaining > 0
   /\ escalated
   /\ LET i == drainItem IN
-       /\ loc' = [loc EXCEPT ![i] = "Completed"]
-       /\ tenure' = IF ~ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+       /\ loc' = IF CompleteBeforeCount THEN loc ELSE [loc EXCEPT ![i] = "Completed"]
+       /\ tenure' = IF CompleteBeforeCount THEN tenure
+                    ELSE (IF tenure = i THEN NoItem ELSE tenure)
+       /\ slotStomped' = IF ~CompleteBeforeCount
+                            /\ activatedSlot # NoItem /\ activatedSlot # i
+                            /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+                         THEN TRUE ELSE slotStomped
+       /\ activatedSlot' = IF CompleteBeforeCount THEN activatedSlot ELSE NoItem
   /\ pendingHeadActivation' = TRUE
   /\ drainPhase' = "handoff"
   /\ drainItem' = NoItem
   /\ drainRemaining' = 0
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
 
 \* Handoff resolution, drainer reclaims: the one-shot re-peek found the head visible (the
 \* escalation's move landed), so the drainer claims its own obligation back (Exchange wins)
@@ -1711,14 +1814,15 @@ SlotDrainHandoffReclaim ==
   /\ pendingHeadActivation
   /\ Len(waiters) > 0
   /\ LET target == Head(waiters) IN
-       activations' = IF target \in taskDone
-                      THEN activations
-                      ELSE [activations EXCEPT ![target] = @ + 1]
+       /\ activations' = IF target \in taskDone
+                         THEN activations
+                         ELSE [activations EXCEPT ![target] = @ + 1]
+       /\ activatedSlot' = IF target \in taskDone THEN activatedSlot ELSE target
   /\ pendingHeadActivation' = FALSE
   /\ drainPhase' = "idle"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, drainRemaining, tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
 
 \* Handoff resolution, drainer trusts the escalator: the re-peek found no visible head (the
 \* move hasn't landed). The flag's full fence makes this safe: had the escalator's
@@ -1733,8 +1837,8 @@ SlotDrainHandoffTrust ==
   /\ drainPhase' = "idle"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Slot drain, step 3 of 3, FIX, C-path arm (drainRemaining = 0): no successor preceded our
 \* decrement, so any LATER commit observes count 1 = wasEmpty and self-activates - the
@@ -1753,25 +1857,37 @@ SlotDrainCompleteCPath ==
   \* completed), leaving the deferred publish as the only live responsibility.
   /\ (IF SkewTolerantPartition THEN drainRemaining <= 0 ELSE drainRemaining = 0)
   /\ LET i == drainItem IN
-       /\ loc' = [loc EXCEPT ![i] = "Completed"]
-       /\ tenure' = IF ~ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+       \* Under CompleteBeforeCount=TRUE the loc/tenure/clear half is already done; this
+       \* action is activation-only. Under FALSE both halves run here.
+       /\ loc' = IF CompleteBeforeCount THEN loc ELSE [loc EXCEPT ![i] = "Completed"]
+       /\ tenure' = IF CompleteBeforeCount THEN tenure
+                    ELSE (IF tenure = i THEN NoItem ELSE tenure)
        /\ IF (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)
              /\ hasExecutingVisible /\ executingItemVisible # NoItem
             THEN
               /\ activations' = [activations EXCEPT ![executingItemVisible] = @ + 1]
+              /\ activatedSlot' = executingItemVisible  \* ActivateHeadItem publishes the deferred-published item
+              /\ slotStomped' = slotStomped  \* the deferred-publish activation overrides any racing write
               /\ hasExecuting' = FALSE
               /\ hasExecutingVisible' = FALSE
               /\ executingItem' = NoItem
               /\ executingItemVisible' = NoItem
             ELSE
               /\ activations' = activations
+              \* Under FALSE this is the bug-shaped unconditional clear matching
+              \* `_activatedItem = default!`; stomps if it lands on a successor's publish.
+              /\ slotStomped' = IF ~CompleteBeforeCount
+                                   /\ activatedSlot # NoItem /\ activatedSlot # i
+                                   /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+                                THEN TRUE ELSE slotStomped
+              /\ activatedSlot' = IF CompleteBeforeCount THEN activatedSlot ELSE NoItem
               /\ UNCHANGED publish_vars
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
   /\ drainRemaining' = 0
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
 
 \* Trailing read fault on a committed SLOT waiter (RecoverySplit, Phase D) - the slot-tier
 \* twin of DrainHeadRecovers. DrainSlotInline consumed the claimed task and its GetResult
@@ -1821,12 +1937,12 @@ SlotHeadRecovers ==
        /\ recoveryOf[i] = NoItem  \* first-level (a substitute's guarded task completes directly)
        /\ loc' = [loc EXCEPT ![i] = "RecoveringInline"]
        /\ failed' = failed \cup {i}
-       /\ tenure' = IF ~ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+       /\ tenure' = IF tenure = i THEN NoItem ELSE tenure
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                 advancingPending, callbackSignaled, recoveryOf>>
+                 advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Drainer's release step. Mirrors DrainSlotInline's _advancing.Release() tail. Between
 \* SlotCallbackDrains and this release, the slot is empty but the advancer is still held.
@@ -1875,8 +1991,8 @@ SlotDrainerRelease ==
   \* when no reclaim precondition holds.
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* Pass-once slot-method tail, escalated arm: DrainSlotInline's post-release reclaim finds
 \* the store escalated and reroutes into DrainReadyWaiters (a fresh queue pass with the
@@ -1936,8 +2052,8 @@ SlotServeReacqEscalated ==
   /\ drainPhase' = "idle"
   /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 SlotServeReacqSlot ==
   /\ drainPhase = "sl_serve"
@@ -1948,8 +2064,8 @@ SlotServeReacqSlot ==
   /\ drainPhase' = "cl_acq"  \* re-enter the truthful slot claim (peek-gated under TriState)
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 SlotServeReacqLose ==
   /\ drainPhase = "sl_serve"
@@ -1959,8 +2075,8 @@ SlotServeReacqLose ==
   /\ advancingPending' = TRUE  \* lost re-acquire re-deposits on the winner (uniform rule)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars,
-                 drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, recoveryOf>>
+                 drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* The slot-mode reclaim (the strand fix under design): post-release, the drainer re-checks
 \* for a waiter whose callback bailed against its hold (recorded in drainSignal, callback
@@ -1988,10 +2104,10 @@ SlotDrainerReclaim ==
        /\ loc' = [loc EXCEPT ![i] = "Draining"]
        /\ drainPhase' = "claimed"
        /\ drainItem' = i
-       /\ tenure' = IF ConsumeBeforeRepublish /\ tenure = i THEN NoItem ELSE tenure
+       /\ tenure' = tenure
   /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                 drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* The race the originally-atomic SlotCallbackDrains hid: a follow-up slot callback fires
 \* while the previous drain still holds the advancer (between SlotDrainerDrains and
@@ -2079,8 +2195,8 @@ CallbackSetSignal ==
        /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, storeCount,
                       esc_vars, drainer_vars, loc, taskDone, activations, callbackFired, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                      tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                      advancingPending, recoveryOf>>
+                      tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
+                      advancingPending, activatedSlot, slotStomped, recoveryOf>>
 
 \* Step 2, won: TryAcquireOrFlagPending won (advancer free). Become the advancer; the do-top
 \* Exchange clears the signal (which a concurrent sibling's set may since have re-raised - that
@@ -2106,7 +2222,7 @@ CallbackAcquireWin ==
        /\ UNCHANGED <<publish_vars, tail_vars, slot_vars, waiters, storeCount,
                       esc_vars, loc, taskDone, activations, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                      tenure, tenureClash, assertFailed, nullActivation, advancingPending, recoveryOf>>
+                      tenure, assertFailed, nullActivation, advancingPending, activatedSlot, slotStomped, recoveryOf>>
 
 \* Step 2, lost: the advancer was held. Deposit the obligation in the latch word (the holder's
 \* release serves it); the signal stays set (this callback's own store, not yet cleared).
@@ -2126,7 +2242,7 @@ CallbackAcquireLose ==
        /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                       esc_vars, drainer_vars, loc, taskDone, activations, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                      tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, recoveryOf>>
+                      tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, activatedSlot, slotStomped, recoveryOf>>
 
 \* The signaled slot occupant was drained out from under its own callback: the holder's
 \* reclaim took it between the set and the acquire (reachable precisely because the
@@ -2149,8 +2265,8 @@ SlotCallbackSpent ==
        /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                       esc_vars, drainer_vars, loc, taskDone, activations, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                      tenure, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                      advancingPending, recoveryOf>>
+                      tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
+                      advancingPending, activatedSlot, slotStomped, recoveryOf>>
 
 (* ===========================================================================
    Advancer actions
@@ -2192,13 +2308,18 @@ AdvancerDrainHead ==
           \* consumed); count > 0 implies a peekable head in the under-promise direction, so
           \* the D-arm's checked peek is a canary - the null arm stays as the detector and
           \* NoNullActivation must HOLD.
+          \* activatedSlot mirrors the activation partition: clear if we just completed an
+          \* item that was the slot occupant; set to the new head on the D-arm.
           IF (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
             THEN /\ activations' = activations
+                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
                  /\ nullActivation' = nullActivation
           ELSE IF Len(waiters) > 1
             THEN /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
+                 /\ activatedSlot' = Head(Tail(waiters))
                  /\ nullActivation' = nullActivation
             ELSE /\ activations' = activations
+                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
                  /\ nullActivation' = TRUE
        \* Backlog #8 (ModelCPathClear): a <=0 decrement enters the C-path LOCK block as a
        \* distinct phase, so the lock's storeCount re-read (which can differ from newCount -
@@ -2210,7 +2331,7 @@ AdvancerDrainHead ==
                           THEN "cpath_lock" ELSE qDrainPhase)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, advancingPending, callbackSignaled, recoveryOf>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
 
 \* Trailing read fault on a committed queue waiter (RecoverySplit, backlog #2/#5 Phase C). The
 \* drainer reaches a settled head whose pipeline task FAULTED (not completed): the code's
@@ -2245,21 +2366,25 @@ DrainHeadRecovers ==
        /\ tenure' = IF tenure = i THEN NoItem ELSE tenure
        /\ UNCHANGED drainSignal
        \* The next-head activation partition, identical to AdvancerDrainHead: the faulted head
-       \* leaving is an ordinary dequeue for the REST of the queue.
+       \* leaving is an ordinary dequeue for the REST of the queue. activatedSlot mirrors:
+       \* clear if slot pointed at the faulted i; set to the new head on the D-arm.
        /\ IF (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
             THEN /\ activations' = activations
+                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
                  /\ nullActivation' = nullActivation
           ELSE IF Len(waiters) > 1
             THEN /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
+                 /\ activatedSlot' = Head(Tail(waiters))
                  /\ nullActivation' = nullActivation
             ELSE /\ activations' = activations
+                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
                  /\ nullActivation' = TRUE
        /\ qDrainPhase' = (IF ModelCPathClear
                              /\ (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
                           THEN "cpath_lock" ELSE qDrainPhase)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars,
                  taskDone, callbackFired, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, advancingPending, callbackSignaled, recoveryOf>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
 
 \* Advancer at count=0, executes C-path activation under lock.
 AdvancerCPath ==
@@ -2279,6 +2404,7 @@ AdvancerCPath ==
   /\ executingItemVisible # NoItem
   /\ LET exec == executingItemVisible IN
        /\ activations' = [activations EXCEPT ![exec] = @ + 1]
+       /\ activatedSlot' = exec  \* the C-path lock-block activation (Pipeline.cs:1281)
        /\ hasExecuting' = FALSE
        /\ hasExecutingVisible' = FALSE
        /\ executingItem' = NoItem
@@ -2674,7 +2800,7 @@ ExecItemFailure ==
          ELSE UNCHANGED publish_vars
     /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                    taskDone, activations, callbackFired, esc_vars, drainer_vars,
-                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
 
 \* RecoverItem wins-path: no prior waiter in flight (_waiters.Count is 0), inline-activate
 \* the substitute. Mirrors the post-fix code at the new RecoverItem in Pipeline.cs. The
@@ -2689,6 +2815,7 @@ RecoverItemWins ==
     /\ escPhase = "idle"
     /\ loc' = [loc EXCEPT ![i] = "Executing"]
     /\ activations' = [activations EXCEPT ![i] = @ + 1]
+    /\ activatedSlot' = i  \* substitute takes over the slot
     /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                    taskDone, callbackFired, failed, esc_vars, drainer_vars>>
 
@@ -2745,12 +2872,13 @@ RecoverInstallWins ==
             /\ j \notin failed
             /\ loc' = [loc EXCEPT ![j] = "Executing"]
             /\ activations' = [activations EXCEPT ![j] = @ + 1]
+            /\ activatedSlot' = j
             /\ recoveryOf' = [recoveryOf EXCEPT ![j] = i]
             /\ tenure' = j
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 \* Install, loses-path: a prior waiter is in flight (storeCount > 0), publish the substitute
 \* via the deferred handshake for the advancer C-path. Mirrors SourceYieldDeferred / the legacy
@@ -2777,8 +2905,8 @@ RecoverInstallLoses ==
                  ELSE FencedWriteOk(hasExecuting', hasExecutingVisible', TRUE)
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, activatedSlot,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 \* Install for a DRAIN-side park (RecoveringInline; Phase C/D's RecoverWaiter, Pipeline.cs
 \* ~1410-1443): the policy accepted, the substitute is activated UNCONDITIONALLY
@@ -2801,11 +2929,12 @@ RecoverInstallInline ==
             /\ j \notin failed
             /\ loc' = [loc EXCEPT ![j] = "Executing"]
             /\ activations' = [activations EXCEPT ![j] = @ + 1]
+            /\ activatedSlot' = j
             /\ recoveryOf' = [recoveryOf EXCEPT ![j] = i]
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 \* In-place completion of a drain-side substitute: its pipeline task settled and the recovery
 \* continuation runs CompleteRecoveryWaiter (Pipeline.cs ~1548/~1571) - the item completes at
@@ -2823,10 +2952,11 @@ RecoverInlineCompletes ==
        /\ j \in taskDone   \* the recovery continuation fired; GetResult observed (no fault face here)
        /\ j \notin failed
        /\ loc' = [loc EXCEPT ![j] = "Completed"]
+       /\ activatedSlot' = IF activatedSlot = j THEN NoItem ELSE activatedSlot
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 \* The binding discharge: the substitute reached "Completed" (its normal lifecycle), so the
 \* failed item it was bound to completes too (CompleteItem completes the bound failed flow with
@@ -2841,11 +2971,12 @@ BindingDischarge ==
        /\ LET i == recoveryOf[j] IN
             /\ loc[i] \in {"Recovering", "RecoveringInline"}
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
+            /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
        /\ recoveryOf' = [recoveryOf EXCEPT ![j] = NoItem]
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 (* ===========================================================================
    Recovery Phase B (June 2026): policy-refuse + recovery-on-recovery.
@@ -2871,10 +3002,11 @@ RecoverRefuse ==
        \* and the binding discharge.)
        /\ ~\E j \in Item : recoveryOf[j] = i
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
+       /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 \* Recovery-on-recovery: a SUBSTITUTE j (recoveryOf[j] = k) itself fails while Executing. The
 \* policy STRUCTURALLY refuses to recover a recovery item (the code's TryRecoverItemFailure
@@ -2893,6 +3025,7 @@ RecoverOnRecoveryFails ==
        /\ failed' = failed \cup {j}
        /\ LET k == recoveryOf[j] IN
             /\ loc' = [loc EXCEPT ![j] = "Completed", ![k] = "Completed"]  \* both direct
+            /\ activatedSlot' = IF activatedSlot \in {j, k} THEN NoItem ELSE activatedSlot
        /\ recoveryOf' = [recoveryOf EXCEPT ![j] = NoItem]
        /\ tenure' = IF tenure = j THEN NoItem ELSE tenure
        \* Roll back j's publish if it was deferred (RecoverInstallLoses), mirroring ExecItemFailure.
@@ -2904,8 +3037,8 @@ RecoverOnRecoveryFails ==
             ELSE UNCHANGED publish_vars
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenureClash,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 (* ===========================================================================
    Next-state relation
@@ -2921,13 +3054,13 @@ CompleteTaskW(i) == CompleteTask(i) /\ UNCHANGED aux_vars
 CompleteTaskUnactivatedW(i) == CompleteTaskUnactivated(i) /\ UNCHANGED aux_vars
 SourceYieldDeferredW == SourceYieldDeferred /\ UNCHANGED aux_vars
 ExecSetTailW == ExecSetTail /\ UNCHANGED aux_vars
-RecoverItemWinsW == RecoverItemWins /\ UNCHANGED aux_vars
+RecoverItemWinsW == RecoverItemWins /\ UNCHANGED aux_vars_act  \* writes activatedSlot
 RecoverItemLosesW == RecoverItemLoses /\ UNCHANGED aux_vars
 ExecCommitQueueVisibleWinsW == ExecCommitQueueVisibleWins /\ UNCHANGED aux_vars
 ExecCommitSlotCASWinsW == ExecCommitSlotCASWins /\ UNCHANGED aux_vars
 ExecCommitSlotCASLosesW == ExecCommitSlotCASLoses /\ UNCHANGED aux_vars
 ExecCommitSlotFieldsW == ExecCommitSlotFields /\ UNCHANGED aux_vars
-ExecCommitSlotCountWinsW == ExecCommitSlotCountWins /\ UNCHANGED aux_vars
+ExecCommitSlotCountWinsW == ExecCommitSlotCountWins /\ UNCHANGED aux_vars_act  \* writes activatedSlot
 ExecCommitSlotCountLosesW == ExecCommitSlotCountLoses /\ UNCHANGED aux_vars
 ExecCommitSlotWriteWinsW == ExecCommitSlotWriteWins /\ UNCHANGED aux_vars
 ExecCommitSlotWriteLosesW == ExecCommitSlotWriteLoses /\ UNCHANGED aux_vars
@@ -2937,7 +3070,7 @@ ExecCommitQueueVisibleLosesW == ExecCommitQueueVisibleLoses /\ UNCHANGED aux_var
 ExecCommitQueueCountWinsW == ExecCommitQueueCountWins /\ UNCHANGED aux_vars
 ExecCommitQueueCountLosesW == ExecCommitQueueCountLoses /\ UNCHANGED aux_vars
 ExecEscalationEnqueueTailW == ExecEscalationEnqueueTail /\ UNCHANGED aux_vars
-ExecEscalationCommitCountW == ExecEscalationCommitCount /\ UNCHANGED aux_vars
+ExecEscalationCommitCountW == ExecEscalationCommitCount /\ UNCHANGED aux_vars_act  \* writes activatedSlot
 ExecCommitTailPublishQueueExecutorWinsW == ExecCommitTailPublishQueueExecutorWins /\ UNCHANGED aux_vars
 ExecCommitTailPublishQueueExecutorLosesW == ExecCommitTailPublishQueueExecutorLoses /\ UNCHANGED aux_vars
 ExecEscalationCASSlotW == ExecEscalationCASSlot /\ UNCHANGED aux_vars
@@ -2961,7 +3094,7 @@ CallbackBecomesAdvancerW == CallbackBecomesAdvancer /\ UNCHANGED aux_nophase
 \* Bails deposit the pending bit atomically with their failed acquire (the one-word property).
 CallbackBailsOutW == CallbackBailsOut /\ UNCHANGED aux_nopend
   /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
-AdvancerCPathW == AdvancerCPath /\ UNCHANGED aux_nophase
+AdvancerCPathW == AdvancerCPath /\ UNCHANGED aux_nophase_act  \* writes activatedSlot
 AdvancerCPathClearAtCountW == AdvancerCPathClearAtCount /\ UNCHANGED aux_nophase
 AdvancerCPathLeaveAtCountW == AdvancerCPathLeaveAtCount /\ UNCHANGED aux_nophase
 AdvancerCPathLockExitW == AdvancerCPathLockExit /\ UNCHANGED aux_nophase
@@ -2992,7 +3125,6 @@ Next ==
   \/ \E i \in Item : CompleteTaskW(i)
   \/ \E i \in Item : CompleteTaskUnactivatedW(i)  \* possible, never obligated - no WF below
   \/ SourceYieldInline
-  \/ SourceYieldInlineClash
   \/ SourceYieldDeferredW
   \/ ExecSetTailW
   \/ ExecItemFailure
@@ -3050,6 +3182,7 @@ Next ==
   \/ SlotServeReacqEscalated
   \/ SlotServeReacqSlot
   \/ SlotServeReacqLose
+  \/ SlotDrainCompleteClear
   \/ SlotDrainCount
   \/ SlotDrainCompleteLegacy
   \/ SlotDrainCompleteChainSlot
@@ -3188,7 +3321,11 @@ Spec == Init /\ [][Next]_vars
         \* The consumed-deposit serve: the slot release's obligation re-acquire. One arm
         \* must fire (escalated reroute / slot re-enter / lost re-deposit).
         /\ WF_vars(SlotServeReacqEscalated \/ SlotServeReacqSlot \/ SlotServeReacqLose)
-        /\ WF_vars(SlotDrainCount)
+        \* SlotDrainCompleteClear under CompleteBeforeCount=TRUE runs FIRST (claimed ->
+        \* completed); SlotDrainCount runs second. Under FALSE it doesn't fire at all
+        \* (its guard requires CompleteBeforeCount). WF on the disjunction with
+        \* SlotDrainCount keeps fairness anchored on "the drain's bookkeeping advances."
+        /\ WF_vars(SlotDrainCompleteClear \/ SlotDrainCount)
         \* One WF over the disjunction: the complete variants are mutually exclusive
         \* (constant gate + drainRemaining partition + escalated branch) - the disjunction
         \* keeps fairness anchored on "the drain's step 3 eventually runs" rather than
@@ -3238,8 +3375,10 @@ TypeOK ==
   /\ advancingPending \in BOOLEAN
   /\ drainerActive \in BOOLEAN
   /\ failed \subseteq Item
-  /\ drainPhase \in {"idle", "claimed", "counted", "handoff", "cl_acq", "cl_xchg", "cl_read",
+  /\ drainPhase \in {"idle", "claimed", "completed", "counted", "handoff", "cl_acq", "cl_xchg", "cl_read",
                      "cl_peeked", "cl_own", "cl_exit", "cl_pendReacq", "sl_serve"}
+  /\ activatedSlot \in Item \cup {NoItem}
+  /\ slotStomped \in BOOLEAN
   /\ drainItem \in Item \cup {NoItem}
   \* -1 floor: the slot claim can consume a committed-but-uncounted pair under the split
   \* commit (the same single-producer skew bound as BoundedCountSkew; the code's
@@ -3247,7 +3386,6 @@ TypeOK ==
   /\ drainRemaining \in -1..NumItems
   /\ pendingHeadActivation \in BOOLEAN
   /\ tenure \in Item \cup {NoItem}
-  /\ tenureClash \in BOOLEAN
   /\ assertFailed \in BOOLEAN
   /\ nullActivation \in BOOLEAN
   /\ callbackSignaled \subseteq Item
@@ -3287,7 +3425,10 @@ CountConsistency ==
                          \/ (hasSlot /\ escPhase \notin {"slot_cas_act", "slot_cas_noact"}))
                   THEN 1 ELSE 0
   IN storeCount = slotTerm + Len(waiters)
-               + (IF drainPhase = "claimed" THEN 1 ELSE 0)
+               \* "completed" is the new phase between SlotDrainCompleteClear and
+               \* SlotDrainCount under CompleteBeforeCount=TRUE: drainItem is loc-Completed
+               \* but the store still counts it (decrement happens next at SlotDrainCount).
+               + (IF drainPhase \in {"claimed", "completed"} THEN 1 ELSE 0)
                + (IF claimInFlight THEN 1 ELSE 0)
                - (IF escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact",
                                    "slot_f_act", "slot_f_noact",
@@ -3300,14 +3441,17 @@ DrainConsistent ==
   \* Split from the fused <=> so the truthful claim's read phase fits: at "cl_read"
   \* drainItem holds whatever the read returned - the committed pair (forward direction
   \* must not require it) or NoItem (NoDefaultSlotClaim's subject, not this invariant's).
-  /\ (drainPhase \in {"claimed", "counted"}) => (drainItem # NoItem)
-  /\ (drainItem # NoItem) => (drainPhase \in {"claimed", "counted", "cl_read"})
+  /\ (drainPhase \in {"claimed", "completed", "counted"}) => (drainItem # NoItem)
+  /\ (drainItem # NoItem) => (drainPhase \in {"claimed", "completed", "counted", "cl_read"})
   \* The recovery admission: a drain-side fault park (SlotHeadRecovers) re-locates the
   \* claimed item to RecoveringInline while the drain PC stays parked at "claimed", and the
   \* post-resolution rejoin runs the count/complete steps with the item already Completed
   \* (refuse / discharge ran first). Outside recovery the original clause is unchanged.
+  \* Under CompleteBeforeCount=TRUE the "completed" phase also has the item already
+  \* Completed (SlotDrainCompleteClear ran first).
   /\ (drainItem # NoItem /\ drainPhase # "cl_read") =>
        \/ loc[drainItem] = "Draining"
+       \/ (drainPhase \in {"completed", "counted"} /\ loc[drainItem] = "Completed")
        \/ (RecoverySplit /\ drainItem \in failed
            /\ loc[drainItem] \in {"RecoveringInline", "Completed"})
   /\ \A i \in Item : (loc[i] = "Draining") => (drainItem = i)
@@ -3411,6 +3555,21 @@ NoSimultaneousActiveReader ==
         loc[i] = "Executing" /\ ~hasExecutingVisible /\ ~hasExecuting }
   IN  Cardinality(inlineActive) <= 1
 
+\* Slot consistency: activatedSlot only points at items that haven't completed yet.
+\* EXPECTED to hold across all toggle settings; orthogonal to the stomp witness below.
+ActivatedSlotConsistent ==
+  (activatedSlot = NoItem)
+  \/ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+
+\* No-stomp invariant: the slot-drain Complete clear must NOT wipe a successor's
+\* activatedSlot publication. EXPECTED to HOLD under CompleteBeforeCount = TRUE
+\* (the shipped ReorderFix - clear lands while count > 0, no concurrent activator
+\* can fire) and EXPECTED to FAIL under CompleteBeforeCount = FALSE (the pre-fix
+\* shape - clear lands after the count drop opens the inline-activation gate, so
+\* a successor can have written activatedSlot = NEW and the unconditional clear
+\* stomps it; Slon's PgDecoder NRE on CurrentExecutionControl, June 2026).
+NoStompedActivation == ~slotStomped
+
 \* Combined safety invariants. Single name keeps the .cfg simple and makes adding a new
 \* invariant a one-file change rather than a two-file change.
 Invariants ==
@@ -3423,6 +3582,8 @@ Invariants ==
   /\ PostEscalationSlotQuiescent
   /\ EscalationConsistent
   /\ NoSimultaneousActiveReader
+  /\ ActivatedSlotConsistent
+  /\ NoStompedActivation
 
 \* ============================================================================
 \* Bug witnesses (checked separately from Invariants so violations are attributable;
@@ -3436,13 +3597,6 @@ Invariants ==
 \* delete the assertion - the store's _hasSlot CAS is the ownership contract, not the count.
 DrainCountAssertHolds ==
   ~assertFailed
-
-\* The consume-before-republish contract. EXPECTED FALSE with ConsumeBeforeRepublish = FALSE
-\* (shipped ordering: consume after DecrementCount; Slon's ThrowAlreadyStarted at
-\* DispatchPipelinedRead, ~7/50 suite runs). MUST hold with ConsumeBeforeRepublish = TRUE -
-\* that is the design target this spec evolution exists to validate.
-NoTenureClash ==
-  ~tenureClash
 
 \* The queue drain's D-arm never fires with nothing to peek (the unchecked
 \* `_waiters.TryPeek` at DrainReadyWaiters ~1124 activating default(T) - the proven

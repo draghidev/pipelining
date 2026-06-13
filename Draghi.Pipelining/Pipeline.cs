@@ -60,12 +60,55 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // set (true) by the executor, claimed (false) by the advancer via Interlocked.Exchange.
     // The item field is written before the flag (ordered by the Exchange barrier).
     T _executingItem = default!;
-    bool _hasExecutingItem;
+    bool _executingItemActivationPending;
+
+    /// <summary>
+    /// The item currently holding the executor's single-pump slot, or default if none. The
+    /// pipeline assigns this before <see cref="IPipelinePolicy{T}.ExecuteItemAsync"/> is called
+    /// and keeps it through the trailing task's tail (a tail-waiter item retains the slot until
+    /// the next iteration's <see cref="CommitTailWaiter"/>); recovery republishes to the
+    /// substitute when <see cref="IPipelinePolicy{T}.TryRecoverItemFailure"/> returns true, and
+    /// leaves the slot cleared when it returns false.
+    /// </summary>
+    /// <remarks>
+    /// The single-pump invariant — only one item holds this slot at a time, ever — is what
+    /// makes the pipeline an item-sequencer: clients sequence whatever the workload's items
+    /// contend over (write turns in a client wire protocol, read turns in a server,
+    /// something else in a full-duplex composition). The pipeline takes no position on what
+    /// is being sequenced; policies use this identity as the single source of truth so they
+    /// can omit their own bookkeeping or locking primitive.
+    /// </remarks>
+    public T ExecutingItem => _executingItem;
+
+    /// The most recently activated item (set whenever the pipeline calls
+    /// <see cref="IPipelinePolicy{T}.ActivateHeadItem"/>). The Activate-before-Complete
+    /// in-order invariant means this identifies the item currently in its post-activation
+    /// phase between its activation and the next item's activation. Held across the brief
+    /// window between completion of the prior item and activation of the next — never reset
+    /// to default while the pipeline is live, so a completion-thread callback racing the
+    /// activation thread always sees a valid reference rather than a transient null.
+    T _activatedItem = default!;
+
+    /// <summary>
+    /// The most recently activated item, or default if no activation has occurred yet. Mirror of
+    /// <see cref="ExecutingItem"/> for the post-activation phase: ActivatedItem identifies whichever
+    /// item is currently in its post-activation phase under the in-order Activate-before-Complete
+    /// discipline. Policies use this identity to omit their own current-item bookkeeping (read-channel
+    /// or response-writer ownership) - the executor's in-order activation IS that bookkeeping.
+    /// </summary>
+    /// <remarks>
+    /// Holds the prior activation's reference across the brief gap between Complete(prev) and
+    /// Activate(next) — Slon's documented "stale reference between completions is safe" pattern
+    /// applies: in-flight processing only happens during an activated item's phase, and the
+    /// framework's per-item Activate-before-Complete invariant guarantees the read sees a
+    /// usable identity at the moment it matters.
+    /// </remarks>
+    public T ActivatedItem => _activatedItem;
     // Visibility-only flag for GetEnumerator. Set on dispatch in both branches (waiters=0 and
     // waiters>0) so heartbeat-style consumers can act on the in-flight flow before it transitions
     // to a tail-waiter slot. Cleared on every transition that gives the enumerator another channel
     // to see the item (sync completion, tail-waiter committal, recovery). Kept separate from
-    // _hasExecutingItem so the advancer C-path's Exchange semantics on that flag stay unchanged.
+    // _executingItemActivationPending so the advancer C-path's Exchange semantics on that flag stay unchanged.
     bool _hasInFlightItem;
     // The chain-arm-to-escalator activation handoff. Set (true) by the slot drainer when its
     // chain obligation meets an in-flight first escalation (the head is being relocated to the
@@ -261,11 +304,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 }
                 else
                 {
-                    // Release-only publish: subsequent readers seeing _hasExecutingItem=true also see
+                    // Release-only publish: subsequent readers seeing _executingItemActivationPending=true also see
                     // the _executingItem write. The full fence isn't needed here, we use the ordering
                     // not the Exchange's return value. CommitTailWaiter and the advancer C-path still
                     // use Exchange because they DO need the return value (test-and-set claim).
-                    Volatile.Write(ref _hasExecutingItem, true);
+                    Volatile.Write(ref _executingItemActivationPending, true);
                 }
 
                 try
@@ -377,7 +420,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         _enumerator = default;
         _tailWaiter = default!;
         _tailWaiterTask = default;
+        // Public surface: cleared unconditionally so value-type T pipelines don't expose a
+        // stale slot value post-shutdown.
         _executingItem = default!;
+        _activatedItem = default!;
         _waiters.Reset();
         _waiterRecoveryItem = default!;
         _drainWakeupTcs = null;
@@ -444,7 +490,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         else
         {
-            Volatile.Write(ref _hasExecutingItem, true);
+            Volatile.Write(ref _executingItemActivationPending, true);
         }
 
         try
@@ -516,31 +562,29 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             lock (activationLock)
             {
                 _executingItem = recoveryItem;
-                recoveryActivated = !Interlocked.Exchange(ref _hasExecutingItem, true);
+                recoveryActivated = !Interlocked.Exchange(ref _executingItemActivationPending, true);
                 if (recoveryActivated)
                 {
                     ActivateHeadItem(recoveryItem, preferAsync: false);
-                    // Inside _activationLock. Plain write suffices: all readers of _hasExecutingItem
+                    // Inside _activationLock. Plain write suffices: all readers of _executingItemActivationPending
                     // are Interlocked.Exchange (acquire-semantics, sees latest committed value), and
                     // the lock exit's release fence orders this write w.r.t. anyone acquiring next.
-                    _hasExecutingItem = false;
-                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                        _executingItem = default!;
+                    _executingItemActivationPending = false;
+                    // _executingItem stays populated: the recovery's ExecuteItemAsync below needs it
+                    // for write-phase gating (same C-path pattern).
                 }
             }
         }
         else
         {
             _executingItem = recoveryItem;
-            recoveryActivated = !Interlocked.Exchange(ref _hasExecutingItem, true);
+            recoveryActivated = !Interlocked.Exchange(ref _executingItemActivationPending, true);
             if (recoveryActivated)
             {
                 ActivateHeadItem(recoveryItem, preferAsync: false);
                 // No-lock path: a null _activationLock means no escalation ever happened, so no
                 // advancer exists to read this flag. Single writer, plain write suffices.
-                _hasExecutingItem = false;
-                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                    _executingItem = default!;
+                _executingItemActivationPending = false;
             }
         }
 
@@ -617,16 +661,16 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             _tailWaiter = default!;
 
         // Check whether the waiter path already activated this item via _executingItem.
-        var alreadyActivated = !Interlocked.Exchange(ref _hasExecutingItem, false);
+        var alreadyActivated = !Interlocked.Exchange(ref _executingItemActivationPending, false);
         // Only clear _executingItem when our Exchange won. If the advancer won, it reads
         // _executingItem under its lock for the C-path activation, clearing here would NRE it.
-        if (!alreadyActivated && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+        if (!alreadyActivated)
             _executingItem = default!;
 
         // Fence-acquire so CompleteWaiter below cannot fire CompleteItem before the advancer's
         // in-progress ActivateHeadItem finishes. Same pattern as ClearExecutingItem's deferred branch.
         // alreadyActivated also covers the "never published" case (inline activation took the
-        // count==0 branch and never set _hasExecutingItem). When _activationLock is still null no
+        // count==0 branch and never set _executingItemActivationPending). When _activationLock is still null no
         // advancer has ever run, so the fence has nothing to synchronize with and the skip is safe.
         if (alreadyActivated && _activationLock is { } activationLock)
             lock (activationLock) { }
@@ -637,7 +681,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // reads the current value anymore. Without this the inline-activated case (no publish,
         // so the Exchange above "loses" vacuously and the !alreadyActivated clear is skipped)
         // strands the committed item in _executingItem across the whole idle period.
-        if (alreadyActivated && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+        if (alreadyActivated)
             _executingItem = default!;
 
         if (task.IsCompleted)
@@ -704,7 +748,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         else
         {
-            Volatile.Write(ref _hasExecutingItem, true);
+            Volatile.Write(ref _executingItemActivationPending, true);
         }
 
         PipelineItemResult result;
@@ -766,15 +810,15 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // runs inside the executor's commit await, so the tail slot is not an option). A lost
             // Exchange means the advancer's C-path is mid-activation under its lock; the empty lock
             // acquire synchronizes-with its release so the commit below cannot race ActivateHeadItem.
-            var alreadyActivated = !Interlocked.Exchange(ref _hasExecutingItem, false);
-            if (!alreadyActivated && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            var alreadyActivated = !Interlocked.Exchange(ref _executingItemActivationPending, false);
+            if (!alreadyActivated)
                 _executingItem = default!;
             if (alreadyActivated && !recoveryActivated && _activationLock is { } activationLock)
                 lock (activationLock) { }
             // Post-fence clear, mirroring CommitTailWaiter: the inline-activated case never
             // published, so the Exchange "loses" vacuously and the clear above is skipped -
             // without this the recovery item strands in _executingItem across the idle period.
-            if (alreadyActivated && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            if (alreadyActivated)
                 _executingItem = default!;
             Volatile.Write(ref _hasInFlightItem, false);
             CommitWaiter(recoveryItem, activated: alreadyActivated, GuardRecoveryTask(pipelineTask));
@@ -815,6 +859,13 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // the zero-signal comparison miss forever (a stranded WaitForEmptyAsync). The comparison stays
         // `is 0` deliberately: <= would mask the same corruption by double-signaling.
         Debug.Assert(depth >= 0, "Pipeline depth under-ran: double completion for a single enqueue.");
+        // Release the ActivatedItem slot on every completion - the activated lifecycle is
+        // Activate-to-Complete by definition, and reading the slot outside that window is
+        // a consumer contract violation. (Exposes ConcurrentSync_AcrossConnections_AllComplete
+        // in the Slon suite - PgDecoder reads ActivatedFlow on socket-thread message
+        // dispatch that runs past the flow's completion. That's the underlying issue to
+        // diagnose, not a case the slot has to retain for.)
+        _activatedItem = default!;
         _policy.CompleteItem(item, depth, exception);
         return depth is 0;
     }
@@ -838,13 +889,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         var count = _waiters.TryEscalateOrEnqueue(item, waiterTask, out var isSlot, out var slotWasMoved);
         var wasEmpty = count is 1;
 
-        // The atomic _hasExecutingItem claim already happened in CommitTailWaiter /
+        // The atomic _executingItemActivationPending claim already happened in CommitTailWaiter /
         // ClearExecutingItem. Just clear for hygiene and inline-activate if we're the head.
         if (!activated)
         {
-            _hasExecutingItem = false;
-            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                _executingItem = default!;
+            _executingItemActivationPending = false;
+            _executingItem = default!;
 
             if (wasEmpty && !waiterTask.IsCompleted)
             {
@@ -994,6 +1044,18 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return;
         }
 
+        // Complete BEFORE Decrement. The clear of _activatedItem inside CompleteWaiterDeferred
+        // must run while the count still carries this position; otherwise the inline-activation
+        // gate (Count==0) can fire on another path - executor's deferred-publish branch, a
+        // successor commit's wasEmpty inline-activate - and that path's ActivateHeadItem write
+        // to _activatedItem gets stomped by our subsequent unconditional clear. The successor's
+        // body's first decoder read then sees _activatedItem=null and NREs in CurrentExecutionControl.
+        // Mirrors the recovery-fault path's Complete-before-Decrement audit reorder (lines
+        // 1132-1138 commentary). Verified: ActivatedSlotRace.tla, ReorderFix holds the
+        // NoNullActivatedReadByNew invariant; NoFix reproduces the witness.
+        if (taskException is null)
+            emptyReached = CompleteWaiterDeferred(item, null);
+
         var count = _waiters.DecrementCount();
         // -1 floor, not 0: a claimable-but-uncounted commit (fields/flag precede the increment)
         // consumed here sends the count transiently negative, bounded at -1 by the single producer.
@@ -1002,9 +1064,6 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // commit can CAS into it (or first-escalate) before our decrement lands - the store's
         // _hasSlot CAS is the ownership contract, not the count. The returned count is the
         // activation-responsibility partition below, same as DrainReadyWaiters' drain loop.
-
-        if (taskException is null)
-            emptyReached = CompleteWaiterDeferred(item, null);
 
         ActivateNextAfterSlotAdvance(count);
 
@@ -1102,11 +1161,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 // responsibility and this claim is correct. The committer's own late increment returns
                 // <= 0 (wasEmpty false) and its IsCompleted guard skips, so without this arm both sides
                 // skip and the publish strands.
-                if (_waiters.Count <= 0 && Interlocked.Exchange(ref _hasExecutingItem, false))
+                if (_waiters.Count <= 0 && Interlocked.Exchange(ref _executingItemActivationPending, false))
                 {
                     var executing = _executingItem;
-                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                        _executingItem = default!;
+                    // _executingItem stays populated: the main loop is concurrently about to call
+                    // _policy.ExecuteItemAsync(executing), which needs ExecutingItem for write-phase
+                    // gating. The next iteration overwrites or clears it naturally.
                     ActivateHeadItem(executing, preferAsync: true);
                 }
             }
@@ -1200,11 +1260,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                         // it; consuming-then-clearing here would strand the activation (neither side
                         // activates). The Exchange stays inside the lock so the executor's fence-acquire
                         // blocks until ActivateHeadItem finishes. The skewed -1 is a C-path state too.
-                        if (_waiters.Count <= 0 && Interlocked.Exchange(ref _hasExecutingItem, false))
+                        if (_waiters.Count <= 0 && Interlocked.Exchange(ref _executingItemActivationPending, false))
                         {
                             var executing = _executingItem;
-                            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                                _executingItem = default!;
                             ActivateHeadItem(executing, preferAsync: true);
                         }
                     }
@@ -1586,11 +1644,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             {
                 // Count gates the Exchange - LEAVE the publish at Count > 0 for the executor's commit
                 // to reclaim and activate, never consume-and-clear it (see DrainReadyWaiters' C-path).
-                if (_waiters.Count <= 0 && Interlocked.Exchange(ref _hasExecutingItem, false))
+                if (_waiters.Count <= 0 && Interlocked.Exchange(ref _executingItemActivationPending, false))
                 {
                     var executing = _executingItem;
-                    if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                        _executingItem = default!;
                     ActivateHeadItem(executing);
                 }
             }
@@ -1609,7 +1665,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    void ActivateHeadItem(T item, bool preferAsync = true) => _policy.ActivateHeadItem(item, preferAsync);
+    void ActivateHeadItem(T item, bool preferAsync = true)
+    {
+        // Update the publicly-observed ActivatedItem slot before dispatching to the policy:
+        // a same-thread inline activation sees the new value via the policy call's own
+        // sequencing, and a TP-dispatched activation publishes via the dispatch fence.
+        _activatedItem = item;
+        _policy.ActivateHeadItem(item, preferAsync);
+    }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void ClearExecutingItem(bool wasActivated)
@@ -1621,12 +1684,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         if (!wasActivated)
         {
-            if (Interlocked.Exchange(ref _hasExecutingItem, false))
+            if (Interlocked.Exchange(ref _executingItemActivationPending, false))
             {
                 // Won the race-back: advancer won't activate. Item is done (callers invoke us after
                 // pipelineTask.IsCompleted), so activation is optional, skip it.
-                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                    _executingItem = default!;
+                _executingItem = default!;
             }
             else
             {
@@ -1638,7 +1700,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 lock (_activationLock!) { }
             }
         }
-        else if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+        else
         {
             // Inline-activated path: no advancer is tracking, so we can drop the item reference
             // along with the visibility flag.

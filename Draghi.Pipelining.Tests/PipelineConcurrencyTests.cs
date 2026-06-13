@@ -350,7 +350,7 @@ public class PipelineConcurrencyTests
 
     /// Stresses the advancer's drain loop by completing many waiter pipeline tasks from
     /// parallel threads simultaneously. Exercises the do-while re-acquire at the end of
-    /// DrainReadyWaiters and the count-decrement-then-_hasExecutingItem-check ordering.
+    /// DrainReadyWaiters and the count-decrement-then-_executingItemActivationPending-check ordering.
     [TestMethod]
     public async Task ConcurrentWaiterCompletions()
     {
@@ -494,7 +494,7 @@ public class PipelineConcurrencyTests
     }
 
     /// Regression guard for the CommitTailWaiter activation-lock fence. CommitTailWaiter's
-    /// Exchange(_hasExecutingItem, false) handshake mirrors ClearExecutingItem's, but if Exchange
+    /// Exchange(_executingItemActivationPending, false) handshake mirrors ClearExecutingItem's, but if Exchange
     /// returns false (advancer already claimed and is mid-ActivateHeadItem under _activationLock)
     /// CommitTailWaiter must wait for that activation to finish before calling CompleteWaiter on
     /// the same item. Without the fence, CompleteItem fires while ActivateHeadItem is still
@@ -633,7 +633,7 @@ public class PipelineConcurrencyTests
     /// Three-way stress: producer enqueues, executor processes items with faulting pipeline
     /// tasks (triggering recovery via the advancer), recovery continuations fire and coordinate
     /// with the activation lock. Exercises the interleaving of executor + advancer + recovery
-    /// continuation paths against the same _hasExecutingItem / _drainTcs / _waiterInRecovery
+    /// continuation paths against the same _executingItemActivationPending / _drainTcs / _waiterInRecovery
     /// state. Stress test - won't deterministically hit every interleaving but catches
     /// regressions under load.
     [TestMethod]
@@ -1170,8 +1170,8 @@ public class PipelineConcurrencyTests
 
     /// Regression guard for the _executingItem slot clear in ClearExecutingItem (Pipeline.cs:1038-1039).
     /// An item dequeued with waiters present takes the deferred-publish path
-    /// (_executingItem=item, _hasExecutingItem=true). On sync-success completion, ClearExecutingItem
-    /// must Exchange _hasExecutingItem=false AND clear _executingItem when the executor wins the race.
+    /// (_executingItem=item, _executingItemActivationPending=true). On sync-success completion, ClearExecutingItem
+    /// must Exchange _executingItemActivationPending=false AND clear _executingItem when the executor wins the race.
     /// Without the clear, the completed item stays GC-rooted for the entire idle period.
     [TestMethod]
     public async Task Idle_ExecutingItemSlotDoesNotLeakDeferredItem()

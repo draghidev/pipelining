@@ -7,7 +7,7 @@ public class ValueTPipelineTests
 {
     /// Smoke test for value-type T: pushes items through the full pipeline lifecycle and verifies
     /// activation + completion fire. Exercises the publish-pair fence paths that differ from ref-T
-    /// (no GC write barrier on _executingItem / _tailWaiter), the Volatile.Write on _hasExecutingItem
+    /// (no GC write barrier on _executingItem / _tailWaiter), the Volatile.Write on _executingItemActivationPending
     /// at line 209, and the Volatile.Write on _hasTailWaiter publish.
     [TestMethod]
     public async Task ValueTypeT_BasicLifecycle()
