@@ -1346,4 +1346,96 @@ public class PipelineConcurrencyTests
 
         public bool RunEnqueueAsynchronously => true;
     }
+
+    /// Stress test targeting the cancel-during-arm window in TestObservableQueueSource's
+    /// WaitForNextAsync (see verification/ObservableSourceWait.tla). The executor parks at
+    /// `await wakeSignal.Arm()` after _pending=TRUE has been set under the wake lock; if the
+    /// source CancellationToken fires while the state machine is in the microsecond window
+    /// between Arm() and the await machinery's OnCompleted call, the state machine can
+    /// unwind without invoking WaitOnCompleted - _pending leaks at TRUE with
+    /// _waitContinuation NULL. A subsequent Signal claims _pending and dispatches a null
+    /// delegate (NRE), or the wake silently routes nowhere (lost wake / hang).
+    ///
+    /// The race is exclusively probabilistic: any deterministic sync (waiting for idle TCS,
+    /// WaitForExecuted, etc.) puts the executor PAST the synchronous arm-vs-register
+    /// window, hiding it. Per-iteration shape is therefore: race enqueue + cancel from two
+    /// threads with NO synchronization between them, staggered spin offsets to walk timing
+    /// across iterations. High iteration count compensates for the tight window.
+    ///
+    /// Iterations via DRAGHI_STRESS_ITERATIONS (default 200; bump for soak runs).
+    /// DRAGHI_STRESS_WAIT_ON_HANG=1 suspends (after a GC shed) for live dump capture
+    /// instead of failing on the first hit.
+    [TestMethod, DoNotParallelize]
+    public async Task CancelDuringArm_NoCorruption_Stress()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 200;
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            using var cts = new CancellationTokenSource();
+            var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+                new(true), cancellationToken: cts.Token);
+
+            // Two competing threads, no sync between them. The executor's first
+            // WaitForNextAsync iteration is the prime target: it races the enqueue
+            // (which signals) and the cancel (which signals via Complete).
+            var enqueueTask = Task.Run(() =>
+            {
+                for (var i = 0; i < 5; i++)
+                {
+                    try { pipeline.Enqueue(new TestPipelineItem()).Execute(); }
+                    catch (InvalidOperationException) { return; } // source completed
+                }
+            });
+
+            var spinTarget = (iter * 13) % 128;
+            var cancelTask = Task.Run(() =>
+            {
+                for (var s = 0; s < spinTarget; s++)
+                    Thread.SpinWait(8);
+                cts.Cancel();
+            });
+
+            try { await Task.WhenAll(enqueueTask, cancelTask).WaitAsync(TimeSpan.FromSeconds(5)); }
+            catch (TimeoutException)
+            {
+                Assert.Fail($"iter {iter}: enqueue/cancel race did not settle in 5s - " +
+                    "WakeSignal likely wedged with stale _pending");
+            }
+
+            string? hangDiagnosis = null;
+            try
+            {
+                await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            catch (OperationCanceledException)
+            {
+                // Token cancellation racing the drain is expected.
+            }
+            catch (TimeoutException)
+            {
+                hangDiagnosis = $"iter {iter}: CompleteAsync hung after cancel. " +
+                    "Lost wake or corrupted _pending in WakeSignal.";
+            }
+            catch (NullReferenceException ex)
+            {
+                hangDiagnosis = $"iter {iter}: NullReferenceException - DispatchClaimed " +
+                    $"dereferenced a null _waitContinuation. {ex.Message}";
+            }
+
+            if (hangDiagnosis is not null)
+            {
+                if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_WAIT_ON_HANG") == "1")
+                {
+                    GC.Collect(2, GCCollectionMode.Forced);
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect(2, GCCollectionMode.Forced);
+                    Console.WriteLine($"SUSPENDED: {hangDiagnosis}");
+                    await Task.Delay(Timeout.Infinite);
+                }
+                Assert.Fail(hangDiagnosis);
+            }
+        }
+    }
 }
