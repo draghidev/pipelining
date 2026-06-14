@@ -7,8 +7,8 @@ namespace Draghi.Pipelining;
 /// wrapper without having to thread the source through their own code.
 /// </summary>
 /// <remarks>
-/// For source-driven scenarios where the producer side isn't a simple SPSC queue (e.g. Slon's
-/// protocol-level idle handoff), use <see cref="Pipeline{T,TPolicy,TSource,TEnumerator}"/>
+/// For source-driven scenarios where the producer side isn't a simple SPSC queue (e.g. a source
+/// with its own idle/wake handoff), use <see cref="Pipeline{T,TPolicy,TSource,TEnumerator}"/>
 /// directly with a custom <see cref="IPipelineSource{T,TEnumerator}"/> implementation.
 /// </remarks>
 public sealed class QueuedPipeline<T, TPolicy>

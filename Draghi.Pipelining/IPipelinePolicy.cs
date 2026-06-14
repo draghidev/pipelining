@@ -30,7 +30,7 @@ public interface IPipelinePolicy<T>
     /// <remarks>
     /// Cancellation contract: implementations MUST observe <paramref name="cancellationToken"/>.
     /// The token is the pipeline's shutdown signal. The executor awaits this call inline during
-    /// the recovery flows (<c>RecoverItem</c>, <c>RecoverTrailingFailure</c>,
+    /// the recovery paths (<c>RecoverItem</c>, <c>RecoverTrailingFailure</c>,
     /// <c>RecoverCommittedTailWaiterAsync</c>). If an implementation ignores the token, the
     /// executor cannot exit its main loop and the pipeline's completion task will never complete.
     /// Idiomatic handling is to either throw <see cref="OperationCanceledException"/> on
@@ -41,7 +41,7 @@ public interface IPipelinePolicy<T>
     /// Signals the item that it is at the head of the pipeline.
     /// When <paramref name="preferAsync"/> is true, activation should be scheduled or guarded to avoid deep recursion.
     /// <remarks>
-    /// Optional per-item: an item that completes outside the head-of-pipeline flow (timeout,
+    /// Optional per-item: an item that completes outside the head-of-pipeline position (timeout,
     /// recovery, sync-deferred path) will not see a subsequent (stale) call for activation.
     /// When called, it is guaranteed to be at most once per item,
     /// strictly before <see cref="CompleteItem"/> for the same item, and never concurrently with it.
@@ -58,7 +58,7 @@ public interface IPipelinePolicy<T>
     /// <para>
     /// Today this runs under the advancer latch, so slow inline work here (or in <see cref="CompleteItem"/>)
     /// pins the drain and defers other completions. Treat <c>preferAsync: true</c> as required:
-    /// dispatch off-thread, no flow-body work inline. The name stays "prefer" because the
+    /// dispatch off-thread, no item-body work inline. The name stays "prefer" because the
     /// constraint is a framework limitation, not the contract's intent.
     /// </para>
     /// </remarks>
@@ -117,9 +117,9 @@ public readonly struct PipelineItemResult(ValueTask trailingExecutionTask, Value
     /// tail-waiter path unconditionally. The framework guarantees that
     /// <see cref="IPipelinePolicy{T}.CompleteItem"/> for such an item will fire only after this
     /// task has been observed (success or fault), regardless of when <see cref="PipelineTask"/>
-    /// completes. Flow authors can return a sync-complete pipeline task while their trailing
+    /// completes. Policy authors can return a sync-complete pipeline task while their trailing
     /// task is still pending. The framework will not fire <c>CompleteItem</c> until trailing
-    /// has finished. No internal composition required at the flow.
+    /// has finished. No internal composition required in the item.
     /// </remarks>
     public ValueTask TrailingExecutionTask { get; } = trailingExecutionTask;
     /// <summary>The item's pipelined-phase task. Completion signals the item is done in the pipeline.</summary>

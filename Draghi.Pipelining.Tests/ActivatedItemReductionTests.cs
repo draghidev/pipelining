@@ -2,42 +2,38 @@ using System.Diagnostics.CodeAnalysis;
 
 namespace Draghi.Pipelining.Tests;
 
-// Reduction for the abort observed in Slon at PgDecoder.cs:26
-// (Debug.Assert(_control.ActivatedFlow is not null)). Hypothesis (per Agent 1):
-//   The framework's per-item ordering (Activate(i)-before-Complete(i)) is preserved.
-//   What is NOT preserved is cross-item ordering between Complete(A) and Activate(B)
-//   when Activate(B) is dispatched to TP via UnsafeQueueUserWorkItem (matching the
-//   protocol's Policy.ActivateHeadItem at PgClientProtocol.cs:496-502).
+// Reduction for a cross-item activation/completion ordering hazard. The framework's per-item
+// ordering (Activate(i)-before-Complete(i)) is preserved. What a consumer can still observe broken
+// is cross-item ordering between Complete(A) and Activate(B) when Activate(B) is dispatched off the
+// completing thread via UnsafeQueueUserWorkItem - the activated-item slot can read null in the gap.
 //
 // We synthesise a policy that:
-//   - holds a single `_activated` field analogous to PgClientProtocol.Control.ActivatedFlow.
+//   - holds a single `_activated` field (the activated-item slot a consumer reads).
 //   - sets it in ActivateHeadItem.
 //   - nulls it in CompleteItem.
 //   - reads it (and asserts non-null) at a configurable check site.
-// Then drives the pipeline with hundreds of items so the framework's CommitWaiter
-// (Pipeline.cs:744) and DrainSlotInline (Pipeline.cs:856) preferAsync=true paths fire.
+// Then drives the pipeline with hundreds of items so the framework's CommitWaiter and
+// DrainSlotInline preferAsync=true paths fire.
 //
-// Two variants: INLINE activation and TP-dispatched activation. If only the second
-// reproduces the assert, the framework's contract is honoured and the bug is in the
-// off-thread activation hop the protocol introduced.
+// Two variants: INLINE activation and TP-dispatched activation. If only the second reproduces the
+// assert, the framework's contract is honoured and the hazard is in the off-thread activation hop.
 [TestClass]
-public class ActivatedFlowReductionTests
+public class ActivatedItemReductionTests
 {
     sealed class SyntheticItem
     {
         public int Id { get; init; }
-        // RunContinuationsAsynchronously: framework's CompleteItem continuation (registered
+        // RunContinuationsAsynchronously: the framework's CompleteItem continuation (registered
         // via UnsafeOnCompleted by the pipeline waiter machinery) gets TP-queued instead of
-        // running inline on whoever called SetResult. This is what makes Complete(prev)
-        // and Activate(next) end up on DIFFERENT threads in the real protocol where
-        // pipeline-task completions and ActivateHeadItem work items each schedule onto TP
-        // independently and race.
+        // running inline on whoever called SetResult. This is what makes Complete(prev) and
+        // Activate(next) end up on DIFFERENT threads - pipeline-task completions and
+        // ActivateHeadItem work items each schedule onto TP independently and race.
         public TaskCompletionSource PipelineTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public ValueTask GetPipelineTask() => new(PipelineTcs.Task);
 
-        // Tenure-reuse support: models PgClientFlow.Reset() + re-enqueue of the SAME instance
-        // (MaintenanceFlow / pooled-flow pattern). Tenures of one item are strictly sequential
-        // (the re-enqueue happens inside the previous tenure's completion), so plain fields.
+        // Tenure-reuse support: models Reset() + re-enqueue of the SAME instance (the pooled-item
+        // pattern). Tenures of one item are strictly sequential (the re-enqueue happens inside the
+        // previous tenure's completion), so plain fields.
         public int RemainingTenures;
         public Tenure CurrentTenure = new();
         public void Reset()
@@ -47,12 +43,12 @@ public class ActivatedFlowReductionTests
         }
     }
 
-    // One activation cycle of an item. The read gate: a decoder read only executes during its
-    // own tenure's drain, i.e. before that tenure's CompleteItem begins. A read that observes
-    // a null slot while its tenure is still mid-drain is a REAL hazard; a read straddling its
-    // own completion is suppressed. This is race-free where the old activeCount gate was not
-    // (count could be sampled before a completion's decrement and the slot after that same
-    // completion's null, yielding false positives).
+    // One activation cycle of an item. The read gate: a read only executes during its own tenure's
+    // drain, i.e. before that tenure's CompleteItem begins. A read that observes a null slot while
+    // its tenure is still mid-drain is a REAL hazard; a read straddling its own completion is
+    // suppressed. This is race-free where the old activeCount gate was not (count could be sampled
+    // before a completion's decrement and the slot after that same completion's null, yielding
+    // false positives).
     sealed class Tenure
     {
         public volatile bool Completed;
@@ -67,7 +63,7 @@ public class ActivatedFlowReductionTests
 
     enum NullPolicy
     {
-        AlwaysNull,           // baseline: ActivatedFlow = null in Complete unconditionally
+        AlwaysNull,           // baseline: activated slot = null in Complete unconditionally
         DepthZeroOnly,        // null only when remainingDepth == 0 (assignment)
         DepthZeroWithCas,     // null only at depth=0, via CAS that fails on overwrite
         NeverNull,            // never null - rely on next Activate to overwrite
@@ -109,18 +105,18 @@ public class ActivatedFlowReductionTests
             }
         }
 
-        // The protocol's CurrentExecutionControl read - the assert site. A read executes on
-        // behalf of a specific tenure and only asserts if the slot is null while that tenure
-        // is still mid-drain. Mirrors the decoder: reads only happen during the activated
-        // flow's drain, so a null observed then is a genuine binding loss.
+        // The consumer's activated-slot read - the assert site. A read executes on behalf of a
+        // specific tenure and only asserts if the slot is null while that tenure is still mid-drain.
+        // Reads only happen during the activated item's drain, so a null observed then is a genuine
+        // binding loss.
         //
-        // Read order matters: slot FIRST, own-tenure flag SECOND. Complete() sets the flag
-        // before applying the null policy (both release-ordered), so a reader that observed
-        // a null produced by its OWN completion must subsequently observe Completed==true
-        // (acquire on the null read). A null with Completed==false is therefore a null
-        // produced by a FOREIGN tenure's completion while this tenure is mid-drain - the
-        // real hazard. Flag-first would straddle: flag sampled before the completion, slot
-        // sampled after its null, false-positively blaming a clean ordering.
+        // Read order matters: slot FIRST, own-tenure flag SECOND. Complete() sets the flag before
+        // applying the null policy (both release-ordered), so a reader that observed a null produced
+        // by its OWN completion must subsequently observe Completed==true (acquire on the null
+        // read). A null with Completed==false is therefore a null produced by a FOREIGN tenure's
+        // completion while this tenure is mid-drain - the real hazard. Flag-first would straddle:
+        // flag sampled before the completion, slot sampled after its null, false-positively blaming
+        // a clean ordering.
         public void Read(Tenure tenure)
         {
             if (Volatile.Read(ref _activated) is null && !tenure.Completed)
@@ -156,12 +152,10 @@ public class ActivatedFlowReductionTests
                 {
                     var (probe, item) = ((ActivationProbe, SyntheticItem))state!;
                     probe.Activate(item);
-                    // Schedule the Read for "later" on a separate TP thread - do NOT
-                    // block. The pipelineTcs.SetResult fires immediately, so the
-                    // framework's CompleteItem chain races with this scheduled Read.
-                    // Mirrors the real protocol where the decoder's batch await on the
-                    // socket thread can fire its continuation (the Read at line 187)
-                    // arbitrarily later, after other items' Completes have interleaved.
+                    // Schedule the Read for "later" on a separate TP thread - do NOT block. The
+                    // pipelineTcs.SetResult fires immediately, so the framework's CompleteItem chain
+                    // races with this scheduled Read. The Read fires arbitrarily later, after other
+                    // items' Completes may have interleaved.
                     ThreadPool.UnsafeQueueUserWorkItem(static s =>
                     {
                         var (p, t) = ((ActivationProbe, Tenure))s!;
@@ -172,16 +166,15 @@ public class ActivatedFlowReductionTests
             }
             else if (_holder is not null)
             {
-                // Tenure-reuse mode, inline activation (the executor's _waiters.Count==0 path
-                // calls ActivateHeadItem with preferAsync:false, Pipeline.cs:237). Model the
-                // real flow shape: the decoder keeps reading AFTER activation (async Read),
-                // and the pipeline task completes from a socket continuation, never inline in
-                // ExecuteItemAsync (async TrySetResult). A synchronous TrySetResult here would
-                // take the executor's sync-completion shortcut and run CompleteItem on the
-                // executor thread itself, serializing away the cross-thread race.
+                // Tenure-reuse mode, inline activation (the executor's _waiters.Count==0 path calls
+                // ActivateHeadItem with preferAsync:false). Model the item shape where reads continue
+                // AFTER activation (async Read) and the pipeline task completes from an off-thread
+                // continuation, never inline in ExecuteItemAsync (async TrySetResult). A synchronous
+                // TrySetResult here would take the executor's sync-completion shortcut and run
+                // CompleteItem on the executor thread itself, serializing away the cross-thread race.
                 _probe.Activate(item);
-                // The real decoder reads many times across a drain; several scattered reads
-                // sample the (potential) null window instead of a single coin flip per tenure.
+                // A consumer reads many times across a drain; several scattered reads sample the
+                // (potential) null window instead of a single coin flip per tenure.
                 for (var r = 0; r < 4; r++)
                 {
                     _probe.RegisterPendingRead();
@@ -203,11 +196,10 @@ public class ActivatedFlowReductionTests
 
         public void CompleteItem(SyntheticItem item, int remainingDepth, Exception? exception)
         {
-            // Mirrors Slon's Policy.CompleteItem ordering: bookkeeping (Probe.Complete -
-            // the analogue of Control.OnCompleted's depth==0 CompareExchange) runs BEFORE
-            // the flow's completion action, so the re-enqueued tenure's Activate cannot
-            // ABA-defeat the comparand. Mark the completing tenure's drain over at entry so
-            // the completion action's Reset doesn't stamp the new tenure mid-drain.
+            // Bookkeeping (Probe.Complete - the depth==0 CompareExchange) runs BEFORE the item's
+            // completion action, so the re-enqueued tenure's Activate cannot ABA-defeat the
+            // comparand. Mark the completing tenure's drain over at entry so the completion action's
+            // Reset doesn't stamp the new tenure mid-drain.
             item.CurrentTenure.Completed = true;
             _probe.Complete(item, remainingDepth);
             FireCompletionAction(item);
@@ -241,8 +233,8 @@ public class ActivatedFlowReductionTests
             if (concurrentEnqueue)
             {
                 // Stagger enqueues across multiple threads to interleave with the framework's
-                // CompleteItem callbacks. Models the user-thread-Enqueue racing socket-thread-
-                // Complete(depth=0) hazard. Mid-pipeline Enqueue can refill the pipeline
+                // CompleteItem callbacks. Models the user-thread-Enqueue racing the completion-
+                // thread-Complete(depth=0) hazard. Mid-pipeline Enqueue can refill the pipeline
                 // between a previous Complete and its OnCompleted nulling.
                 var enqueueLock = new Lock();
                 Parallel.For(0, items, i =>
@@ -263,11 +255,9 @@ public class ActivatedFlowReductionTests
                 }
             }
 
-            // Mirror the protocol's invariant: an item's pipelineTask completes only AFTER
-            // its activation chain ran. In the real protocol, ExecutePipelined returns
-            // (triggering the framework's CompleteItem) only after Activate fires Activate-
-            // continuation -> ExecutePipelined chain. We replicate by setting the TCS from
-            // INSIDE the ActivateHeadItem callback, so Complete(i) is causally after Activate(i).
+            // Maintain the invariant: an item's pipelineTask completes only AFTER its activation
+            // chain ran. We replicate by setting the TCS from INSIDE the ActivateHeadItem callback,
+            // so Complete(i) is causally after Activate(i).
             await pipeline.CompleteAsync();
             // Wait for any scheduled Reads to drain so we count nulls observed late too.
             while (Volatile.Read(ref probe.PendingReads) > 0)
@@ -319,30 +309,28 @@ public class ActivatedFlowReductionTests
         }
     }
 
-    // Reads are scheduled per-item on a separate TP work item (modelling the socket-
-    // completion continuation that lands cross-thread). Read fires causally AFTER its
-    // item's Activate, so the noise floor of "Read before any Activate" is gone -
-    // any null observation now is a genuine cross-item race window.
+    // Reads are scheduled per-item on a separate TP work item (modelling a completion continuation
+    // that lands cross-thread). Read fires causally AFTER its item's Activate, so the noise floor of
+    // "Read before any Activate" is gone - any null observation now is a genuine cross-item race.
     [TestMethod] public Task Sequential_AlwaysNull_Inline() => RunBatch(false, 200, 50, NullPolicy.AlwaysNull);
     [TestMethod] public Task Sequential_AlwaysNull_Tp() => RunBatch(true, 200, 50, NullPolicy.AlwaysNull);
     [TestMethod] public Task Sequential_DepthZeroOnly_Tp() => RunBatch(true, 200, 50, NullPolicy.DepthZeroOnly);
     [TestMethod] public Task Sequential_DepthZeroWithCas_Tp() => RunBatch(true, 200, 50, NullPolicy.DepthZeroWithCas);
     [TestMethod] public Task Sequential_NeverNull_Tp() => RunBatch(true, 200, 50, NullPolicy.NeverNull);
 
-    // Concurrent enqueue exposes the user-thread-Enqueue racing framework
+    // Concurrent enqueue exposes the user-thread-Enqueue racing the framework
     // CompleteItem(depth=0) hazard - the harder race.
     [TestMethod] public Task ConcurrentEnqueue_AlwaysNull_Tp() => RunBatch(true, 200, 50, NullPolicy.AlwaysNull, concurrentEnqueue: true);
     [TestMethod] public Task ConcurrentEnqueue_DepthZeroOnly_Tp() => RunBatch(true, 200, 50, NullPolicy.DepthZeroOnly, concurrentEnqueue: true);
     [TestMethod] public Task ConcurrentEnqueue_DepthZeroWithCas_Tp() => RunBatch(true, 200, 50, NullPolicy.DepthZeroWithCas, concurrentEnqueue: true);
     [TestMethod] public Task ConcurrentEnqueue_NeverNull_Tp() => RunBatch(true, 200, 50, NullPolicy.NeverNull, concurrentEnqueue: true);
 
-    // Tenure reuse (MaintenanceFlow pattern): the same instance is reset and re-enqueued
-    // from inside its completion callback. With ReleaseBeforeComplete (the ordering Slon
-    // ships in Policy.CompleteItem - bookkeeping before user-visible completion) the
-    // depth==0 null sees the activated instance under its own tenure and never severs a
-    // live binding. The historical CompleteBeforeRelease ordering was ABA-defeated
-    // (PgDecoder.cs:26 abort); the activated-item / decrement reorder structurally closes
-    // that window in the framework so the unsafe variant no longer reproduces - the only
-    // remaining check here is that the shipped ordering stays hazard-free.
+    // Tenure reuse (pooled-item pattern): the same instance is reset and re-enqueued from inside its
+    // completion callback. With ReleaseBeforeComplete (bookkeeping before user-visible completion)
+    // the depth==0 null sees the activated instance under its own tenure and never severs a live
+    // binding. The historical CompleteBeforeRelease ordering was ABA-defeated; the activated-item /
+    // decrement reorder structurally closes that window in the framework so the unsafe variant no
+    // longer reproduces - the only remaining check here is that the shipped ordering stays
+    // hazard-free.
     [TestMethod] public Task TenureReuse_Cas_ReleaseBeforeComplete() => RunReuseBatch(1, 10, 150, NullPolicy.DepthZeroWithCas);
 }

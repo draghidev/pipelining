@@ -45,7 +45,26 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // cached-but-idle Pipeline shell's footprint then shrinks to just its own fields.
     Task _executionTask = Task.CompletedTask;
     // Pipeline state.
-    bool _completing; // First-writer guard for CompleteAsync.
+    // Shutdown coordination over a single slot, claimable by either an external CompleteAsync
+    // caller or by the executor's terminal cleanup (when the executor self-shuts-down via external
+    // CT cancellation through the Enumerator's _cts linkage). Slot values:
+    //   null                  = None: no shutdown in progress.
+    //   _shutdownInFlight     = a CompleteAsync caller is mid-call to _enumerator.Complete.
+    //   _shutdownDone         = caller (or executor on the no-caller path) finished. The
+    //                            terminal cleanup may dispose.
+    //   <a TaskCompletionSource> = executor's lazily-installed TCS that the caller must signal.
+    // The transitions use paired Interlocked.CompareExchange / Exchange (full fences) so the
+    // publish-and-signal handoff is free of the StoreLoad-reorder hazard a Volatile.Write +
+    // Volatile.Read pair across two fields would re-introduce (the original 2-field design
+    // parked the executor on a TCS the caller had already read as null on weak-memory; observed
+    // in HangRepro iter 51). One small allocation per shutdown when a caller is in flight; none
+    // on the common path where the executor wins the CAS.
+    // Verified in verification/PipelineShutdown.tla (ExecutorClosesGate fix).
+    TaskCompletionSource? _shutdownSlot;
+    // Identity-only sentinels. Never signaled; their Task is never observed. The Exchange-result
+    // check uses ReferenceEquals to distinguish them from a real executor-published TCS.
+    static readonly TaskCompletionSource _shutdownInFlight = new();
+    static readonly TaskCompletionSource _shutdownDone = new();
     Pipeline.DepthState _depthState;
     Exception? _completionException;
 
@@ -98,14 +117,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// </summary>
     /// <remarks>
     /// Holds the prior activation's reference across the brief gap between Complete(prev) and
-    /// Activate(next) — Slon's documented "stale reference between completions is safe" pattern
-    /// applies: in-flight processing only happens during an activated item's phase, and the
-    /// framework's per-item Activate-before-Complete invariant guarantees the read sees a
-    /// usable identity at the moment it matters.
+    /// Activate(next): a stale reference there is safe because in-flight processing only happens during
+    /// an activated item's phase, when the read sees a usable identity.
     /// </remarks>
     public T ActivatedItem => _activatedItem;
     // Visibility-only flag for GetEnumerator. Set on dispatch in both branches (waiters=0 and
-    // waiters>0) so heartbeat-style consumers can act on the in-flight flow before it transitions
+    // waiters>0) so heartbeat-style consumers can act on the in-flight item before it transitions
     // to a tail-waiter slot. Cleared on every transition that gives the enumerator another channel
     // to see the item (sync completion, tail-waiter committal, recovery). Kept separate from
     // _executingItemActivationPending so the advancer C-path's Exchange semantics on that flag stay unchanged.
@@ -154,7 +171,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         _policy = policy;
         _source = source;
-        _completing = false;
+        _shutdownSlot = null;
 
         // GetAsyncEnumerator takes the depth-increment callback inline. Source binds it before
         // any item can be admitted, so the very first admission lands in _depthState. Pipeline
@@ -212,7 +229,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// </remarks>
     public ValueTask CompleteAsync(Exception? exception = null)
     {
-        if (Interlocked.Exchange(ref _completing, true))
+        // First-claim wins (CAS null -> InFlight). Subsequent callers (or a late call after the
+        // executor self-shut-down via external CT cancellation, which transitions the slot to Done
+        // from the terminal cleanup) just return the executor task.
+        if (Interlocked.CompareExchange(ref _shutdownSlot, _shutdownInFlight, null) != null)
             return new(_executionTask);
 
         _completionException = exception;
@@ -222,6 +242,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // DisposeAsync runs at the end of the executor's main loop as the terminal cleanup.
         _enumerator.Complete();
 
+        // Transition InFlight -> Done. The Exchange picks up whatever was in the slot - either the
+        // InFlight sentinel we put there (executor hasn't shown up) or a TCS the executor
+        // published while we were inside _enumerator.Complete. In the latter case we signal it so
+        // the executor unblocks. The Exchange's full fence pairs with the executor's CASes (see
+        // _shutdownSlot comment) - one of the two sides always observes the other's transition.
+        var swapped = Interlocked.Exchange(ref _shutdownSlot, _shutdownDone);
+        if (swapped is not null && !ReferenceEquals(swapped, _shutdownInFlight))
+            swapped.TrySetResult();
         return new(_executionTask);
     }
 
@@ -360,13 +388,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // trailing-await below stalls the executor before the next CommitTailWaiter (which
                     // fires CompleteWaiter), so trailing is structurally observed before completion.
                     //
-                    // Clear _hasInFlightItem BEFORE publishing _hasTailWaiter so a concurrent
-                    // enumerator never sees both true at once. The reverse order would let the
-                    // heartbeat enumerator yield the same flow twice (once via phase 0, once via
-                    // phase 4) and call OnHeartbeat twice in one tick, which double-decrements
-                    // PgDecoder's _remainingTimeout and fires a spurious read timeout.
-                    // _executingItem itself stays populated for the advancer C-path when waiters>0;
-                    // CommitTailWaiter clears it under the lock.
+                    // Clear _hasInFlightItem BEFORE publishing _hasTailWaiter so a concurrent enumerator
+                    // never sees both true at once - the reverse order would let a heartbeat-style
+                    // enumerator yield the same item twice (phase 0 and phase 4) and fire the consumer's
+                    // per-tick callback twice. _executingItem stays populated for the advancer C-path
+                    // when waiters>0; CommitTailWaiter clears it under the lock.
                     Volatile.Write(ref _hasInFlightItem, false);
                     _tailWaiter = item;
                     _tailWaiterTask = itemResult.PipelineTask;
@@ -403,15 +429,30 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
 
         await DrainOnCompletionAsync();
+
+        // Close the shutdown gate before disposing the enumerator. CAS null -> Done:
+        //   - Wins (slot was null): no caller in flight; dispose immediately.
+        //   - Loses with Done: caller already finished; dispose immediately.
+        //   - Loses with InFlight: caller is mid-_enumerator.Complete; install a TCS via a second
+        //     CAS over the InFlight sentinel. If that CAS wins, await the TCS - the caller's
+        //     Exchange to Done picks our TCS up and signals it. If that CAS loses, the caller
+        //     raced to Done between our two CASes, so skip the await.
+        var prev = Interlocked.CompareExchange(ref _shutdownSlot, _shutdownDone, null);
+        if (prev is not null && !ReferenceEquals(prev, _shutdownDone))
+        {
+            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            if (ReferenceEquals(Interlocked.CompareExchange(ref _shutdownSlot, tcs, _shutdownInFlight), _shutdownInFlight))
+                await tcs.Task.ConfigureAwait(false);
+        }
         await _enumerator.DisposeAsync().ConfigureAwait(false);
 
         // ExecuteSource has fully completed: all items drained, enumerator disposed, advancer
         // chain quiesced. Default the per-run reference-holding fields so a cached-but-idle
         // Pipeline shell doesn't hold them across an idle period. Trimmed to the safe minimum:
         // only reference-typed and reference-containing fields that could be promoted to gen1/2.
-        // _completing is set to true so any racing CompleteAsync first-call returns the (about-
-        // to-be-swapped-to-CompletedTask) execution task without touching the defaulted fields.
-        _completing = true;
+        // _shutdownSlot is already at Done from the gate-close above, so a racing CompleteAsync
+        // first-call's CAS null -> InFlight fails and they return the (about-to-be-swapped-to-
+        // CompletedTask) execution task without touching the defaulted fields.
         _completionException = null;
         _policy = default!;
         _source = default!;
@@ -859,10 +900,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         Debug.Assert(depth >= 0, "Pipeline depth under-ran: double completion for a single enqueue.");
         // Release the ActivatedItem slot on every completion - the activated lifecycle is
         // Activate-to-Complete by definition, and reading the slot outside that window is
-        // a consumer contract violation. (Exposes ConcurrentSync_AcrossConnections_AllComplete
-        // in the Slon suite - PgDecoder reads ActivatedFlow on socket-thread message
-        // dispatch that runs past the flow's completion. That's the underlying issue to
-        // diagnose, not a case the slot has to retain for.)
+        // a consumer contract violation. (A consumer that reads the activated slot on a dispatch
+        // thread running past the item's completion will observe the cleared slot - that's the
+        // underlying issue to diagnose, not a case the slot has to retain for.)
         _activatedItem = default!;
         _policy.CompleteItem(item, depth, exception);
         return depth is 0;
@@ -940,8 +980,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Try to become the advancer, only one thread processes completions at a time.
         // Process even during shutdown: drain's wait-for-advancer-idle is what coordinates with
         // us, and bailing out here would let drain "complete" the item via DrainOnCompletionAsync's
-        // queue sweep while the body's pipeline task is still running, stranding the flow in a
-        // half-completed state (ActivatedFlow cleared but body still reading).
+        // queue sweep while the body's pipeline task is still running, stranding the item in a
+        // half-completed state (activated slot cleared but its body still reading).
         if (!_advancing.TryAcquireOrFlagPending())
         {
             // Obligation deposited in the latch word; the holder's release serves it.
@@ -1709,7 +1749,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     _phase = 1;
                     // Visibility-only window: the in-flight item is held on _executingItem before
                     // being committed elsewhere. Without yielding it here, heartbeat-style
-                    // consumers can't see the flow during dispatch (waiting-body abort propagation
+                    // consumers can't see the item during dispatch (waiting-body abort propagation
                     // needs this). Volatile.Read pairs with the executor's Volatile.Write on
                     // _hasInFlightItem.
                     if (Volatile.Read(ref _pipeline._hasInFlightItem) && _pipeline._executingItem is { } inFlight)

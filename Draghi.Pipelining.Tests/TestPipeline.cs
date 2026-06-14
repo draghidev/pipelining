@@ -127,8 +127,8 @@ sealed class TestPipelineItem
     }
 
     // TrySet: an explicit completion can race the shutdown-token settlement (see
-    // TryCancelPipelineTask) - first writer wins, matching the escalation design where a
-    // flow's natural completion and its abort escalation are inherently racing settlers.
+    // TryCancelPipelineTask) - first writer wins, matching the escalation design where an
+    // item's natural completion and its abort escalation are inherently racing settlers.
     public void CompletePipelineTask()
     {
         if (PipelineTaskException is not null)
@@ -203,11 +203,10 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
         if (item.ThrowOnExecute is { } ex)
             throw ex;
 
-        // The flow-side escalation half of the shutdown design: the pipeline only drains
+        // The item-side escalation half of the shutdown design: the pipeline only drains
         // gracefully, and items are responsible for settling their own waiting sources when
-        // the shutdown signal fires (the real protocol does this via the heartbeat abort
-        // walk; the pipeline's signal to items is this token). Without it a pending item
-        // legitimately blocks CompleteAsync forever.
+        // the shutdown signal fires (the pipeline's signal to items is this token). Without
+        // it a pending item legitimately blocks CompleteAsync forever.
         if (item.CompleteAsync && cancellationToken.CanBeCanceled)
             item.AttachShutdownRegistration(cancellationToken.UnsafeRegister(
                 static (state, token) => ((TestPipelineItem)state!).TryCancelPipelineTask(token), item));

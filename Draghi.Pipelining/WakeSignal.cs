@@ -105,7 +105,7 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     /// <see cref="Signal(bool)"/>). Requires construction with <c>enableWaitForSuspended</c>.
     /// Every claim clears the observation before dispatch so it stays accurate across resume.
     /// A stale observation would let a later handoff producer skip its wait and return with its
-    /// flow unexecuted.
+    /// item unexecuted.
     /// </summary>
     public void WaitForSuspended() => _suspendedMres!.Wait();
 

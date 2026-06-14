@@ -266,7 +266,7 @@ public class PipelineConcurrencyTests
 
     /// Upper-bound regression guard for activation: every item must be activated at most once.
     /// Activation is optional per the contract (items whose underlying work completes outside the
-    /// head-of-pipeline flow may skip it), so we don't assert a lower bound. The bug class this
+    /// head-of-pipeline position may skip it), so we don't assert a lower bound. The bug class this
     /// catches is double activation, where two paths both call ActivateHeadItem for the same item.
     [TestMethod]
     public async Task NoItemActivatedMoreThanOnceUnderLoad()
@@ -297,7 +297,7 @@ public class PipelineConcurrencyTests
     }
 
     /// Ordering regression guard: activations that do occur must be in pipeline-enqueue order.
-    /// Activation is optional (items whose work completes outside head-of-pipeline flow may skip),
+    /// Activation is optional (items whose work completes outside head-of-pipeline position may skip),
     /// so the recorded sequence is monotone-increasing rather than contiguous.
     [TestMethod]
     public async Task ActivationOrderMatchesEnqueueOrderUnderLoad()
@@ -873,7 +873,7 @@ public class PipelineConcurrencyTests
     /// Concurrent CompleteAsync calls from multiple threads: Interlocked.Exchange on _completing
     /// ensures exactly one wins, others observe the same execution task, and all callers'
     /// tasks complete. The pipeline drains gracefully only - the pending item settles itself
-    /// via the shutdown token (the flow-side escalation contract), so the drained item sees
+    /// via the shutdown token (the item-side escalation contract), so the drained item sees
     /// the cancellation, not a CompleteAsync-supplied exception (that propagation was the
     /// retired forceful-sweep contract).
     [TestMethod]
@@ -902,7 +902,7 @@ public class PipelineConcurrencyTests
         Assert.IsTrue(item.IsCompleted);
         Assert.IsNotNull(item.Exception);
         Assert.IsInstanceOfType<OperationCanceledException>(item.Exception,
-            "Drained item settles via the shutdown token (flow-side escalation), not a CompleteAsync-supplied exception.");
+            "Drained item settles via the shutdown token (item-side escalation), not a CompleteAsync-supplied exception.");
     }
 
     /// WaitForEmptyAsync caller is suspended when CompleteAsync fires concurrently. The drain must

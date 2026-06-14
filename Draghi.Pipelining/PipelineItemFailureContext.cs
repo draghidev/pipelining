@@ -28,10 +28,10 @@ public readonly struct PipelineItemFailureContext(PipelineItemFailureKind kind, 
     /// it carries the still-pending PIPELINE task (the framework hasn't observed it yet,
     /// but the policy may need to wire its outcome into a substitute); for
     /// <see cref="PipelineItemFailureKind.PipelineTask"/> it carries the still-running
-    /// TRAILING task (the failed flow's trailing may still be in-flight when its pipeline
+    /// TRAILING task (the failed item's trailing may still be in-flight when its pipeline
     /// task sync-faulted, and the substitute must sequence against it to avoid colliding
     /// on the shared output). Default for <see cref="PipelineItemFailureKind.ExecuteItemTask"/>
-    /// (no FlowTasks returned) and <see cref="PipelineItemFailureKind.PipelineTaskWaiter"/>
+    /// (no PipelineItemResult returned) and <see cref="PipelineItemFailureKind.PipelineTaskWaiter"/>
     /// (failed item's trailing was awaited at commit time long before the drain-side fault).
     public ValueTask OutstandingPhaseTask { get; } = outstandingPhaseTask;
 }
