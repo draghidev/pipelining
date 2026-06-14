@@ -80,6 +80,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // The item field is written before the flag (ordered by the Exchange barrier).
     T _executingItem = default!;
     bool _executingItemActivationPending;
+    // Seqlock generation for the public ExecutingItem getter under value-type T (see PublishSlot /
+    // ReadSlot). Unused for reference T (single-word atomic). _executingItem has a sole writer (the
+    // executor strand; recovery is awaited inline, the advancer only reads it under _activationLock),
+    // so the seqlock's single-writer assumption is unconditional here.
+    uint _executingItemGen;
 
     /// <summary>
     /// The item currently holding the executor's single-pump slot, or default if none. The
@@ -97,7 +102,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// is being sequenced; policies use this identity as the single source of truth so they
     /// can omit their own bookkeeping or locking primitive.
     /// </remarks>
-    public T ExecutingItem => _executingItem;
+    public T ExecutingItem => ReadSlot(ref _executingItem, ref _executingItemGen);
 
     /// The most recently activated item (set whenever the pipeline calls
     /// <see cref="IPipelinePolicy{T}.ActivateHeadItem"/>). The Activate-before-Complete
@@ -107,6 +112,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// to default while the pipeline is live, so a completion-thread callback racing the
     /// activation thread always sees a valid reference rather than a transient null.
     T _activatedItem = default!;
+    // Seqlock generation for the public ActivatedItem getter under value-type T. Unused for reference
+    // T. The writers of _activatedItem (ActivateHeadItem, the depth-0 clear, the post-drain reset) run
+    // on different strands but never overlap for a live slot - serialized by the in-order retirement
+    // discipline + Complete-before-DecrementCount (TLA NoStompedActivation / CompleteBeforeCount), the
+    // same invariant the slot-clear leans on. The seqlock introduces no new concurrent-writer pair.
+    uint _activatedItemGen;
 
     /// <summary>
     /// The most recently activated item, or default if no activation has occurred yet. Mirror of
@@ -120,7 +131,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// Activate(next): a stale reference there is safe because in-flight processing only happens during
     /// an activated item's phase, when the read sees a usable identity.
     /// </remarks>
-    public T ActivatedItem => _activatedItem;
+    public T ActivatedItem => ReadSlot(ref _activatedItem, ref _activatedItemGen);
     // Visibility-only flag for GetEnumerator. Set on dispatch in both branches (waiters=0 and
     // waiters>0) so heartbeat-style consumers can act on the in-flight item before it transitions
     // to a tail-waiter slot. Cleared on every transition that gives the enumerator another channel
@@ -319,7 +330,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 // Publish _executingItem and the visibility flag before either activation path.
                 // _hasInFlightItem signals GetEnumerator that the in-flight item is yieldable during
                 // the dispatch window where it isn't tracked anywhere else.
-                _executingItem = item;
+                SetExecutingItem(item);
                 Volatile.Write(ref _hasInFlightItem, true);
 
                 var activated = false;
@@ -353,7 +364,16 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 // their trailing is also sync-complete (default(ValueTask) is success, so items without a
                 // trailing keep the fast path). This is how the framework guarantees CompleteWaiter doesn't
                 // fire before trailing is observed.
-                if (itemResult.PipelineTask.IsCompletedSuccessfully && itemResult.TrailingExecutionTask.IsCompletedSuccessfully)
+                //
+                // Gated on _waiters.Count is 0 to keep retirement strictly in-order: the store plus the
+                // head-gated drain is a reorder buffer (entries complete out of order, buffer, and retire
+                // in program order from the head). This inline shortcut bypasses the ROB, so it's only
+                // safe when the ROB is empty (Count is 0 = this item is the head). With an earlier entry
+                // buffered, retiring inline would jump ahead of it, so we fall through to route through
+                // the ROB instead. The shortcut is a perf optimization, not a correctness path - an
+                // ordered transport never produces a later item sync-completing before an earlier one.
+                if (_waiters.Count is 0
+                    && itemResult.PipelineTask.IsCompletedSuccessfully && itemResult.TrailingExecutionTask.IsCompletedSuccessfully)
                 {
                     itemResult.PipelineTask.GetAwaiter().GetResult();
                     ClearExecutingItem(activated);
@@ -461,8 +481,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         _tailWaiterTask = default;
         // Public surface: cleared unconditionally so value-type T pipelines don't expose a
         // stale slot value post-shutdown.
-        _executingItem = default!;
-        _activatedItem = default!;
+        SetExecutingItem(default!);
+        SetActivatedItem(default!);
         _waiters.Reset();
         _waiterRecoveryItem = default!;
         _drainWakeupTcs = null;
@@ -519,7 +539,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // inline-activate only when no prior pipeline task is in flight, otherwise publish for
         // deferred activation. Activating eagerly while a prior waiter still owns the read channel
         // overwrites its activation state and races the in-flight decoder consumer.
-        _executingItem = recoveryItem;
+        SetExecutingItem(recoveryItem);
         Volatile.Write(ref _hasInFlightItem, true);
         var recoveryActivated = false;
         if (_waiters.Count is 0)
@@ -600,7 +620,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         {
             lock (activationLock)
             {
-                _executingItem = recoveryItem;
+                SetExecutingItem(recoveryItem);
                 recoveryActivated = !Interlocked.Exchange(ref _executingItemActivationPending, true);
                 if (recoveryActivated)
                 {
@@ -616,7 +636,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         else
         {
-            _executingItem = recoveryItem;
+            SetExecutingItem(recoveryItem);
             recoveryActivated = !Interlocked.Exchange(ref _executingItemActivationPending, true);
             if (recoveryActivated)
             {
@@ -704,7 +724,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Only clear _executingItem when our Exchange won. If the advancer won, it reads
         // _executingItem under its lock for the C-path activation, clearing here would NRE it.
         if (!alreadyActivated)
-            _executingItem = default!;
+            SetExecutingItem(default!);
 
         // Fence-acquire so CompleteWaiter below cannot fire CompleteItem before the advancer's
         // in-progress ActivateHeadItem finishes. Same pattern as ClearExecutingItem's deferred branch.
@@ -721,7 +741,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // so the Exchange above "loses" vacuously and the !alreadyActivated clear is skipped)
         // strands the committed item in _executingItem across the whole idle period.
         if (alreadyActivated)
-            _executingItem = default!;
+            SetExecutingItem(default!);
 
         if (task.IsCompleted)
         {
@@ -777,7 +797,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Republish and gate activation on the count, mirroring RecoverItem: activating
         // unconditionally while prior waiters are in flight would put a second active reader on the
         // wire.
-        _executingItem = recoveryItem;
+        SetExecutingItem(recoveryItem);
         Volatile.Write(ref _hasInFlightItem, true);
         var recoveryActivated = false;
         if (_waiters.Count is 0)
@@ -851,14 +871,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // acquire synchronizes-with its release so the commit below cannot race ActivateHeadItem.
             var alreadyActivated = !Interlocked.Exchange(ref _executingItemActivationPending, false);
             if (!alreadyActivated)
-                _executingItem = default!;
+                SetExecutingItem(default!);
             if (alreadyActivated && !recoveryActivated && _activationLock is { } activationLock)
                 lock (activationLock) { }
             // Post-fence clear, mirroring CommitTailWaiter: the inline-activated case never
             // published, so the Exchange "loses" vacuously and the clear above is skipped -
             // without this the recovery item strands in _executingItem across the idle period.
             if (alreadyActivated)
-                _executingItem = default!;
+                SetExecutingItem(default!);
             Volatile.Write(ref _hasInFlightItem, false);
             CommitWaiter(recoveryItem, activated: alreadyActivated, GuardRecoveryTask(pipelineTask));
         }
@@ -898,12 +918,25 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // the zero-signal comparison miss forever (a stranded WaitForEmptyAsync). The comparison stays
         // `is 0` deliberately: <= would mask the same corruption by double-signaling.
         Debug.Assert(depth >= 0, "Pipeline depth under-ran: double completion for a single enqueue.");
-        // Release the ActivatedItem slot on every completion - the activated lifecycle is
-        // Activate-to-Complete by definition, and reading the slot outside that window is
-        // a consumer contract violation. (A consumer that reads the activated slot on a dispatch
-        // thread running past the item's completion will observe the cleared slot - that's the
-        // underlying issue to diagnose, not a case the slot has to retain for.)
-        _activatedItem = default!;
+        // Release the ActivatedItem slot only at the in-order retirement terminal: when this completion
+        // drains the pipeline to empty (depth 0). CompleteItem is the single in-order retirement seam,
+        // and the slot retires off it like depth and the policy's per-item resources. Correct and
+        // uniform across reference and value T via two properties:
+        //   - No stomp. Completion is strictly head-ordered (the store drains head-first, and the sync
+        //     fast-path is gated on _waiters.Count is 0), so any completion that is NOT the slot's owner
+        //     is an earlier item completing while the newest-activated owner is still live. Clearing
+        //     only at depth 0 means it never nulls the live owner's slot.
+        //   - Never null while live. The field's contract (see the ActivatedItem remarks) is that a
+        //     stale non-null reference between completion and the next activation is safe and preferred
+        //     over a transient null: the sole reader (PgDecoder.CurrentExecutionControl) reads the slot
+        //     only during an active read, never in that gap, so a transient null while live is the real
+        //     NRE hazard. depth-0 clears only when nothing is live, so it never produces that null.
+        //     (Identity or a per-item generation would clear promptly but reintroduce null-while-live.)
+        //     Struct-T safe by construction - a plain counter, no reference identity to box.
+        if (depth is 0)
+        {
+            SetActivatedItem(default!);
+        }
         _policy.CompleteItem(item, depth, exception);
         return depth is 0;
     }
@@ -930,7 +963,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (!activated)
         {
             _executingItemActivationPending = false;
-            _executingItem = default!;
+            SetExecutingItem(default!);
 
             if (wasEmpty && !waiterTask.IsCompleted)
             {
@@ -1678,13 +1711,107 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         DrainReadyWaiters();
     }
 
+    // Whether a store to a slot field of type T is atomic against a concurrent getter read, deciding
+    // whether the seqlock below is needed. Mirrors ConcurrentDictionary's IsValueWriteAtomic
+    // (ECMA-335 I.12.6.6): references and IntPtr are atomic, primitives up to 4 bytes always, 8-byte
+    // primitives only on 64-bit, and EVERY custom struct is tearable. That last point is load-bearing:
+    // the JIT may field-decompose a struct copy regardless of size, so a `sizeof <= nativeword` test is
+    // NOT a safe substitute. Cached per instantiation - true for reference T (the seqlock vanishes),
+    // false for the struct pipelines that need it.
+    static readonly bool _writeAtomic = IsWriteAtomic();
+
+    static bool IsWriteAtomic()
+    {
+        if (!typeof(T).IsValueType || typeof(T) == typeof(IntPtr) || typeof(T) == typeof(UIntPtr))
+            return true;
+
+        switch (Type.GetTypeCode(typeof(T)))
+        {
+            case TypeCode.Boolean:
+            case TypeCode.Byte:
+            case TypeCode.Char:
+            case TypeCode.Int16:
+            case TypeCode.Int32:
+            case TypeCode.SByte:
+            case TypeCode.Single:
+            case TypeCode.UInt16:
+            case TypeCode.UInt32:
+                return true;
+            case TypeCode.Int64:
+            case TypeCode.Double:
+            case TypeCode.UInt64:
+                return IntPtr.Size == 8;
+            default:
+                return false;
+        }
+    }
+
+    // Publish a value to one of the public single-pump slots (_executingItem / _activatedItem).
+    // When the store is atomic (_writeAtomic), a cross-thread getter read can never tear, so a plain
+    // store suffices and the generation work is skipped. The !typeof(T).IsValueType guard JIT-folds, so
+    // reference T short-circuits with zero cost.
+    //
+    // Otherwise T is a multi-word struct and a concurrent getter could observe a field-mismatched
+    // ("torn") value. The seqlock generation closes that: bump it odd before the store and even after,
+    // so ReadSlot detects any overlap and retries. A torn copy is harmless - reference fields are
+    // atomically copied, so a torn struct still has every reference valid (just mismatched), never a
+    // garbage pointer, and ReadSlot discards it on the generation recheck. Interlocked.Increment is a
+    // full fence, so the store stays sandwiched in the odd/even bracket.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static void PublishSlot(ref T slot, ref uint gen, T value)
+    {
+        if (!typeof(T).IsValueType || _writeAtomic)
+        {
+            slot = value;
+        }
+        else
+        {
+            Interlocked.Increment(ref gen); // odd: store in progress
+            slot = value;
+            Interlocked.Increment(ref gen); // even: store complete
+        }
+    }
+
+    // Tear-free read of a public single-pump slot. Reference T: a plain atomic load. Value T: the
+    // seqlock read - sample an even generation, copy the struct, re-sample; if the generation moved
+    // the copy straddled a write (possibly torn, always GC-safe) so retry. Writes are item-paced
+    // (wire-I/O-gated) so the loop effectively never spins, but correctness does not depend on that:
+    // a snapshot is only returned when no write overlapped it. Stale-but-consistent is fine (the
+    // slot's contract permits a stale reference); only tearing is excluded.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    static T ReadSlot(ref T slot, ref uint gen)
+    {
+        if (!typeof(T).IsValueType || _writeAtomic)
+            return slot;
+
+        var spin = new SpinWait();
+        while (true)
+        {
+            var g1 = Volatile.Read(ref gen);
+            if ((g1 & 1) == 0) // even: no write in progress at the sample point
+            {
+                var value = slot; // acquire on g1 orders this read after the generation sample
+                Interlocked.MemoryBarrier(); // the copy must complete before the re-sample (LoadLoad)
+                if (Volatile.Read(ref gen) == g1)
+                    return value;
+            }
+            spin.SpinOnce();
+        }
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void SetExecutingItem(T value) => PublishSlot(ref _executingItem, ref _executingItemGen, value);
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void SetActivatedItem(T value) => PublishSlot(ref _activatedItem, ref _activatedItemGen, value);
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void ActivateHeadItem(T item, bool preferAsync = true)
     {
         // Update the publicly-observed ActivatedItem slot before dispatching to the policy:
         // a same-thread inline activation sees the new value via the policy call's own
         // sequencing, and a TP-dispatched activation publishes via the dispatch fence.
-        _activatedItem = item;
+        SetActivatedItem(item);
         _policy.ActivateHeadItem(item, preferAsync);
     }
 
@@ -1702,7 +1829,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             {
                 // Won the race-back: advancer won't activate. Item is done (callers invoke us after
                 // pipelineTask.IsCompleted), so activation is optional, skip it.
-                _executingItem = default!;
+                SetExecutingItem(default!);
             }
             else
             {
@@ -1718,7 +1845,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         {
             // Inline-activated path: no advancer is tracking, so we can drop the item reference
             // along with the visibility flag.
-            _executingItem = default!;
+            SetExecutingItem(default!);
         }
     }
 

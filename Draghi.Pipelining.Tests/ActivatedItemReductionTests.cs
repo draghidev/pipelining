@@ -333,4 +333,53 @@ public class ActivatedItemReductionTests
     // longer reproduces - the only remaining check here is that the shipped ordering stays
     // hazard-free.
     [TestMethod] public Task TenureReuse_Cas_ReleaseBeforeComplete() => RunReuseBatch(1, 10, 150, NullPolicy.DepthZeroWithCas);
+
+    // The framework's own _activatedItem slot (read by Slon via Control.ActivatedFlow), under
+    // pipelined TP-dispatch load. The contract: never transient-null while the pipeline is live - a
+    // null read by the decoder mid-pipeline is the production NRE. We sample (ActivatedItem, Depth)
+    // off-thread across a single non-refilling batch; once the slot has gone non-null (first
+    // activation), it must never read null again while Depth > 0 - it may only return to default at
+    // the depth-0 retirement terminal. depth-0 holds this (it clears only at depth 0); the
+    // unconditional clear that shipped the NRE nulls the slot on every intermediate completion and
+    // is caught here. Stash-validated: fails with the unconditional clear, passes with depth-0.
+    static async Task RunSlotNeverNullWhileLive(int items, int batches)
+    {
+        for (var b = 0; b < batches; b++)
+        {
+            var probe = new ActivationProbe { Policy = NullPolicy.NeverNull };
+            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp: true));
+            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+            for (var i = 0; i < items; i++)
+                pipeline.Enqueue(new SyntheticItem { Id = i }).Execute();
+
+            var violations = 0;
+            var seen = false;
+            var stop = false;
+            var sampler = Task.Run(() =>
+            {
+                while (!Volatile.Read(ref stop))
+                {
+                    // Read slot BEFORE depth: if the slot is non-null we're done; if it's null we then
+                    // read depth. A depth > 0 observed AFTER a null slot (with the slot still settling)
+                    // is conservative - it can only over-report, and depth-0 never produces a null here
+                    // mid-batch, so a clean run proves the property.
+                    var slot = pipeline.Pipeline.ActivatedItem;
+                    if (slot is not null)
+                        seen = true;
+                    else if (seen && pipeline.Depth > 0)
+                        Interlocked.Increment(ref violations);
+                }
+            });
+
+            await pipeline.CompleteAsync();
+            Volatile.Write(ref stop, true);
+            await sampler;
+
+            if (Volatile.Read(ref violations) > 0)
+                Assert.Fail($"batch={b} items={items}: framework ActivatedItem slot read null while live (Depth>0) " +
+                            $"{Volatile.Read(ref violations)}x - a transient-null-while-live the decoder would NRE on.");
+        }
+    }
+
+    [TestMethod] public Task FrameworkSlot_NeverNullWhileLive_Pipelined() => RunSlotNeverNullWhileLive(400, 40);
 }

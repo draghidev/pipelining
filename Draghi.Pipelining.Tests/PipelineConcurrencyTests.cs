@@ -104,18 +104,21 @@ public class PipelineConcurrencyTests
             Assert.IsTrue(items[i].IsCompleted);
     }
 
-    /// Exercises both branches of CommitTailWaiter in one test: sync items take the inline
-    /// CompleteWaiter path (task.IsCompletedSuccessfully on commit). Async items take the
-    /// EnqueueWaiter path (callback registered, advancer drains). Verifies every item completes
-    /// regardless of which path it took.
+    /// Mixed sync/async stream. Sync items (CompleteAsync=false) are driven to completion inline in
+    /// the executor's main-loop sync shortcut (both pipeline and trailing tasks already successful at
+    /// dispatch) before the executor advances to the next item. Async items (CompleteAsync=true) fall
+    /// through to the tail-waiter path, get committed to the waiter store by CommitTailWaiter with a
+    /// completion callback registered, and are drained by the advancer in FIFO. Verifies every item
+    /// completes regardless of which path it took, and that the sync item completes inline at head.
     [TestMethod]
     public async Task MixedSyncAsyncPipelineTasks_AllItemsComplete()
     {
-        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
 
         // Alternating mix: even = sync (CompleteAsync=false), odd = async (CompleteAsync=true).
+        // Stream items in one at a time: each Execute() can wake the executor mid-stream, so a sync
+        // item reaches head while async waiters are already pending. We do NOT pre-stage the backlog
+        // - the whole point is to exercise sync-at-head inline completion under streaming.
         const int count = 10;
         var items = new TestPipelineItem[count];
         for (var i = 0; i < count; i++)
@@ -124,15 +127,21 @@ public class PipelineConcurrencyTests
             pipeline.Enqueue(items[i]).Execute();
         }
 
-        // Wait for executor to settle. Async items will be in _waiters with callbacks registered.
-        // sync items already completed inline via CommitTailWaiter's sync-success branch.
-        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
-
-        // Sync items should already be complete.
+        // Per-boundary synchrony check: a sync item at head must complete inline BEFORE the executor
+        // advances to the next item. The barrier keys off the NEXT item's SignalExecuted (the
+        // executor dispatching item i+1), NOT completion - the executor loop is sequential, so it
+        // cannot have executed item i+1 until item i's inline CompleteWaiter has already run. The bare
+        // IsCompleted read below therefore still distinguishes inline completion from a deferred async
+        // drain: had the sync item been parked instead of completed inline, its completion would not
+        // yet be visible at this point and the assert would fail.
         for (var i = 0; i < count; i++)
         {
             if (i % 2 == 0)
-                Assert.IsTrue(items[i].IsCompleted, $"Sync item {i} should have completed inline via CommitTailWaiter.");
+            {
+                await items[i + 1].WaitForExecutedAsync();
+                Assert.IsTrue(items[i].IsCompleted,
+                    $"Sync item {i} should have been driven to idle inline before the executor advanced to item {i + 1}.");
+            }
         }
 
         // Complete async items' pipeline tasks in reverse order. Advancer drains them in FIFO.
@@ -145,6 +154,76 @@ public class PipelineConcurrencyTests
 
         for (var i = 0; i < count; i++)
             Assert.IsNull(items[i].Exception, $"Item {i} should complete without exception.");
+        Assert.AreEqual(0, pipeline.Depth);
+    }
+
+    /// The flip side of the inline-completion test: the pipeline STALL an activation-gated item
+    /// imposes. An item whose execute task stays pending until it is activated holds the executor's
+    /// single pump from dispatch until activation (its FIFO turn). While it is stalled awaiting
+    /// activation behind a prior in-flight item, NO subsequent item can be dispatched - that
+    /// occupied-pump window is the stall. It clears only when the prior item completes and the
+    /// advancer hands activation to the stalled item.
+    ///
+    /// This is the cost of an item whose completion is gated on its own activation while it is being
+    /// driven inline on the single pump: the pump cannot advance to later items until the gate
+    /// opens. The companion MixedSyncAsyncPipelineTasks_AllItemsComplete pins the opposite property
+    /// (an item that completes inline at head without ever holding the pump past its own dispatch).
+    [TestMethod]
+    public async Task ActivationGatedItem_StallsExecutorUntilActivated()
+    {
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
+
+        // A: a prior async item. Activated inline (no waiters at dispatch), then parks as a waiter
+        // on its pending pipeline task - free-floating, it does NOT hold the executor pump.
+        var a = new TestPipelineItem { CompleteAsync = true };
+        // B: the activation-gated item. ExecuteAsync keeps its execute task pending so the executor
+        // is forced to await it inline (as a synchronous body would be driven on the pump). It only
+        // resolves once B is activated - the test plays the body below. B is dispatched while A is
+        // still pending, so it is published for deferred activation, not activated at dispatch.
+        var b = new TestPipelineItem { ExecuteAsync = true };
+        // C: a follow-on item that can only be dispatched once the pump is freed from B.
+        var c = new TestPipelineItem();
+
+        pipeline.Enqueue(a).Execute();
+        // Barrier: only A is enqueued, so the first idle deterministically means A was dispatched,
+        // committed to _waiters with its callback registered, and the pump is free and suspended.
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        pipeline.Enqueue(b).Execute();
+        // B is dequeued, deferred-activation-published (A still in flight), and the executor is now
+        // suspended awaiting B's pending execute task. The single pump is held by B: the stall.
+        await b.WaitForExecutedAsync();
+
+        pipeline.Enqueue(c).Execute();
+
+        // The stall, deterministically: C sits behind B in the queue and the pump is sequential, so
+        // the executor cannot reach C until B's execute task resolves - which needs B's activation,
+        // which needs A to complete. None of that has happened, so C is structurally un-dispatched.
+        Assert.IsFalse(c.IsExecuted, "B (activation-gated) holds the single pump until activated; C must not be dispatched yet.");
+        Assert.AreEqual(0, b.ActivationCount, "B must not be activated while A is still in flight (FIFO turn).");
+
+        // Play B's body: it can only run once it gets its turn (activation), at which point it drives
+        // to completion inline. Wire that drive to fire on activation.
+        _ = b.WaitForActivationAsync().ContinueWith(_ => b.CompleteExecuteTask(), TaskScheduler.Default);
+
+        // Completing A drains the prior waiter; the advancer's slot-drain C-path then claims B's
+        // deferred-activation publish and activates the still-executing B (ActivateNextAfterSlotAdvance).
+        a.CompletePipelineTask();
+        await a.WaitForCompleteAsync();
+
+        // The stall clears strictly in order: B activates only after A completed, B's body resolves
+        // only after activation, and only then does the pump advance to dispatch C.
+        await b.WaitForActivationAsync();
+        await c.WaitForExecutedAsync();
+
+        await b.WaitForCompleteAsync();
+        await c.WaitForCompleteAsync();
+
+        Assert.IsNull(a.Exception);
+        Assert.IsNull(b.Exception);
+        Assert.IsNull(c.Exception);
         Assert.AreEqual(0, pipeline.Depth);
     }
 
@@ -1421,18 +1500,21 @@ public class PipelineConcurrencyTests
             catch (NullReferenceException ex)
             {
                 hangDiagnosis = $"iter {iter}: NullReferenceException - DispatchClaimed " +
-                    $"dereferenced a null _waitContinuation. {ex.Message}";
+                    $"dereferenced a null _waitContinuation. {ex.Message}\n{ex.StackTrace}";
             }
 
             if (hangDiagnosis is not null)
             {
                 if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_WAIT_ON_HANG") == "1")
                 {
-                    GC.Collect(2, GCCollectionMode.Forced);
-                    GC.WaitForPendingFinalizers();
-                    GC.Collect(2, GCCollectionMode.Forced);
-                    Console.WriteLine($"SUSPENDED: {hangDiagnosis}");
+                    Console.WriteLine($"SUSPENDED iter {iter}: {hangDiagnosis}");
                     await Task.Delay(Timeout.Infinite);
+                    // The post-await reference forces the compiler to hoist `pipeline` into the
+                    // state machine box, which the Task.Delay continuation roots for the duration
+                    // of the suspend. The call itself never runs - the presence of the reference
+                    // past the await is the load-bearing thing. A GC.KeepAlive BEFORE the await
+                    // is just a barrier at that line and lets `pipeline` go after.
+                    GC.KeepAlive(pipeline);
                 }
                 Assert.Fail(hangDiagnosis);
             }

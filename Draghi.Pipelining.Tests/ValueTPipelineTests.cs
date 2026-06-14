@@ -32,6 +32,11 @@ public class ValueTPipelineTests
             Assert.IsTrue(pool.Get(ids[i]).Completed);
         }
         Assert.AreEqual(0, pipeline.Depth);
+        // Value-T slot clear: the depth-0 retirement-terminal clear of _activatedItem is uniform
+        // across reference and value T (a plain counter, no reference identity to box). After full
+        // drain the slot must read default - a reference-identity clear would have boxed the struct
+        // and never cleared, leaking the last item's value here.
+        Assert.AreEqual(0, pipeline.Pipeline.ActivatedItem.Id, "value-type ActivatedItem slot should clear to default after drain.");
     }
 
     /// Enumeration with value-type T. Exercises the Enumerator's reads of _tailWaiter / _waiters
@@ -165,6 +170,57 @@ public class ValueTPipelineTests
             await pool.Get(ids[i]).WaitForCompleteAsync();
 
         Assert.AreEqual(0, pipeline.Depth);
+    }
+
+    /// The public ActivatedItem / ExecutingItem getters for a large (multi-word) value-T, read
+    /// concurrently with the executor writing the slots. The slots use a seqlock generation for
+    /// non-write-atomic T (PublishSlot / ReadSlot), so a cross-thread getter must never observe a
+    /// torn (field-mismatched) struct. Every item carries four equal longs, so a torn read shows up
+    /// as unequal fields. With the seqlock this is clean; stash-validated to fail (thousands of torn
+    /// reads) when the generation is bypassed. Reference T never reaches the seqlock (atomic word).
+    [TestMethod]
+    public async Task LargeValueTypeT_Slots_NoTornRead()
+    {
+        var pool = new ValueItemPool();
+        var pipeline = Pipeline.Create<LargeValueItem, LargeValueItemPolicy>(new(pool));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        const int producerItems = 50000;
+        var producerDone = false;
+        var tornActivated = 0;
+        var tornExecuting = 0;
+
+        var reader = Task.Run(() =>
+        {
+            while (!Volatile.Read(ref producerDone))
+            {
+                var a = pipeline.Pipeline.ActivatedItem;
+                if (a.A != a.B || a.A != a.C || a.A != a.D)
+                    Interlocked.Increment(ref tornActivated);
+                var e = pipeline.Pipeline.ExecutingItem;
+                if (e.A != e.B || e.A != e.C || e.A != e.D)
+                    Interlocked.Increment(ref tornExecuting);
+            }
+        });
+
+        var producer = Task.Run(() =>
+        {
+            for (var i = 0; i < producerItems; i++)
+            {
+                var id = pool.Allocate();
+                pipeline.Enqueue(new LargeValueItem(id, id, id, id)).Execute();
+            }
+        });
+
+        await producer;
+        while (pipeline.Depth > 0)
+            await Task.Yield();
+        Volatile.Write(ref producerDone, true);
+        await reader;
+        await pipeline.CompleteAsync();
+
+        Assert.AreEqual(0, tornActivated, "ActivatedItem slot torn read for large value-T (seqlock failed).");
+        Assert.AreEqual(0, tornExecuting, "ExecutingItem slot torn read for large value-T (seqlock failed).");
     }
 }
 

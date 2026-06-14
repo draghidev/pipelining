@@ -552,6 +552,13 @@ Locations == {"Nowhere", "Executing", "InTail", "InSlot", "InSlotPending", "InEs
               "InWaitersPending", "InWaiters", "Recovering", "RecoveringInline", "Draining",
               "Completed"}
 
+\* depth-0 slot clear (the shipped CompleteWaiterDeferred): the slot returns to NoItem only when THIS
+\* completion empties the pipeline (every other item already Completed). Otherwise the slot keeps its
+\* (stale-but-safe) value - never nulled while a later item is still live. S = the item(s) completed
+\* by this action. Replaces the pre-fix identity-clear, which nulled the owner the instant it
+\* completed (violating NoNullWhileLive when a later item was still pending).
+DepthZeroClear(S) == IF (\A j \in Item \ S : loc[j] = "Completed") THEN NoItem ELSE activatedSlot
+
 (* ===========================================================================
    Init
    =========================================================================== *)
@@ -745,7 +752,7 @@ ExecCommitTailExecutorWins ==
           THEN \* sync-success: CompleteWaiter inline, store untouched.
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
-            /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+            /\ activatedSlot' = DepthZeroClear({i})
             /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
@@ -792,7 +799,7 @@ ExecCommitTailExecutorLoses ==
           THEN
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
-            /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+            /\ activatedSlot' = DepthZeroClear({i})
             /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
@@ -1637,7 +1644,7 @@ SlotDrainCompleteClear ==
        \* class - reachable when an item completes without ever being activated (the slot
        \* still points at an older live item) - is orthogonal and out of scope here.
        /\ slotStomped' = slotStomped
-       /\ activatedSlot' = NoItem  \* unconditional clear, matches _activatedItem = default!
+       /\ activatedSlot' = DepthZeroClear({drainItem})  \* depth-0 clear; only nulls when this empties the pipeline
   /\ drainPhase' = "completed"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, drainSignal, storeCount,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
@@ -1709,7 +1716,7 @@ SlotDrainCompleteLegacy ==
                                    /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                                 THEN TRUE ELSE slotStomped
               /\ activatedSlot' = IF storeCount = 0 THEN executingItemVisible
-                                  ELSE (IF CompleteBeforeCount THEN activatedSlot ELSE NoItem)
+                                  ELSE (IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem)
               /\ hasExecuting' = FALSE
               /\ hasExecutingVisible' = FALSE
               /\ executingItem' = NoItem
@@ -1722,7 +1729,7 @@ SlotDrainCompleteLegacy ==
                                    /\ activatedSlot # NoItem /\ activatedSlot # i
                                    /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                                 THEN TRUE ELSE slotStomped
-              /\ activatedSlot' = IF CompleteBeforeCount THEN activatedSlot ELSE NoItem
+              /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
               /\ UNCHANGED publish_vars
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
@@ -1770,7 +1777,7 @@ SlotDrainCompleteChainSlot ==
                             /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                          THEN TRUE ELSE slotStomped
        /\ activatedSlot' = IF target \in taskDone
-                           THEN (IF CompleteBeforeCount THEN activatedSlot ELSE NoItem)
+                           THEN (IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem)
                            ELSE target
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
@@ -1797,7 +1804,7 @@ SlotDrainCompleteChainHandoff ==
                             /\ activatedSlot # NoItem /\ activatedSlot # i
                             /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                          THEN TRUE ELSE slotStomped
-       /\ activatedSlot' = IF CompleteBeforeCount THEN activatedSlot ELSE NoItem
+       /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
   /\ pendingHeadActivation' = TRUE
   /\ drainPhase' = "handoff"
   /\ drainItem' = NoItem
@@ -1880,7 +1887,7 @@ SlotDrainCompleteCPath ==
                                    /\ activatedSlot # NoItem /\ activatedSlot # i
                                    /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                                 THEN TRUE ELSE slotStomped
-              /\ activatedSlot' = IF CompleteBeforeCount THEN activatedSlot ELSE NoItem
+              /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
               /\ UNCHANGED publish_vars
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
@@ -2312,14 +2319,14 @@ AdvancerDrainHead ==
           \* item that was the slot occupant; set to the new head on the D-arm.
           IF (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
             THEN /\ activations' = activations
-                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+                 /\ activatedSlot' = DepthZeroClear({i})
                  /\ nullActivation' = nullActivation
           ELSE IF Len(waiters) > 1
             THEN /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
                  /\ activatedSlot' = Head(Tail(waiters))
                  /\ nullActivation' = nullActivation
             ELSE /\ activations' = activations
-                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+                 /\ activatedSlot' = DepthZeroClear({i})
                  /\ nullActivation' = TRUE
        \* Backlog #8 (ModelCPathClear): a <=0 decrement enters the C-path LOCK block as a
        \* distinct phase, so the lock's storeCount re-read (which can differ from newCount -
@@ -2370,14 +2377,14 @@ DrainHeadRecovers ==
        \* clear if slot pointed at the faulted i; set to the new head on the D-arm.
        /\ IF (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
             THEN /\ activations' = activations
-                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+                 /\ activatedSlot' = DepthZeroClear({i})
                  /\ nullActivation' = nullActivation
           ELSE IF Len(waiters) > 1
             THEN /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
                  /\ activatedSlot' = Head(Tail(waiters))
                  /\ nullActivation' = nullActivation
             ELSE /\ activations' = activations
-                 /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+                 /\ activatedSlot' = DepthZeroClear({i})
                  /\ nullActivation' = TRUE
        /\ qDrainPhase' = (IF ModelCPathClear
                              /\ (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
@@ -2952,7 +2959,7 @@ RecoverInlineCompletes ==
        /\ j \in taskDone   \* the recovery continuation fired; GetResult observed (no fault face here)
        /\ j \notin failed
        /\ loc' = [loc EXCEPT ![j] = "Completed"]
-       /\ activatedSlot' = IF activatedSlot = j THEN NoItem ELSE activatedSlot
+       /\ activatedSlot' = DepthZeroClear({j})
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
@@ -2971,7 +2978,7 @@ BindingDischarge ==
        /\ LET i == recoveryOf[j] IN
             /\ loc[i] \in {"Recovering", "RecoveringInline"}
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
-            /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+            /\ activatedSlot' = DepthZeroClear({i})
        /\ recoveryOf' = [recoveryOf EXCEPT ![j] = NoItem]
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
@@ -3002,7 +3009,7 @@ RecoverRefuse ==
        \* and the binding discharge.)
        /\ ~\E j \in Item : recoveryOf[j] = i
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
-       /\ activatedSlot' = IF activatedSlot = i THEN NoItem ELSE activatedSlot
+       /\ activatedSlot' = DepthZeroClear({i})
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
@@ -3025,7 +3032,7 @@ RecoverOnRecoveryFails ==
        /\ failed' = failed \cup {j}
        /\ LET k == recoveryOf[j] IN
             /\ loc' = [loc EXCEPT ![j] = "Completed", ![k] = "Completed"]  \* both direct
-            /\ activatedSlot' = IF activatedSlot \in {j, k} THEN NoItem ELSE activatedSlot
+            /\ activatedSlot' = DepthZeroClear({j, k})
        /\ recoveryOf' = [recoveryOf EXCEPT ![j] = NoItem]
        /\ tenure' = IF tenure = j THEN NoItem ELSE tenure
        \* Roll back j's publish if it was deferred (RecoverInstallLoses), mirroring ExecItemFailure.
@@ -3570,6 +3577,17 @@ ActivatedSlotConsistent ==
 \* stomps it; Slon's PgDecoder NRE on CurrentExecutionControl, June 2026).
 NoStompedActivation == ~slotStomped
 
+\* Never null while live: once an activation has happened and the pipeline is not empty (some item
+\* not yet Completed - including not-yet-yielded items, which are enqueued/depth-counted), the slot
+\* must name an item, never NoItem. This is the shipped depth-0 clear's contract: the decoder reads
+\* the slot during an active read, so a transient NoItem while live is the production NRE; a stale
+\* non-null reference is safe. depth-0 clears only when the pipeline drains empty, so it HOLDS this.
+\* The pre-fix identity-clear (the model's diverged shape) and the unconditional clear both VIOLATE
+\* it - they null the slot while a later item is still pending.
+NoNullWhileLive ==
+  ((\E i \in Item : activations[i] > 0) /\ (\E i \in Item : loc[i] # "Completed"))
+    => (activatedSlot # NoItem)
+
 \* Combined safety invariants. Single name keeps the .cfg simple and makes adding a new
 \* invariant a one-file change rather than a two-file change.
 Invariants ==
@@ -3582,7 +3600,9 @@ Invariants ==
   /\ PostEscalationSlotQuiescent
   /\ EscalationConsistent
   /\ NoSimultaneousActiveReader
-  /\ ActivatedSlotConsistent
+  \* NoOverstay (ActivatedSlotConsistent) is intentionally NOT asserted: depth-0's stale window
+  \* (slot keeps a Completed item's reference until the pipeline drains empty) is documented-safe.
+  /\ NoNullWhileLive
   /\ NoStompedActivation
 
 \* ============================================================================
