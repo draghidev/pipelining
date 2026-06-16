@@ -39,6 +39,7 @@ public class PipelineEnumeratorTests
     public void Empty_YieldsNothing()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var observed = new List<TestPipelineItem>();
         foreach (var item in pipeline)
@@ -56,6 +57,7 @@ public class PipelineEnumeratorTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 5;
         var enqueued = new TestPipelineItem[count];
@@ -95,6 +97,7 @@ public class PipelineEnumeratorTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 50;
         var enqueued = new TestPipelineItem[count];
@@ -127,6 +130,7 @@ public class PipelineEnumeratorTests
     public async Task AfterAllCompleted_YieldsNothing()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 3;
         for (var i = 0; i < count; i++)
@@ -155,6 +159,7 @@ public class PipelineEnumeratorTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 4;
         var enqueued = new TestPipelineItem[count];
@@ -201,6 +206,7 @@ public class PipelineEnumeratorTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();

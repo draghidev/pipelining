@@ -7,6 +7,7 @@ public class PipelineRecoveryTests
     public async Task RecoveryReturnsNull_ItemCompletedWithOriginalException()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
         pipeline.Enqueue(item).Execute();
         await item.WaitForCompleteAsync();
@@ -32,6 +33,7 @@ public class PipelineRecoveryTests
             observedException = ctx.Exception;
             return recovery;
         }));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = thrown };
         pipeline.Enqueue(item).Execute();
@@ -46,6 +48,7 @@ public class PipelineRecoveryTests
     {
         var recovery = new TestPipelineItem();
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
         pipeline.Enqueue(item).Execute();
 
@@ -59,6 +62,7 @@ public class PipelineRecoveryTests
     {
         var recovery = new TestPipelineItem { ExecuteAsync = true };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
         pipeline.Enqueue(item).Execute();
 
@@ -74,6 +78,7 @@ public class PipelineRecoveryTests
     {
         var recovery = new TestPipelineItem { ThrowOnExecute = new ApplicationException("recovery failed") };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
         pipeline.Enqueue(item).Execute();
 
@@ -87,6 +92,7 @@ public class PipelineRecoveryTests
     {
         var recovery = new TestPipelineItem { CompleteAsync = true };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
         pipeline.Enqueue(item).Execute();
 
@@ -105,6 +111,7 @@ public class PipelineRecoveryTests
     {
         var recovery = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new ApplicationException("pipeline failed") };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
         pipeline.Enqueue(item).Execute();
 
@@ -121,6 +128,7 @@ public class PipelineRecoveryTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Item has a pending pipeline task that will fault later.
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
@@ -142,6 +150,7 @@ public class PipelineRecoveryTests
     {
         var recovery = new TestPipelineItem();
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -170,6 +179,7 @@ public class PipelineRecoveryTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask or PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var first = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("tail fault") };
         pipeline.Enqueue(first).Execute();
@@ -192,6 +202,7 @@ public class PipelineRecoveryTests
     public async Task TrailingFailure_NoRecovery_OriginalCompletesViaPipelineTask()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -219,6 +230,7 @@ public class PipelineRecoveryTests
     public async Task TrailingFailure_NoRecovery_PipelineTaskAlsoFails_PipelineExceptionWins()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var pipelineEx = new ApplicationException("pipeline fail");
         var item = new TestPipelineItem
@@ -250,6 +262,7 @@ public class PipelineRecoveryTests
         };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -283,6 +296,7 @@ public class PipelineRecoveryTests
         };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -313,6 +327,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { ExecuteAsync = true, CompleteAsync = true };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Construct an item that hits the committed-tail-faulted path: HasTrailingTask=true
         // keeps the executor inside the trailing await past the pipeline-task fault check on
@@ -361,6 +376,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { HasTrailingTask = true, CompleteAsync = true };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -405,6 +421,7 @@ public class PipelineRecoveryTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Original: async pipeline that will fault, drives the advancer into RecoverWaiter.
         var item = new TestPipelineItem
@@ -454,6 +471,7 @@ public class PipelineRecoveryTests
             var pipeline = Pipeline.Create<TestPipelineItem, CompletionCountingPolicy>(
                 new CompletionCountingPolicy(completeCounts,
                     ctx => ctx.Kind == PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null));
+            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
             var item = new TestPipelineItem
             {
@@ -536,6 +554,7 @@ public class PipelineRecoveryTests
             observedException = ctx.Exception;
             return recovery;
         }));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // CompleteAsync=false + PipelineTaskException = sync-faulted ValueTask from GetPipelineTask,
         // so the executor sees itemResult.PipelineTask.IsCompleted && !IsCompletedSuccessfully inline.
@@ -557,6 +576,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { PipelineTaskException = recoveryEx };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -581,6 +601,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { ThrowOnExecute = recoveryEx };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -606,6 +627,7 @@ public class PipelineRecoveryTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -629,6 +651,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { ThrowOnExecute = recoveryEx };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Same setup as RecoverCommittedTailWaiter_AsyncContinuationRacesCompleteAsync_NoLeak:
         // HasTrailingTask + PipelineTaskException keeps the executor inside trailing-await past
@@ -662,6 +685,7 @@ public class PipelineRecoveryTests
         };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
             ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -690,6 +714,7 @@ public class PipelineRecoveryTests
     public async Task TrailingFailure_NoPendingTailWaiter_TrailingExceptionAbsorbed()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Sync-success pipeline task (CompleteAsync=false) → CompleteWaiter fires inline,
         // _tailWaiter never set. Then trailing fault has no tail to recover for.
@@ -717,6 +742,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem();
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, _ => recovery));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
         pipeline.Enqueue(item).Execute();
@@ -745,6 +771,7 @@ public class PipelineRecoveryTests
             consults.Enqueue($"{ctx.Kind}:{ctx.Exception.GetType().Name}:{ctx.Exception.Message}");
             return recovery;
         }));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Fault the original's pipeline task BEFORE enqueue: CommitTailWaiter observes a
         // completed+faulted task and takes the committed-tail recovery path.
@@ -779,6 +806,7 @@ public class PipelineRecoveryTests
             Interlocked.Increment(ref factoryCalls);
             return recovery;
         }));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
         pipeline.Enqueue(item).Execute();
@@ -808,6 +836,7 @@ public class PipelineRecoveryTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var faulting = new TestPipelineItem { Name = "A", CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
         pipeline.Enqueue(faulting).Execute();
@@ -865,6 +894,7 @@ public class PipelineRecoveryTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var faulting = new TestPipelineItem { Name = "A", CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
         pipeline.Enqueue(faulting).Execute();
@@ -905,6 +935,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { Name = "R" };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var prior = new TestPipelineItem { Name = "W", CompleteAsync = true };
         pipeline.Enqueue(prior).Execute();

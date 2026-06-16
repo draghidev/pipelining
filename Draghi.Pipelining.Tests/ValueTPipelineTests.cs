@@ -14,6 +14,7 @@ public class ValueTPipelineTests
     {
         var pool = new ValueItemPool();
         var pipeline = Pipeline.Create<ValueItem, ValueItemPolicy>(new(pool));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 10;
         var ids = new int[count];
@@ -50,6 +51,7 @@ public class ValueTPipelineTests
         var pipeline = ObservablePipeline.Create<ValueItem, ValueItemPolicy>(
             new(pool),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 6;
         var ids = new int[count];
@@ -104,6 +106,7 @@ public class ValueTPipelineTests
     {
         var pool = new ValueItemPool();
         var pipeline = Pipeline.Create<LargeValueItem, LargeValueItemPolicy>(new(pool));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int producerItems = 1000;
         var producerDone = false;
@@ -150,6 +153,7 @@ public class ValueTPipelineTests
         var pipeline = ObservablePipeline.Create<ValueItem, ValueItemPolicy>(
             new(pool),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 5;
         var ids = new int[count];

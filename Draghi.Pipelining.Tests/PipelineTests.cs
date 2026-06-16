@@ -30,6 +30,7 @@ public class PipelineTests
     public async Task AsyncEnqueueComplete()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
         await item.WaitForCompleteAsync();
@@ -40,6 +41,7 @@ public class PipelineTests
     public async Task PipelinedItems()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var items = new TestPipelineItem[10];
         for (var i = 0; i < items.Length; i++)
         {
@@ -60,6 +62,7 @@ public class PipelineTests
     public async Task ExecuteFailureCompletesItem()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("test") };
         pipeline.Enqueue(item).Execute();
         await item.WaitForCompleteAsync();
@@ -70,6 +73,7 @@ public class PipelineTests
     public async Task PipelineTaskFailureCompletesItem()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("test") };
         pipeline.Enqueue(item).Execute();
         item.CompletePipelineTask();
@@ -81,6 +85,7 @@ public class PipelineTests
     public async Task CompleteAsyncDrainsItems()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var items = new TestPipelineItem[5];
         for (var i = 0; i < items.Length; i++)
         {
@@ -98,6 +103,7 @@ public class PipelineTests
     public async Task WaitForEmptyAsync()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();
 
@@ -134,6 +140,7 @@ public class PipelineTests
         using var externalCts = new CancellationTokenSource();
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true), cancellationToken: externalCts.Token);
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // QueuedPipeline.CompletionToken is the source-level CT (stable for the queue's
         // lifetime). It does NOT fire on CompleteAsync — that's what CompleteAsync's task is for.
@@ -154,6 +161,7 @@ public class PipelineTests
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Enqueue items with pending pipeline tasks, they become waiters.
         var item1 = new TestPipelineItem { CompleteAsync = true };
@@ -180,6 +188,7 @@ public class PipelineTests
     public async Task SyncEnqueue_AsyncPipelineTask_CompletesViaWaiterPath()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(false));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();
 

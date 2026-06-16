@@ -7,6 +7,7 @@ public class PipelineLifecycleTests
     public async Task CompleteAsync_CalledTwice_SecondCallReturnsSameTask()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var first = pipeline.CompleteAsync();
         var second = pipeline.CompleteAsync();
@@ -25,6 +26,7 @@ public class PipelineLifecycleTests
     {
         var executeObservedCancellation = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = Pipeline.Create<TestPipelineItem, TokenObservingPolicy>(new(executeTokenSink: executeObservedCancellation));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Enqueue an item. Policy's ExecuteItemAsync awaits cancellation on the token.
         var item = new TestPipelineItem();
@@ -63,6 +65,7 @@ public class PipelineLifecycleTests
                 try { await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false); }
                 catch (OperationCanceledException) { idleObservedCancellation.TrySetResult(); throw; }
             });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Enqueue an item to push the executor past the cold wait into the post-batch idle hook.
         // Without this, the executor suspends at the wake signal without ever firing onIdle.
@@ -81,6 +84,7 @@ public class PipelineLifecycleTests
     public async Task CompleteAsync_WithException_PropagatesToDrainedItems()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Enqueue items that won't complete on their own.
         var items = new TestPipelineItem[3];
@@ -114,6 +118,7 @@ public class PipelineLifecycleTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Phase 1: enqueue async items + wait for the executor to suspend. These end up in _waiters.
         var waitersItems = new TestPipelineItem[3];
@@ -157,6 +162,7 @@ public class PipelineLifecycleTests
     public void WaitForEmptyAsync_AlreadyIdle_CompletesImmediately()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Depth is 0 from construction. WaitForEmptyAsync should return a completed task synchronously.
         var task = pipeline.WaitForEmptyAsync();
@@ -168,6 +174,7 @@ public class PipelineLifecycleTests
     public async Task WaitForEmptyAsync_Cancelled_ThrowsTaskCanceled()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Hold an item in-flight so WaitForEmptyAsync has to wait.
         var item = new TestPipelineItem { CompleteAsync = true };
@@ -195,6 +202,7 @@ public class PipelineLifecycleTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
@@ -210,6 +218,7 @@ public class PipelineLifecycleTests
     {
         var depths = new List<int>();
         var pipeline = Pipeline.Create<TestPipelineItem, DepthCapturingPolicy>(new(depths));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 5;
         var items = new TestPipelineItem[count];
@@ -266,6 +275,7 @@ public class PipelineLifecycleTests
     public async Task EnqueueAfterCompleteAsync_Throws()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         await pipeline.CompleteAsync();
 
         var item = new TestPipelineItem();
@@ -279,6 +289,7 @@ public class PipelineLifecycleTests
     public async Task CompleteAsync_TwiceWithDifferentExceptions_FirstWins()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var first = new InvalidOperationException("first");
         var second = new InvalidOperationException("second");
 
@@ -305,6 +316,7 @@ public class PipelineLifecycleTests
     public async Task CompleteAsync_WithItemsMidTrailingTask_DrainsCleanly()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true, HasTrailingTask = true };
         pipeline.Enqueue(item).Execute();
@@ -328,6 +340,7 @@ public class PipelineLifecycleTests
     public async Task CompleteAsync_WithPendingTailWaiter_DrainsTail()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();
@@ -351,6 +364,7 @@ public class PipelineLifecycleTests
         var idleEx = new InvalidOperationException("idle fault");
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(), onIdle: _ => throw idleEx);
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
@@ -368,6 +382,7 @@ public class PipelineLifecycleTests
     public async Task WaitForEmptyAsync_AfterCompleteAsync_CompletesImmediately()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         await pipeline.CompleteAsync();
 
         var task = pipeline.WaitForEmptyAsync();
@@ -412,6 +427,7 @@ public class PipelineLifecycleTests
         QueuedPipeline<TestPipelineItem, ReentrantCompletePolicy>? pipelineRef = null;
         var pipeline = Pipeline.Create<TestPipelineItem, ReentrantCompletePolicy>(
             new ReentrantCompletePolicy(() => _ = pipelineRef!.CompleteAsync()));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         pipelineRef = pipeline;
 
         var item = new TestPipelineItem();
