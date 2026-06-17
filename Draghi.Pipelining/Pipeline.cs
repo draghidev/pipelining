@@ -7,28 +7,16 @@ using Draghi.Pipelining.Internal;
 namespace Draghi.Pipelining;
 
 /// <summary>
-/// Source-driven pipelined request/response coordinator. Consumes items from an
-/// <see cref="IPipelineSource{T,TEnumerator}"/> via <c>await foreach</c> and processes each
-/// through the policy's lifecycle (execute/activate/complete/recover). Cancellation and
-/// completion are owned by the source's enumerator (see <see cref="IPipelineEnumerator{T}"/>).
-/// <see cref="CompleteAsync"/> drives shutdown by signalling that enumerator.
+/// Source-driven pipelined request/response coordinator. Processes each item from the source
+/// through the policy's lifecycle (execute/activate/complete/recover). The source's enumerator owns
+/// cancellation and completion; <see cref="CompleteAsync"/> drives shutdown by signalling it.
 /// </summary>
 /// <remarks>
-/// <para>
-/// The class is not thread-safe. <see cref="CompleteAsync"/>, <see cref="GetEnumerator"/>, and
-/// the <see cref="Depth"/> getter must be invoked from a single caller at a time. Concurrent
-/// calls produce undefined results (stale signals, missed completions). Callers needing
-/// multi-threaded access must serialize externally.
-/// </para>
-/// <para>
-/// Internally the class IS concurrent: the execution loop runs on its own scheduler thread, the
-/// advancer can fire on threadpool continuations driven by waiter-task completions, and the
-/// recovery paths span async boundaries. The "not thread-safe" contract applies specifically to
-/// the public API surface, where the cost of broadly thread-safe semantics would not be justified
-/// for the target use case (connection-bound network protocol clients with a single producer).
-/// Adding piecemeal thread safety to individual methods is worse than committing to either pure
-/// stance, so we don't.
-/// </para>
+/// <see cref="CompleteAsync"/> and <see cref="GetEnumerator"/> are not thread-safe - serialize
+/// external callers. <see cref="Depth"/> is a lock-free read safe from any thread, but like a
+/// concurrent collection's count it is a snapshot that may be stale on return. Internally the class
+/// IS concurrent: the execution loop runs on its own scheduler thread, the advancer fires on
+/// threadpool continuations from waiter-task completions, and recovery spans async boundaries.
 /// </remarks>
 public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     where TPolicy : IPipelinePolicy<T>
@@ -39,27 +27,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     TSource _source;
     TEnumerator _enumerator;
 
-    // Execution. Field-initialized to a completed sentinel so the first call to Initialize from
-    // the constructor sees a "completed previous run" and proceeds. On run completion, ExecuteSource
-    // swaps the field back to Task.CompletedTask, releasing the prior ExecuteSource task box. The
-    // cached-but-idle Pipeline shell's footprint then shrinks to just its own fields.
+    // Field-initialized to a completed sentinel so the first Initialize from the constructor sees a
+    // "completed previous run" and proceeds. On run completion ExecuteSource swaps it back to
+    // Task.CompletedTask, releasing the prior ExecuteSource task box.
     Task _executionTask = Task.CompletedTask;
-    // Pipeline state.
     // Shutdown coordination over a single slot, claimable by either an external CompleteAsync
-    // caller or by the executor's terminal cleanup (when the executor self-shuts-down via external
-    // CT cancellation through the Enumerator's _cts linkage). Slot values:
+    // caller or by the executor's terminal cleanup (self-shutdown via external CT cancellation).
+    // Slot values:
     //   null                  = None: no shutdown in progress.
     //   _shutdownInFlight     = a CompleteAsync caller is mid-call to _enumerator.Complete.
     //   _shutdownDone         = caller (or executor on the no-caller path) finished. The
     //                            terminal cleanup may dispose.
     //   <a TaskCompletionSource> = executor's lazily-installed TCS that the caller must signal.
-    // The transitions use paired Interlocked.CompareExchange / Exchange (full fences) so the
-    // publish-and-signal handoff is free of the StoreLoad-reorder hazard a Volatile.Write +
-    // Volatile.Read pair across two fields would re-introduce (the original 2-field design
-    // parked the executor on a TCS the caller had already read as null on weak-memory; observed
-    // in HangRepro iter 51). One small allocation per shutdown when a caller is in flight; none
-    // on the common path where the executor wins the CAS.
-    // Verified in verification/PipelineShutdown.tla (ExecutorClosesGate fix).
+    // Transitions use paired Interlocked CompareExchange / Exchange (full fences), so the
+    // publish-and-signal handoff has no StoreLoad reorder hazard. Allocates one TCS per shutdown
+    // when a caller is in flight, none when the executor wins the CAS.
     TaskCompletionSource? _shutdownSlot;
     // Identity-only sentinels. Never signaled; their Task is never observed. The Exchange-result
     // check uses ReferenceEquals to distinguish them from a real executor-published TCS.
@@ -83,7 +65,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // Seqlock generation for the public ExecutingItem getter under value-type T (see PublishSlot /
     // ReadSlot). Unused for reference T (single-word atomic). _executingItem has a sole writer (the
     // executor strand; recovery is awaited inline, the advancer only reads it under _activationLock),
-    // so the seqlock's single-writer assumption is unconditional here.
+    // so the seqlock's single-writer assumption holds.
     uint _executingItemGen;
 
     /// <summary>
@@ -95,28 +77,23 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// leaves the slot cleared when it returns false.
     /// </summary>
     /// <remarks>
-    /// The single-pump invariant — only one item holds this slot at a time, ever — is what
-    /// makes the pipeline an item-sequencer: clients sequence whatever the workload's items
-    /// contend over (write turns in a client wire protocol, read turns in a server,
-    /// something else in a full-duplex composition). The pipeline takes no position on what
-    /// is being sequenced; policies use this identity as the single source of truth so they
+    /// The single-pump invariant (only one item holds this slot at a time, ever) is what makes the
+    /// pipeline an item-sequencer: policies use this identity as the single source of truth so they
     /// can omit their own bookkeeping or locking primitive.
     /// </remarks>
     public T ExecutingItem => ReadSlot(ref _executingItem, ref _executingItemGen);
 
     /// The most recently activated item (set whenever the pipeline calls
-    /// <see cref="IPipelinePolicy{T}.ActivateHeadItem"/>). The Activate-before-Complete
-    /// in-order invariant means this identifies the item currently in its post-activation
-    /// phase between its activation and the next item's activation. Held across the brief
-    /// window between completion of the prior item and activation of the next — never reset
-    /// to default while the pipeline is live, so a completion-thread callback racing the
-    /// activation thread always sees a valid reference rather than a transient null.
+    /// <see cref="IPipelinePolicy{T}.ActivateHeadItem"/>). The Activate-before-Complete in-order
+    /// invariant means this identifies the item currently in its post-activation phase. Held across
+    /// the brief window between completion of the prior item and activation of the next, never reset
+    /// to default while the pipeline is live, so a completion-thread callback racing the activation
+    /// thread always sees a valid reference rather than a transient null.
     T _activatedItem = default!;
     // Seqlock generation for the public ActivatedItem getter under value-type T. Unused for reference
-    // T. The writers of _activatedItem (ActivateHeadItem, the depth-0 clear, the post-drain reset) run
-    // on different strands but never overlap for a live slot - serialized by the in-order retirement
-    // discipline + Complete-before-DecrementCount (TLA NoStompedActivation / CompleteBeforeCount), the
-    // same invariant the slot-clear leans on. The seqlock introduces no new concurrent-writer pair.
+    // T. The writers of _activatedItem (ActivateHeadItem, the depth-0 clear, the post-drain reset)
+    // run on different strands but never overlap for a live slot, serialized by the in-order
+    // retirement discipline + Complete-before-DecrementCount.
     uint _activatedItemGen;
 
     /// <summary>
@@ -1091,15 +1068,17 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return;
         }
 
-        // Complete BEFORE Decrement. The clear of _activatedItem inside CompleteWaiterDeferred
-        // must run while the count still carries this position; otherwise the inline-activation
-        // gate (Count==0) can fire on another path - executor's deferred-publish branch, a
-        // successor commit's wasEmpty inline-activate - and that path's ActivateHeadItem write
-        // to _activatedItem gets stomped by our subsequent unconditional clear. The successor's
-        // body's first decoder read then sees _activatedItem=null and NREs in CurrentExecutionControl.
-        // Mirrors the recovery-fault path's Complete-before-Decrement audit reorder (lines
-        // 1132-1138 commentary). Verified: ActivatedSlotRace.tla, ReorderFix holds the
-        // NoNullActivatedReadByNew invariant; NoFix reproduces the witness.
+        // Complete BEFORE Decrement. CompleteWaiterDeferred's _activatedItem clear is depth-gated
+        // (it only fires when this completion drains the pipeline to empty), so an intermediate
+        // completion cannot stomp a live successor in the first place. The depth-0 boundary case
+        // still needs this ordering: were the store count decremented first, the inline-activation
+        // gate (Count==0) could fire on another path - executor's deferred-publish branch, a
+        // successor commit's wasEmpty inline-activate - admitting a brand-new item and writing
+        // _activatedItem = NEW between our DecrementDepth-to-0 and the gated clear, which would then
+        // null NEW. NEW's body's first decoder read would see _activatedItem=null and NRE in
+        // CurrentExecutionControl. Running the complete (hence the clear) while the store count still
+        // carries this position keeps that gate shut until after the clear. Mirrors the recovery-fault
+        // path's Complete-before-Decrement ordering.
         if (taskException is null)
             emptyReached = CompleteWaiterDeferred(item, null);
 
@@ -2103,11 +2082,9 @@ public static class Pipeline
                 return ValueTask.CompletedTask;
 
             var newTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            // The publish IS the arm: the CAS is the full-fence RMW, so the re-check below is
-            // ordered after it. A completer that hit zero before observing the publish skipped
-            // its fire; the re-check catches that case and self-signals. TLA:
-            // DepthDrain.ArmPublish/ArmRecheckZero; the witness config (RecheckFix=FALSE) shows
-            // the lost wake when the re-check is removed.
+            // The publish IS the arm: the CAS is the full-fence RMW, so the re-check below is ordered
+            // after it. A completer that hit zero before observing the publish skipped its fire, and
+            // the re-check catches that case and self-signals.
             var tcs = Interlocked.CompareExchange(ref _drainTcs, newTcs, null) ?? newTcs;
             if (Depth is 0)
                 SignalDrainWaiter();

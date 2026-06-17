@@ -21,9 +21,11 @@ public interface IPipelineEnumerator<T> : IAsyncDisposable
     CancellationToken CompletionToken { get; }
 
     /// <summary>
-    /// Signals the enumeration to stop producing items. After Complete, the pull drains
-    /// any remaining buffered items and then resolves completed. CompletionToken fires so policy
-    /// methods observing it can short-circuit in-flight work.
+    /// Signals the enumeration to stop producing items. After Complete, the source resolves its
+    /// residual (items enqueued but not yet dispatched) and then resolves completed. The
+    /// disposition is the source's choice: drain the residual through the executor, or reclaim it
+    /// in bulk for the producer to dispose or migrate. CompletionToken fires so policy methods
+    /// observing it can short-circuit in-flight work.
     /// The enumerator remains usable for drain reads until DisposeAsync. Complete is the
     /// non-terminal "I'm winding down" signal, DisposeAsync is the terminal cleanup.
     /// </summary>
