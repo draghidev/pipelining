@@ -1079,6 +1079,56 @@ public class PipelineConcurrencyTests
         }
     }
 
+    /// In-proc stress runner for the DrainSlotInline shutdown deposit-drop. The shape: two
+    /// CompleteAsync waiters, then CompleteAsync. The strand needs item1 drained via the slot (its
+    /// callback claims it pre-escalation) while item2's CommitTailWaiter escalation is in flight, so
+    /// CompleteAsync must land in the narrow window before the executor commits item2. Rare per
+    /// iteration, so the loop rolls it. Iterations via DRAGHI_STRESS_ITERATIONS (default 200).
+    /// DRAGHI_STRESS_WAIT_ON_HANG=1 suspends after a GC shed for live capture.
+    [TestMethod, DoNotParallelize]
+    public async Task CompleteAsyncDrainsWaiters_ShutdownDepositDrop_Stress()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 200;
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+            var item1 = new TestPipelineItem { CompleteAsync = true };
+            var item2 = new TestPipelineItem { CompleteAsync = true };
+            pipeline.Enqueue(item1).Execute();
+            pipeline.Enqueue(item2).Execute();
+            await item1.WaitForExecutedAsync();
+            await item2.WaitForExecutedAsync();
+
+            var completeTask = pipeline.CompleteAsync().AsTask();
+
+            try
+            {
+                await completeTask.WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (TimeoutException)
+            {
+                var diagnosis = $"iter {iter}: hang - completeTask={completeTask.Status}, " +
+                    $"item1 completed={item1.IsCompleted}, item2 completed={item2.IsCompleted}, depth={pipeline.Depth}";
+                if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_WAIT_ON_HANG") == "1")
+                {
+                    GC.Collect(2, GCCollectionMode.Forced);
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect(2, GCCollectionMode.Forced);
+                    Console.WriteLine($"SUSPENDED: {diagnosis}");
+                    await Task.Delay(Timeout.Infinite);
+                }
+                Assert.Fail(diagnosis);
+            }
+
+            Assert.IsTrue(item1.IsCompleted, $"iter {iter}: item1 not completed");
+            Assert.IsTrue(item2.IsCompleted, $"iter {iter}: item2 not completed");
+            Assert.AreEqual(0, pipeline.Depth, $"iter {iter}: depth not zero");
+        }
+    }
+
     /// In-proc stress runner for DeferredActivationUnderSustainedLoad (one observed field
     /// timeout, June 2026: the tail item executed and its pipeline task was completed, but
     /// item completion never fired; 25 isolated runs + 24 contended suite runs clean).

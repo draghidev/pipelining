@@ -1107,17 +1107,30 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             _depthState.OnDepthReachedZero();
         SignalDrainWakeupIfWaiting();
 
-        // Reclaim, mirroring the queue drain's tail: a successor's waiter that completed
-        // while we held the advancer had its callback deposit-and-bail - with no
-        // reclaim the activation chain dies there (field signature: "Operation timed out
-        // waiting for activation"). In non-escalated slot mode, a set drain signal implies
-        // the bailed waiter IS the current slot occupant with a completed task (a commit
-        // against an occupied slot escalates instead), so looping back to the claim is safe.
-        // Verified: Pipeline.tla SlotDrainerReclaim / Pipeline_StrandWitness.cfg
-        // (SlotReclaimEnabled=FALSE reproduces the lost-activation liveness violation; TRUE
-        // holds EventuallyCompleted and NoTripleActivation across the full state space).
+        // Serve a consumed deposit unconditionally. ReleaseAndCheckPending cleared the pending bit,
+        // so the obligation is ours and must not be gated on cancellation. During shutdown the drain
+        // never dequeues, so a dropped wake strands the waiter and hangs completion on Count > 0.
+        if (serveDeposit)
+        {
+            if (_advancing.TryAcquireOrFlagPending())
+            {
+                if (_waiters.IsEscalated)
+                {
+                    DrainReadyWaiters();
+                    return;
+                }
+                continue;
+            }
+            return;
+        }
+
+        // Dirty-flag reclaim: a successor's waiter that completed while we held the advancer set the
+        // signal from its callback, and without reclaim its activation is lost. A set signal in
+        // non-escalated slot mode means that waiter is the current slot occupant with a completed
+        // task, so looping back to the claim is safe. Gated off during shutdown, where the drain
+        // sweep owns completions and the deposit-serve above already covers any real bail.
         if (!_enumerator.CompletionToken.IsCancellationRequested
-            && (serveDeposit || Volatile.Read(ref _drainSignal))
+            && Volatile.Read(ref _drainSignal)
             && _advancing.TryAcquireOrFlagPending())
         {
             if (_waiters.IsEscalated)
@@ -1355,14 +1368,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // racing OnWaiterTaskCompleted caller.
         bool TryReclaimAdvancerForWork()
         {
-            // This transient hold was the June 2026 field strand (ring-trace-pinned, ~1/40k
-            // stress iterations): a callback's one-shot wake bailed against the hold while the
-            // miss path below released with no post-release rendezvous - signal set, latch
-            // free, completed entry resident, nobody left. The pending word closes it: a bail
-            // against this hold deposits in the latch word, and the miss release reads the
-            // deposit atomically with releasing and serves. Verified: Pipeline.tla
-            // PendingWordLatch (Pipeline_Contract.cfg green over the full state space;
-            // Pipeline_RecheckStrandWitness.cfg pins the unfixed strand).
+            // The transient hold had a strand: a callback's one-shot wake bailed against the hold
+            // while the miss path below released with no post-release rendezvous - signal set, latch
+            // free, completed entry resident, nobody left. The pending word closes it: a bail against
+            // this hold deposits in the latch word, and the miss release reads the deposit atomically
+            // with releasing and serves.
             if (!_advancing.TryAcquireOrFlagPending())
             {
                 // Obligation deposited on the winner; its release serves.
