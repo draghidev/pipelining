@@ -32,6 +32,12 @@ monotonic counter visibility, never store->load ordering. See the
 volatile-semantics notes: an RMW executes with SC semantics for the purposes
 of this Dekker pair.
 
+(The drain-wakeup TCS that DrainOnCompletionAsync arms is a DIFFERENT park
+point - a pure StoreLoad fence-pairing handshake - verified in WakeHandshake.tla
+(DrainWakeup config). This module is the depth zero-crossing protocol, which has
+load-bearing structure BEYOND the fence (the revalidate / zero verdict), so it
+does not reduce to a WakeHandshake config.)
+
 Completer equality uses its OWN bump result (myComp), mirroring
 `var comp = Interlocked.Increment(ref _completed); depth = enq - comp`:
 when two completers race the final completion, exactly the last bumper can
