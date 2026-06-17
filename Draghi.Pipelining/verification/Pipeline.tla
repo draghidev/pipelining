@@ -445,8 +445,8 @@ VARIABLES
   callbackSignaled,
 
   \* [Item -> Item \cup {NoItem}] - the recovery binding (RecoverySplit, backlog #2/#5). Maps a
-  \* substitute item to the failed item it must complete on behalf of (the code's
-  \* RecoveryDrainFlow.BindFailedFlow). NoItem = not a substitute. A distinct substitute identity
+  \* substitute item to the failed item it must complete on behalf of. 
+  \* NoItem = not a substitute. A distinct substitute identity
   \* (vs the legacy identity-reuse) makes the binding discharge modelable and the activation
   \* bound uniform (each item dispatched once). NoItem for all unless RecoverySplit.
   recoveryOf,
@@ -2853,8 +2853,7 @@ RecoverItemLoses ==
 
    The failed item parks in "Recovering" carrying a completion obligation; a
    FRESH substitute j is installed bound to it (recoveryOf[j] = i) and flows the
-   NORMAL lifecycle (the code's RecoveryDrainFlow - a distinct flow that, on
-   completion, completes the bound failed flow via BindFailedFlow / CompleteItem).
+   NORMAL lifecycle.
    Distinct identity makes the activation bound uniform <= 1 and the binding
    discharge checkable. Phase A models the first-level Executing-throw failure;
    recovery-on-recovery, policy-refuse, and the other failure-injection points
@@ -2922,8 +2921,8 @@ RecoverInstallLoses ==
 \* executes IN PLACE on the advancer thread, under the advancer latch the parked drain still
 \* holds (advance = false return). It never publishes, never becomes the tail, never enters
 \* the store - completion is RecoverInlineCompletes below. NO tenure interaction: the
-\* substitute is a distinct recovery flow with its own promise (the code's
-\* RecoveryDrainFlow), not a dispatch on the pipeline's shared promise - the executor's
+\* substitute is a distinct recovery flow with its own promise, 
+\* not a dispatch on the pipeline's shared promise - the executor's
 \* TryStart tenure word is untouched.
 RecoverInstallInline ==
   /\ RecoverySplit
@@ -3016,8 +3015,7 @@ RecoverRefuse ==
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
 
 \* Recovery-on-recovery: a SUBSTITUTE j (recoveryOf[j] = k) itself fails while Executing. The
-\* policy STRUCTURALLY refuses to recover a recovery item (the code's TryRecoverItemFailure
-\* refuses a RecoveryDrainFlow - "a dead-wire drain cannot be re-drained"), so j completes
+\* policy STRUCTURALLY refuses to recover a recovery item, so j completes
 \* DIRECTLY (with both exceptions), AND the bound failed item k discharges too (CompleteItem with
 \* the AggregateException). No new substitute - the chain is single-level by construction. This is
 \* the "recovery fails one level up" path the code's try/finally must discharge; the model checks
@@ -3699,7 +3697,7 @@ EventuallyCompleted ==
 
 \* The recovery binding's liveness (RecoverySplit, backlog #2/#5): a failed item parked in
 \* "Recovering" must eventually complete - the lifetime-alignment guarantee that
-\* RecoveryDrainFlow / CompleteItem completes the bound failed flow. A failed item is NEVER
+\* CompleteItem completes the bound failed flow. A failed item is NEVER
 \* taskDone (it threw, never completed its task), so EventuallyCompleted's premise cannot cover
 \* it; this is the property that catches a stranded failed flow (the original hang's shape, and
 \* the "recovery fails one level up" hazard). Vacuous under ~RecoverySplit (the legacy
@@ -3835,8 +3833,7 @@ EventuallyActivated ==
           substitute identity (SubSlot = NumItems) + one-failure bound keep the
           NumItems = 3 pool from being drained out from under recovery.
         - Payoff target: confirm refusal-completes-directly so the code's
-          Debug.Assert(failedItem is not RecoveryDrainFlow) (reachable on real
-          late I/O) can become a normal path.
+          Debug.Assert can become a normal path.
 
    6. Escalation-vs-slot-callback CAS race - both EscalateAndEnqueue and the
       slot callback do Exchange(_hasSlot, 0). Currently the spec models the
