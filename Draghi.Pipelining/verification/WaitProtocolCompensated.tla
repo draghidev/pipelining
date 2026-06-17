@@ -1,4 +1,4 @@
--------------------------- MODULE WaitProtocolPg --------------------------
+-------------------------- MODULE WaitProtocolCompensated --------------------------
 (*
 PgClientFlowSource's variant of the wait protocol (audit C2/C3), modeled
 SEPARATELY from WaitProtocol.tla because it differs in load-bearing shape:
@@ -14,6 +14,18 @@ SEPARATELY from WaitProtocol.tla because it differs in load-bearing shape:
     QueueNotEmpty or IsCompleted accrued during the window. WaitProtocol.tla
     models the deferral as a DELAYED signal (fairness re-fires it), which
     cannot express the compensation or its failure modes at all.
+  - RECLAIM, not drain on completion: the consumer's wait resolves completed
+    BEFORE the queue check (completion BEATS the queue) and STOPS pulling, even
+    with items still queued. The undispatched residual is reclaimed by Shutdown
+    (DrainInertItems), unblocked by the DrainSignal the completed-resolution
+    fires - modeled by ShutdownDrain, gated on cpc="done" (cpc reaches it only
+    through that resolution, so it stands in for the signal AND for the executor
+    having stopped: ShutdownDrain is thus the SOLE consumer, no race). UQS/
+    WaitProtocol.tla instead drain the residual through the executor
+    (queue-before-completion); this reorder is why PgClientFlowSource needs no
+    second consumer of the SPSC queue at shutdown. The C6 hot-spin (PeekRecheck
+    witness) is unaffected: it lives in the not-yet-completed phase, where the
+    reorder changes nothing.
 
 Two failure families this module exists to pin:
 
@@ -68,6 +80,9 @@ Properties:
   NoWrongThreadTake - no scheduler-thread TryGetNext ever takes an acked
                       handoff (fails with GateUnderLock=FALSE: the steal)
   HandoffInline     - a handoff producer past its claim saw its flow consumed
+  Drains            - liveness: every queued item drains - via PullHit while
+                      running, or ShutdownDrain (the reclaim) once completed
+                      (fails with PeekRecheck=FALSE: the C6 hot-spin)
   AllConsumed       - liveness: everything drains and completion is observed
                       (fails with either fence toggle FALSE: the stale close)
   HandoffReturns    - the handoff producer is never stranded
@@ -416,21 +431,27 @@ WaitAcquire ==
                  handoff, acked, ppc, hpc, kpc, wrongThreadTake>>
 
 \* Flag-only availability re-check (peek-style; consumption stays in
-\* TryGetNext): HandoffAcked, or queue work outside a window.
+\* TryGetNext): HandoffAcked always retries; queue work retries only when NOT
+\* completed - completion now BEATS the queue (see WaitRecheckCompleted), so a
+\* queued item no longer outranks a pending completion.
 WaitRecheckRetry ==
   /\ cpc = "locked"
-  /\ acked \/ (~windowActive /\ RecheckSeesWork)
+  /\ acked \/ (~isCompleted /\ ~windowActive /\ RecheckSeesWork)
   /\ lock' = FALSE
   /\ cpc' = "run"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
                  windowActive, clearBuf, pending, contStored, suspendedSig,
                  handoff, acked, ppc, hpc, kpc, wrongThreadTake>>
 
-\* Completed-resolution DEFERS during a window (resolving under a waiting sync
-\* producer strands its rendezvous; the close-out re-delivers).
+\* Completed-resolution BEATS the queue (the reclaim policy): it resolves even
+\* with items still queued - the residual is reclaimed by ShutdownDrain, not
+\* drained through the executor. Still DEFERS during a window (resolving under a
+\* waiting sync producer strands its rendezvous; the close-out re-delivers). The
+\* DrainSignal Shutdown waits on is fired here in the code; cpc'="done" stands in
+\* for it (ShutdownDrain gates on it).
 WaitRecheckCompleted ==
   /\ cpc = "locked"
-  /\ ~(acked \/ (~windowActive /\ RecheckSeesWork))
+  /\ ~acked
   /\ isCompleted /\ ~windowActive
   /\ lock' = FALSE
   /\ cpc' = "done"
@@ -440,8 +461,8 @@ WaitRecheckCompleted ==
 
 WaitArm ==
   /\ cpc = "locked"
-  /\ ~(acked \/ (~windowActive /\ RecheckSeesWork))
-  /\ ~(isCompleted /\ ~windowActive)
+  /\ ~(acked \/ (~isCompleted /\ ~windowActive /\ RecheckSeesWork))
+  /\ ~(~acked /\ isCompleted /\ ~windowActive)
   /\ pending' = TRUE
   /\ cpc' = "armed"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
@@ -460,6 +481,26 @@ WaitRegister ==
                  windowActive, clearBuf, pending, handoff, acked, ppc, hpc,
                  kpc, wrongThreadTake>>
 
+\* Shutdown's residual reclaim (DrainInertItems), unblocked by the DrainSignal
+\* that WaitRecheckCompleted fires at the completed-resolution. Modeled by the
+\* cpc="done" gate: cpc reaches "done" ONLY through that resolution, so it stands
+\* in for the fired signal AND for the executor having stopped pulling - which is
+\* what makes this the SOLE consumer of the queue (the barrier the DrainSignal
+\* buys). This replaces the executor draining the queue itself on completion:
+\* under completion-before-queue the executor stops with items still queued, and
+\* the residual is reclaimed here. (Under the old queue-before-completion shape
+\* the executor drains via PullHit first, so cpc="done" finds an empty queue and
+\* this is a no-op - harmless.)
+ShutdownDrain ==
+  /\ cpc = "done"
+  /\ queue > 0
+  /\ queue' = 0
+  /\ consumed' = consumed + queue
+  /\ qne' = FALSE
+  /\ UNCHANGED <<enqueued, qneBuf, isCompleted, compBuf, windowActive, clearBuf,
+                 lock, pending, contStored, suspendedSig, handoff, acked, cpc,
+                 ppc, hpc, kpc, wrongThreadTake>>
+
 -----------------------------------------------------------------------------
 
 Next ==
@@ -472,6 +513,7 @@ Next ==
   \/ PullHit \/ PullHandoffStolen
   \/ WaitAcquire \/ WaitRecheckRetry \/ WaitRecheckCompleted
   \/ WaitArm \/ WaitRegister
+  \/ ShutdownDrain
 
 \* The producer may stop before MaxItems (no WF on EnqPublish); everything
 \* in-flight finishes, buffers drain, and the chains run to completion.
@@ -488,6 +530,7 @@ Fairness ==
   /\ WF_vars(PullHit) /\ WF_vars(PullHandoffStolen)
   /\ WF_vars(WaitAcquire) /\ WF_vars(WaitRecheckRetry)
   /\ WF_vars(WaitRecheckCompleted) /\ WF_vars(WaitArm) /\ WF_vars(WaitRegister)
+  /\ WF_vars(ShutdownDrain)
 
 Spec == Init /\ [][Next]_vars /\ Fairness
 
@@ -500,9 +543,11 @@ NoWrongThreadTake == ~wrongThreadTake
 \* A handoff producer past its claim saw its flow leave the slot.
 HandoffInline == (hpc \in {"closing", "closeRead", "done"}) => (handoff = 0)
 
-\* Every published item is eventually consumed, WITHOUT relying on a
-\* completion sweep (completion is a shutdown event that may never arrive; a
-\* mid-run lost wake must fail this, not hide behind Complete's claim).
+\* Every published item is eventually consumed - drained through the executor
+\* (PullHit) while running, or reclaimed by ShutdownDrain once completed. A
+\* mid-run lost wake (queue > 0, NOT yet completed, executor stuck) reaches
+\* neither - ShutdownDrain gates on cpc="done" - so it still fails this rather
+\* than hiding behind completion's sweep.
 Drains == (queue > 0) ~> (queue = 0)
 
 \* Everything produced is consumed and completion observed.
