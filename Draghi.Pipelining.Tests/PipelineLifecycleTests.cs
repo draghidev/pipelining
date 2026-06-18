@@ -376,6 +376,87 @@ public class PipelineLifecycleTests
         Assert.AreSame(idleEx, ex);
     }
 
+    /// A source pull surfacing OCE that carries the enumerator's own CompletionToken is the idiomatic
+    /// IAsyncEnumerator shutdown signal: identity-matched and swallowed, so the run completes cleanly
+    /// rather than faulting. Pins the narrowed catch (identity, not just IsCancellationRequested).
+    [TestMethod]
+    public async Task SourcePull_OceWithCompletionToken_TreatedAsCleanShutdown()
+    {
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(), onIdle: token => throw new OperationCanceledException(token));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var item = new TestPipelineItem();
+        pipeline.Enqueue(item).Execute();
+        await item.WaitForCompleteAsync();
+        // onIdle fires on the next wait and throws OCE carrying CompletionToken; the executor swallows
+        // it as sanctioned shutdown, so CompleteAsync must complete rather than fault.
+        await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    /// A source pull surfacing OCE carrying a FOREIGN token is not the sanctioned signal - it must
+    /// fault the run and surface via CompleteAsync, not be swallowed. The inverse guard for the narrowing.
+    [TestMethod]
+    public async Task SourcePull_ForeignOce_Faults()
+    {
+        using var foreign = new CancellationTokenSource();
+        foreign.Cancel();
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(), onIdle: _ => throw new OperationCanceledException(foreign.Token));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var item = new TestPipelineItem();
+        pipeline.Enqueue(item).Execute();
+        await item.WaitForCompleteAsync();
+
+        var ex = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreEqual(foreign.Token, ex.CancellationToken);
+    }
+
+    /// When the loop faults AND the finally-teardown (DisposeAsync) also throws, the captured root
+    /// cause must not be masked by the teardown throw - both surface (root preserved, teardown folded).
+    [TestMethod]
+    public async Task ExecutorFault_TeardownThrow_RootCausePreserved()
+    {
+        var rootEx = new InvalidOperationException("root: source WaitForNextAsync");
+        var teardownEx = new InvalidOperationException("teardown: DisposeAsync");
+#pragma warning disable DRAGHI001
+        var source = ThrowingSource<TestPipelineItem>.Create(waitThrow: rootEx, disposeThrow: teardownEx);
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy, ThrowingSource<TestPipelineItem>, ThrowingSource<TestPipelineItem>.Enumerator>(new(), source);
+#pragma warning restore DRAGHI001
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var ex = await Assert.ThrowsExactlyAsync<AggregateException>(
+            async () => await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        var inner = ex.Flatten().InnerExceptions;
+        CollectionAssert.Contains(inner, rootEx, "root cause must survive the teardown throw");
+        CollectionAssert.Contains(inner, teardownEx, "teardown throw should be folded in, not lost");
+    }
+
+    /// A source fault while an item is still in flight must still drain that item (its CompleteItem
+    /// fires) rather than strand it, and then surface the root fault via CompleteAsync.
+    [TestMethod]
+    public async Task ExecutorFault_DrainsInFlightItem()
+    {
+        var rootEx = new InvalidOperationException("root: source fault while item in flight");
+        var item = new TestPipelineItem { CompleteAsync = true }; // pending pipeline task => in flight
+#pragma warning disable DRAGHI001
+        var source = ThrowingSource<TestPipelineItem>.Create(items: new[] { item }, gateWait: true);
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy, ThrowingSource<TestPipelineItem>, ThrowingSource<TestPipelineItem>.Enumerator>(new(), source);
+#pragma warning restore DRAGHI001
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        await item.WaitForExecutedAsync();   // dispatched, pipeline task pending, executor parked on the gated wait
+        source.TriggerWaitThrow(rootEx);     // fault lands while the item is in flight
+        item.CompletePipelineTask();         // item retires during the faulted drain -> CompleteItem fires
+
+        var ex = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            async () => await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(rootEx, ex);
+        await item.WaitForCompleteAsync();   // drained on the faulted exit, not stranded
+    }
+
     /// WaitForEmptyAsync called after CompleteAsync has fully drained should return a completed
     /// task immediately (depth is 0, drain TCS is null because no one was waiting during drain).
     [TestMethod]

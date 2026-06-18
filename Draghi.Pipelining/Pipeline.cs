@@ -1,6 +1,7 @@
 using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
 using System.Runtime.InteropServices;
 using Draghi.Pipelining.Internal;
 
@@ -257,6 +258,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Promoted out of the loop so the post-loop clear below can null them out.
         T item;
         PipelineItemResult itemResult;
+        // Root cause of an executor break, captured (stack preserved) so the teardown drain/dispose
+        // in the finally can't mask it, then rethrown after teardown so it faults _executionTask.
+        ExceptionDispatchInfo? fault = null;
         try
         {
             // The CTS-cancelled check belongs to the source's MoveNextAsync, not here: even after
@@ -420,50 +424,84 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // No post-loop CommitTailWaiter needed: the top-of-loop commit already ran before the
             // MoveNextAsync that returned false.
         }
-        catch (OperationCanceledException) when (_enumerator.CompletionToken.IsCancellationRequested)
+        catch (OperationCanceledException ex) when (ex.CancellationToken == _enumerator.CompletionToken)
         {
-            // Source's MoveNextAsync threw OCE on shutdown, expected.
+            // Sanctioned shutdown: a source may signal completion either by returning false from
+            // WaitForNextAsync or, the idiomatic IAsyncEnumerator way, by throwing OCE carrying the
+            // enumerator's own CompletionToken. Identity-matched (not just IsCancellationRequested) so a
+            // foreign or untokened OCE is NOT swallowed - it falls through to the capture below and faults.
+        }
+        catch (Exception ex)
+        {
+            // Any other throw from a source/policy/loop seam (TryGetNext, WaitForNextAsync, commit, a
+            // recovery that itself escaped) breaks the pipeline. Capture the root cause now, before the
+            // teardown drain/dispose runs, so a teardown fault can't mask which seam actually broke.
+            fault = ExceptionDispatchInfo.Capture(ex);
+        }
+        finally
+        {
+            // Teardown runs on EVERY exit - clean, sanctioned-shutdown, or fault - so a faulted loop
+            // still drains in-flight items (decoupled from the source, they retire normally) and
+            // disposes the enumerator, instead of leaking the run. Guarded so a teardown throw is folded
+            // into the captured fault rather than replacing it.
+            try
+            {
+                await DrainOnCompletionAsync();
+
+                // Close the shutdown gate before disposing the enumerator. CAS null -> Done:
+                //   - Wins (slot was null): no caller in flight; dispose immediately.
+                //   - Loses with Done: caller already finished; dispose immediately.
+                //   - Loses with InFlight: caller is mid-_enumerator.Complete; install a TCS via a second
+                //     CAS over the InFlight sentinel. If that CAS wins, await the TCS - the caller's
+                //     Exchange to Done picks our TCS up and signals it. If that CAS loses, the caller
+                //     raced to Done between our two CASes, so skip the await.
+                var prev = Interlocked.CompareExchange(ref _shutdownSlot, _shutdownDone, null);
+                if (prev is not null && !ReferenceEquals(prev, _shutdownDone))
+                {
+                    var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+                    if (ReferenceEquals(Interlocked.CompareExchange(ref _shutdownSlot, tcs, _shutdownInFlight), _shutdownInFlight))
+                        await tcs.Task.ConfigureAwait(false);
+                }
+                await _enumerator.DisposeAsync().ConfigureAwait(false);
+
+                // ExecuteSource has fully completed: all items drained, enumerator disposed, advancer
+                // chain quiesced. Default the per-run reference-holding fields so a cached-but-idle
+                // Pipeline shell doesn't hold them across an idle period. Trimmed to the safe minimum:
+                // only reference-typed and reference-containing fields that could be promoted to gen1/2.
+                // _shutdownSlot is already at Done from the gate-close above, so a racing CompleteAsync
+                // first-call's CAS null -> InFlight fails and they return the execution task without
+                // touching the defaulted fields.
+                _completionException = null;
+                _policy = default!;
+                _source = default!;
+                _enumerator = default;
+                _tailWaiter = default!;
+                _tailWaiterTask = default;
+                // Public surface: cleared unconditionally so value-type T pipelines don't expose a
+                // stale slot value post-shutdown.
+                SetExecutingItem(default!);
+                SetActivatedItem(default!);
+                _waiters.Reset();
+                _waiterRecoveryItem = default!;
+                _drainWakeupTcs = null;
+                // Reset the sentinel ONLY on a clean exit. On a fault, leave _executionTask pointing at
+                // this faulting task so CompleteAsync (which returns it) surfaces the fault; rethrow below.
+                // A settled async-Task box releases its state machine, so the faulted task roots no
+                // per-run state (only a collectable Pipeline self-cycle) - no separate task needed.
+                if (fault is null)
+                    _executionTask = Task.CompletedTask;
+            }
+            catch (Exception teardownEx)
+            {
+                fault = fault is null
+                    ? ExceptionDispatchInfo.Capture(teardownEx)
+                    : ExceptionDispatchInfo.Capture(new AggregateException(fault.SourceException, teardownEx));
+            }
         }
 
-        await DrainOnCompletionAsync();
-
-        // Close the shutdown gate before disposing the enumerator. CAS null -> Done:
-        //   - Wins (slot was null): no caller in flight; dispose immediately.
-        //   - Loses with Done: caller already finished; dispose immediately.
-        //   - Loses with InFlight: caller is mid-_enumerator.Complete; install a TCS via a second
-        //     CAS over the InFlight sentinel. If that CAS wins, await the TCS - the caller's
-        //     Exchange to Done picks our TCS up and signals it. If that CAS loses, the caller
-        //     raced to Done between our two CASes, so skip the await.
-        var prev = Interlocked.CompareExchange(ref _shutdownSlot, _shutdownDone, null);
-        if (prev is not null && !ReferenceEquals(prev, _shutdownDone))
-        {
-            var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-            if (ReferenceEquals(Interlocked.CompareExchange(ref _shutdownSlot, tcs, _shutdownInFlight), _shutdownInFlight))
-                await tcs.Task.ConfigureAwait(false);
-        }
-        await _enumerator.DisposeAsync().ConfigureAwait(false);
-
-        // ExecuteSource has fully completed: all items drained, enumerator disposed, advancer
-        // chain quiesced. Default the per-run reference-holding fields so a cached-but-idle
-        // Pipeline shell doesn't hold them across an idle period. Trimmed to the safe minimum:
-        // only reference-typed and reference-containing fields that could be promoted to gen1/2.
-        // _shutdownSlot is already at Done from the gate-close above, so a racing CompleteAsync
-        // first-call's CAS null -> InFlight fails and they return the (about-to-be-swapped-to-
-        // CompletedTask) execution task without touching the defaulted fields.
-        _completionException = null;
-        _policy = default!;
-        _source = default!;
-        _enumerator = default;
-        _tailWaiter = default!;
-        _tailWaiterTask = default;
-        // Public surface: cleared unconditionally so value-type T pipelines don't expose a
-        // stale slot value post-shutdown.
-        SetExecutingItem(default!);
-        SetActivatedItem(default!);
-        _waiters.Reset();
-        _waiterRecoveryItem = default!;
-        _drainWakeupTcs = null;
-        _executionTask = Task.CompletedTask;
+        // Rethrow the captured root (or root + teardown aggregate) with its original stack, faulting
+        // _executionTask. No-op on the clean / sanctioned-shutdown paths.
+        fault?.Throw();
     }
 
     /// Drains remaining items after the execution loop exits. Waits for the advancer chain to
