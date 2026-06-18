@@ -39,6 +39,14 @@ public abstract class PipelineScheduler
     /// The callback runs detached from the caller's logical execution stream, AsyncLocal values,
     /// security context, and culture from the caller will not flow to the callback.
     /// </summary>
+    /// <remarks>
+    /// Must not throw, like System.IO.Pipelines' PipeScheduler.Schedule: it is a thin fire-and-forget
+    /// dispatch primitive called from detached dispatch/retirement work-item contexts that have no
+    /// exception channel, so a throw crashes that thread. (Unlike <see cref="TaskScheduler"/>'s QueueTask,
+    /// which the runtime hands a Task to fault, there is nowhere to surface a submit failure.)
+    /// Implementations must contain any submit-time failure internally; a throwing scheduler is a caller
+    /// contract violation, and the resulting connection breakage is the caller's responsibility.
+    /// </remarks>
     public abstract void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true);
 
     public void SubmitDetached<TState>(Action<TState> action, TState state, bool preferLocal = true)
