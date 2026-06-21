@@ -70,7 +70,11 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     // in the same way to avoid reading _first on the hot path.
 
     /// <summary>The initial size to use for segments (in number of elements).</summary>
-    const int InitialSegmentSize = 32; // must be a power of 2
+    // 8 (was 32): callers escalate to the queue only past a slot fast path and typically overlap a
+    // few deep, so a small floor cuts the per-instance footprint (the 32-element array dominated the
+    // ~700B-1.2KB minimum alongside the cache-line padding). Segments still double on demand
+    // (EnqueueSlow) up to MaxSegmentSize, so deep producers are unaffected.
+    const int InitialSegmentSize = 8; // must be a power of 2
     /// <summary>The maximum size to use for segments (in number of elements).</summary>
     const int MaxSegmentSize = 0x1000000; // this could be made as large as int.MaxValue / 2
 
@@ -164,13 +168,25 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         if (first != segment._state._lastCopy)
         {
             result = array[first];
-            array[first] = default!; // Clear the slot to release the element
-            // Plain store on _first. The producer only reads _first to gauge free room, where a stale
-            // value is conservative and safe, so the hot, cross-core-bouncing index needs no release
-            // here - dropping the stlr off the contended line is a large ARM64/M-series win (a release
-            // store on the line that ping-pongs every dequeue was the dominant per-op cost). External
-            // observers (IsEmpty/Count/Enumerator) stay best-effort, exactly as already documented.
-            segment._state._first = (first + 1) & (array.Length - 1);
+            // Advancing _first publishes the slot back to the producer for reuse, so any store the
+            // consumer makes to the slot must be ordered before it: a plain advance can become
+            // visible first, and the producer's write into the reused slot then races the pending
+            // slot store. Elements without references skip the slot clear entirely (the producer
+            // overwrites the slot before publishing _last, and there is nothing for the GC to
+            // release), which also removes the store needing ordering: the advance stays a plain
+            // store. Elements with references must be cleared to release them, so there the
+            // advance is a release store ordering the clear before the handoff.
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                array[first] = default!; // Clear the slot to release the element
+                Volatile.Write(ref segment._state._first, (first + 1) & (array.Length - 1));
+            }
+            else
+            {
+                // Plain store on _first: the producer reads it only to gauge free room, where a
+                // stale value is conservative and safe.
+                segment._state._first = (first + 1) & (array.Length - 1);
+            }
             return true;
         }
 
@@ -181,6 +197,12 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     /// <summary>Attempts to peek at an item in the queue.</summary>
     /// <param name="result">The peeked item.</param>
     /// <returns>true if an item could be peeked. Otherwise, false.</returns>
+    /// <remarks>
+    /// Consumer-only, like every dequeue: the slow path refreshes _lastCopy and hops _head
+    /// (consumer-owned writes), and even a read-only peek from another thread can observe an
+    /// element torn by the consumer's concurrent slot clear. Single producer, single consumer,
+    /// peeks included.
+    /// </remarks>
     public bool TryPeek([MaybeNullWhen(false)] out T result)
     {
         Segment segment = _head; // consumer-owned, plain read
@@ -248,9 +270,16 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         result = array[first];
         if (!peek)
         {
-            array[first] = default!; // Clear the slot to release the element
-            // Plain store on _first (see TryDequeue fast path).
-            segment._state._first = (first + 1) & (segment._array.Length - 1);
+            // Clear-then-release ordering: see TryDequeue.
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                array[first] = default!; // Clear the slot to release the element
+                Volatile.Write(ref segment._state._first, (first + 1) & (segment._array.Length - 1));
+            }
+            else
+            {
+                segment._state._first = (first + 1) & (segment._array.Length - 1);
+            }
             // Freshness-only refresh of _lastCopy to widen the fast-path window.
             segment._state._lastCopy = Volatile.Read(ref segment._state._last);
         }
@@ -274,9 +303,16 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
             result = array[first];
             if (predicate == null || predicate(result))
             {
-                array[first] = default!; // Clear the slot to release the element
-                // Plain store on _first (see TryDequeue fast path).
-                segment._state._first = (first + 1) & (array.Length - 1);
+                // Clear-vs-advance ordering: see TryDequeue.
+                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                {
+                    array[first] = default!;
+                    Volatile.Write(ref segment._state._first, (first + 1) & (array.Length - 1));
+                }
+                else
+                {
+                    segment._state._first = (first + 1) & (array.Length - 1);
+                }
                 return true;
             }
 
@@ -330,9 +366,16 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         result = array[first];
         if (predicate == null || predicate(result))
         {
-            array[first] = default!; // Clear the slot to release the element
-            // Plain store on _first (see TryDequeue fast path).
-            segment._state._first = (first + 1) & (segment._array.Length - 1);
+            // Clear-then-release ordering: see TryDequeue.
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            {
+                array[first] = default!; // Clear the slot to release the element
+                Volatile.Write(ref segment._state._first, (first + 1) & (segment._array.Length - 1));
+            }
+            else
+            {
+                segment._state._first = (first + 1) & (segment._array.Length - 1);
+            }
             // Freshness-only refresh of _lastCopy.
             segment._state._lastCopy = Volatile.Read(ref segment._state._last);
             return true;
@@ -358,7 +401,9 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
             // Plain read of _head: reference reads are ordered via data-dependency through the load.
             Segment head = _head;
             // Acquire-load on _first, subsequent plain read of _lastCopy cannot be reordered past it.
-            // Pairs with consumer's Volatile.Write release on _first.
+            // Dequeues of elements without references store _first plain (see TryDequeue), so from
+            // a thread other than the consumer this read is best-effort, per the remarks above; from
+            // the consumer's own thread it is always fresh.
             var first = Volatile.Read(ref head._state._first);
             if (first != head._state._lastCopy)
             {
