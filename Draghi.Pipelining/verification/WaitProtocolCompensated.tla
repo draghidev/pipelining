@@ -27,7 +27,7 @@ SEPARATELY from WaitProtocol.tla because it differs in load-bearing shape:
     witness) is unaffected: it lives in the not-yet-completed phase, where the
     reorder changes nothing.
 
-Two failure families this module exists to pin:
+Three failure families this module exists to pin:
 
   STALE CLOSE (audit C2, code fixed 672e1f45): the close-out compensation is
   a pair of store->load Dekker races - producer flag-store -> HandoffActive
@@ -40,6 +40,20 @@ Two failure families this module exists to pin:
   re-delivered (drain hang). Modeled with buffered/committed store pairs;
   CloseFence and SignalFence toggle the Interlocked fences the fix added -
   each is INDEPENDENTLY necessary (either missing alone admits the loss).
+
+  STALE OPEN (audit C7): the SYMMETRIC twin of the stale close, on the window
+  OPEN. The close-out clear is Interlocked (full fence, the C2 fix), but the
+  window OPEN is a plain Volatile.Write (release) - asymmetric. A concurrent
+  Complete/Execute reading HandoffActive can see it stale-CLOSED while the
+  handoff is genuinely open: it then does NOT defer/drop, but proceeds to
+  claim - stealing the suspended wait the handoff is rendezvousing on (the
+  executor wakes on a scheduler thread, runs the sync flow on the wrong thread
+  or, on the completion face, resolves Completed out from under the handoff,
+  stranding it). The MRES-wait fence that would commit the open does NOT cover
+  the HEAD's fast path: only a NON-head waits on its MRES; the head sets
+  HandoffActive and claims directly, its only fence being its own claim-loop
+  AcquireWakeLock - which does NOT commit the store for a reader on another
+  core. OpenFence toggles the fix (an Interlocked open, matching the clear).
 
   GATE RACE / handoff steal (audit C5, found by this module's construction):
   Execute's and Complete's HandoffActive gate is read OUTSIDE the wake lock,
@@ -58,14 +72,16 @@ Two failure families this module exists to pin:
   the handoff producer cannot observe it and blocks until the executor
   re-arms; a claim after the handoff observed implies the open committed
   (the producer's MRES wait fences its own prior open store), so the
-  under-lock re-read sees the window and defers.
+  under-lock re-read sees the window and defers. (NOTE: this soundness rests
+  on the open being committed by the time it is observed - which OpenFence=FALSE
+  exposes as NOT guaranteed for the head fast path.)
 
 Modeling notes (fidelity decisions):
-  - The window OPEN is modeled atomic-committed: the opener's MRES wait is a
-    full fence, so the open is globally committed before the handoff can
-    observe the suspension; an open that is not yet committed is
-    indistinguishable from one that has not happened (covered by ordinary
-    interleaving).
+  - The window OPEN is now modeled with a buffered/committed pair
+    (openBuf/windowActive), toggled by OpenFence - NO LONGER atomic-committed.
+    The handoff's own wake-lock acquire (HandoffObserveAck / HandoffClaimInline)
+    commits its buffered open (a fence on its own thread); CommitOpen models
+    natural propagation; the close-out's Interlocked clear drains it.
   - The consumer's flag clear is modeled committed: its staleness can only
     produce a SPURIOUS compensation wake (reads stale TRUE), which is benign.
   - The three legacy mechanisms (under-lock re-check, lock-through
@@ -73,24 +89,29 @@ Modeling notes (fidelity decisions):
     WaitProtocol.tla.
   - A claim's lock acquire is a full fence on the claiming thread, so it
     commits that thread's buffered store (qne for the producer, isCompleted
-    for the completer, the window clear for the close-out wake).
+    for the completer, the window clear for the close-out wake, the window
+    open for the handoff).
 
 Properties:
   TypeOK
   NoWrongThreadTake - no scheduler-thread TryGetNext ever takes an acked
-                      handoff (fails with GateUnderLock=FALSE: the steal)
+                      handoff (fails with GateUnderLock=FALSE: the steal;
+                      and with OpenFence=FALSE: the stale-open steal)
   HandoffInline     - a handoff producer past its claim saw its flow consumed
   Drains            - liveness: every queued item drains - via PullHit while
                       running, or ShutdownDrain (the reclaim) once completed
                       (fails with PeekRecheck=FALSE: the C6 hot-spin)
   AllConsumed       - liveness: everything drains and completion is observed
-                      (fails with either fence toggle FALSE: the stale close)
-  HandoffReturns    - the handoff producer is never stranded
+                      (fails with either close fence toggle FALSE: the stale
+                      close)
+  HandoffReturns    - the handoff producer is never stranded (fails with
+                      OpenFence=FALSE: a stale-open Complete resolves Completed
+                      out from under the rendezvous)
 *)
 
 EXTENDS Naturals, TLC
 
-CONSTANTS MaxItems, CloseFence, SignalFence, GateUnderLock, PeekRecheck
+CONSTANTS MaxItems, CloseFence, SignalFence, OpenFence, GateUnderLock, PeekRecheck
 
 VARIABLES
   queue,        \* published items pending consumption
@@ -101,6 +122,7 @@ VARIABLES
   isCompleted,  \* committed IsCompleted
   compBuf,      \* completer's buffered IsCompleted := TRUE
   windowActive, \* committed HandoffActive
+  openBuf,      \* handoff's buffered HandoffActive := TRUE (store buffer)
   clearBuf,     \* close-out's buffered HandoffActive := FALSE
   lock,         \* wake spinlock held?
   pending,      \* armed wait
@@ -115,7 +137,7 @@ VARIABLES
   wrongThreadTake
 
 vars == <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-          windowActive, clearBuf, lock, pending, contStored, suspendedSig,
+          windowActive, openBuf, clearBuf, lock, pending, contStored, suspendedSig,
           handoff, acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
 
 TypeOK ==
@@ -125,7 +147,7 @@ TypeOK ==
   /\ consumed + queue = enqueued
   /\ qne \in BOOLEAN /\ qneBuf \in BOOLEAN
   /\ isCompleted \in BOOLEAN /\ compBuf \in BOOLEAN
-  /\ windowActive \in BOOLEAN /\ clearBuf \in BOOLEAN
+  /\ windowActive \in BOOLEAN /\ openBuf \in BOOLEAN /\ clearBuf \in BOOLEAN
   /\ lock \in BOOLEAN /\ pending \in BOOLEAN /\ contStored \in BOOLEAN
   /\ suspendedSig \in BOOLEAN
   /\ handoff \in 0..1 /\ acked \in BOOLEAN
@@ -139,7 +161,7 @@ Init ==
   /\ queue = 0 /\ enqueued = 0 /\ consumed = 0
   /\ qne = FALSE /\ qneBuf = FALSE
   /\ isCompleted = FALSE /\ compBuf = FALSE
-  /\ windowActive = FALSE /\ clearBuf = FALSE
+  /\ windowActive = FALSE /\ openBuf = FALSE /\ clearBuf = FALSE
   /\ lock = FALSE /\ pending = FALSE /\ contStored = FALSE
   /\ suspendedSig = FALSE
   /\ handoff = 0 /\ acked = FALSE
@@ -171,8 +193,8 @@ EnqPublish ==
   /\ queue' = queue + 1 /\ enqueued' = enqueued + 1
   /\ ppc' = "published"
   /\ UNCHANGED <<consumed, qne, qneBuf, isCompleted, compBuf, windowActive,
-                 clearBuf, lock, pending, contStored, suspendedSig, handoff,
-                 acked, cpc, hpc, kpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, pending, contStored, suspendedSig,
+                 handoff, acked, cpc, hpc, kpc, wrongThreadTake>>
 
 \* QueueNotEmpty := TRUE. Fenced (Interlocked, the C2 fix) commits at once;
 \* unfenced sits in the store buffer until CommitQne or a later lock fence.
@@ -183,16 +205,16 @@ EnqFlag ==
        ELSE qneBuf' = TRUE /\ qne' = qne
   /\ ppc' = "flagged"
   /\ UNCHANGED <<queue, enqueued, consumed, isCompleted, compBuf, windowActive,
-                 clearBuf, lock, pending, contStored, suspendedSig, handoff,
-                 acked, cpc, hpc, kpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, pending, contStored, suspendedSig,
+                 handoff, acked, cpc, hpc, kpc, wrongThreadTake>>
 
 \* Store buffer drain (eventual; a fence elsewhere on the thread also drains).
 CommitQne ==
   /\ qneBuf
   /\ qne' = TRUE /\ qneBuf' = FALSE
   /\ UNCHANGED <<queue, enqueued, consumed, isCompleted, compBuf, windowActive,
-                 clearBuf, lock, pending, contStored, suspendedSig, handoff,
-                 acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, pending, contStored, suspendedSig,
+                 handoff, acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
 
 \* SHIPPED gate shape (~GateUnderLock): the HandoffActive read is its own
 \* instruction, outside the wake lock. A TRUE read DROPS the signal (the
@@ -205,7 +227,7 @@ ExecuteGateRead ==
        THEN ppc' = "idle"
        ELSE ppc' = "gated"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, pending, contStored,
+                 windowActive, openBuf, clearBuf, lock, pending, contStored,
                  suspendedSig, handoff, acked, cpc, hpc, kpc, wrongThreadTake>>
 
 ExecuteClaim ==
@@ -216,7 +238,7 @@ ExecuteClaim ==
   /\ qneBuf' = FALSE
   /\ ppc' = "idle"
   /\ UNCHANGED <<queue, enqueued, consumed, isCompleted, compBuf, windowActive,
-                 clearBuf, lock, handoff, acked, hpc, kpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, handoff, acked, hpc, kpc, wrongThreadTake>>
 
 \* FIXED gate shape (GateUnderLock): gate re-read and claim under one wake-lock
 \* hold. The acquire is the fence (commits the producer's flag); the re-read
@@ -231,7 +253,7 @@ ExecuteGatedClaim ==
        ELSE (ClaimWakes \/ ClaimNoop)
   /\ ppc' = "idle"
   /\ UNCHANGED <<queue, enqueued, consumed, isCompleted, compBuf, windowActive,
-                 clearBuf, lock, handoff, acked, hpc, kpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, handoff, acked, hpc, kpc, wrongThreadTake>>
 
 -----------------------------------------------------------------------------
 \* Complete (one-shot, after the producer is done): IsCompleted store, then
@@ -244,15 +266,15 @@ CompleteStore ==
        ELSE compBuf' = TRUE /\ isCompleted' = isCompleted
   /\ kpc' = "stored"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, windowActive,
-                 clearBuf, lock, pending, contStored, suspendedSig, handoff,
-                 acked, cpc, ppc, hpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, pending, contStored, suspendedSig,
+                 handoff, acked, cpc, ppc, hpc, wrongThreadTake>>
 
 CommitComp ==
   /\ compBuf
   /\ isCompleted' = TRUE /\ compBuf' = FALSE
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, windowActive,
-                 clearBuf, lock, pending, contStored, suspendedSig, handoff,
-                 acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, pending, contStored, suspendedSig,
+                 handoff, acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
 
 CompleteGateRead ==
   /\ ~GateUnderLock
@@ -261,7 +283,7 @@ CompleteGateRead ==
        THEN kpc' = "done"      \* dropped; the close-out re-delivers
        ELSE kpc' = "gated"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, pending, contStored,
+                 windowActive, openBuf, clearBuf, lock, pending, contStored,
                  suspendedSig, handoff, acked, cpc, ppc, hpc, wrongThreadTake>>
 
 CompleteClaim ==
@@ -272,7 +294,7 @@ CompleteClaim ==
   /\ compBuf' = FALSE
   /\ kpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, windowActive,
-                 clearBuf, lock, handoff, acked, ppc, hpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, handoff, acked, ppc, hpc, wrongThreadTake>>
 
 CompleteGatedClaim ==
   /\ GateUnderLock
@@ -284,50 +306,70 @@ CompleteGatedClaim ==
        ELSE (ClaimWakes \/ ClaimNoop)
   /\ kpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, windowActive,
-                 clearBuf, lock, handoff, acked, ppc, hpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, handoff, acked, ppc, hpc, wrongThreadTake>>
 
 -----------------------------------------------------------------------------
 \* Sync-handoff producer (one chain; the SyncWaiterLock baton serializes).
 
-\* Open the window + publish the slot (atomic-committed; see modeling notes),
-\* then block on the suspension observation.
+\* Open the window (Volatile.Write HandoffActive := TRUE under SyncWaiterLock)
+\* + publish the slot, then block on the suspension observation. OpenFence=TRUE
+\* models the fix (Interlocked open, committed at once); FALSE (the shipped
+\* code) buffers the open - a concurrent reader keeps seeing the window CLOSED
+\* until openBuf commits (the handoff's own fence, or CommitOpen propagation).
 HandoffOpen ==
   /\ hpc = "idle" /\ ~isCompleted
-  /\ windowActive' = TRUE
+  /\ IF OpenFence
+       THEN windowActive' = TRUE /\ openBuf' = openBuf
+       ELSE openBuf' = TRUE /\ windowActive' = windowActive
   /\ handoff' = 1
   /\ hpc' = "waiting"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
                  clearBuf, lock, pending, contStored, suspendedSig, acked,
                  cpc, ppc, kpc, wrongThreadTake>>
 
+\* Store buffer drain for the open (eventual; the handoff's own fence below
+\* also drains it).
+CommitOpen ==
+  /\ openBuf
+  /\ windowActive' = TRUE /\ openBuf' = FALSE
+  /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
+                 clearBuf, lock, pending, contStored, suspendedSig, handoff,
+                 acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
+
 \* WaitForSuspended returned + HandoffAcked := TRUE (the ack is ordered after
 \* the observation in code; fusing them loses no interleaving because nothing
 \* the protocol does distinguishes the gap - the acked flag is what gates
-\* consumption, and it is set here).
+\* consumption, and it is set here). The MRES wait is a full fence: it commits
+\* this thread's buffered open.
 HandoffObserveAck ==
   /\ hpc = "waiting"
   /\ suspendedSig
+  /\ windowActive' = (windowActive \/ openBuf)
+  /\ openBuf' = FALSE
   /\ acked' = TRUE
   /\ hpc' = "acked"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, pending, contStored,
+                 clearBuf, lock, pending, contStored,
                  suspendedSig, handoff, cpc, ppc, kpc, wrongThreadTake>>
 
 \* Inline claim: consume the wait, run the executor on this thread, and the
 \* executor's retry takes the acked slot - fused, per the code's contract that
-\* the flow has been processed by the time Signal(false) returns.
+\* the flow has been processed by the time Signal(false) returns. The claim's
+\* lock acquire is a full fence: it commits this thread's buffered open.
 HandoffClaimInline ==
   /\ hpc = "acked" /\ ~lock
   /\ pending /\ contStored
   /\ pending' = FALSE
   /\ contStored' = FALSE
   /\ suspendedSig' = FALSE
+  /\ windowActive' = (windowActive \/ openBuf)
+  /\ openBuf' = FALSE
   /\ handoff' = 0
   /\ acked' = FALSE
   /\ cpc' = "run"
   /\ hpc' = "closing"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, ppc, kpc, wrongThreadTake>>
+                 clearBuf, lock, ppc, kpc, wrongThreadTake>>
 
 \* Claim found nothing pending: the rendezvous was stolen (the gate race took
 \* the wait first). The code's Debug.Assert(claimed) face; the producer
@@ -335,16 +377,21 @@ HandoffClaimInline ==
 HandoffClaimNoop ==
   /\ hpc = "acked" /\ ~lock
   /\ ~pending
+  /\ windowActive' = (windowActive \/ openBuf)
+  /\ openBuf' = FALSE
   /\ hpc' = "closing"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, pending, contStored,
+                 clearBuf, lock, pending, contStored,
                  suspendedSig, handoff, acked, cpc, ppc, kpc, wrongThreadTake>>
 
 \* Close-out, step 1: clear HandoffActive. Fenced (Interlocked, the C2 fix)
-\* commits at once; unfenced sits in the buffer - others keep reading the
-\* window as OPEN while this thread's compensation reads run.
+\* commits at once AND drains this thread's buffered open (same location, the
+\* Interlocked supersedes the prior Volatile.Write); unfenced sits in the
+\* buffer - others keep reading the window as OPEN while this thread's
+\* compensation reads run.
 CloseClear ==
   /\ hpc = "closing"
+  /\ openBuf' = FALSE
   /\ IF CloseFence
        THEN windowActive' = FALSE /\ clearBuf' = clearBuf
        ELSE clearBuf' = TRUE /\ windowActive' = windowActive
@@ -363,7 +410,7 @@ CloseReadWake ==
   /\ clearBuf' = FALSE
   /\ hpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 lock, handoff, acked, ppc, kpc, wrongThreadTake>>
+                 openBuf, lock, handoff, acked, ppc, kpc, wrongThreadTake>>
 
 \* Close-out, step 2b: nothing accrued (per this thread's possibly-stale view)
 \* - no wake, no fence; a buffered clear drains via CommitClear eventually.
@@ -372,14 +419,14 @@ CloseReadSkip ==
   /\ ~(qne \/ isCompleted)
   /\ hpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, pending, contStored,
+                 windowActive, openBuf, clearBuf, lock, pending, contStored,
                  suspendedSig, handoff, acked, cpc, ppc, kpc, wrongThreadTake>>
 
 CommitClear ==
   /\ clearBuf
   /\ windowActive' = FALSE /\ clearBuf' = FALSE
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 lock, pending, contStored, suspendedSig, handoff, acked,
+                 openBuf, lock, pending, contStored, suspendedSig, handoff, acked,
                  cpc, ppc, hpc, kpc, wrongThreadTake>>
 
 -----------------------------------------------------------------------------
@@ -403,8 +450,8 @@ PullHit ==
   /\ queue' = queue - 1 /\ consumed' = consumed + 1
   /\ qne' = IF queue - 1 = 0 THEN FALSE ELSE qne
   /\ UNCHANGED <<enqueued, qneBuf, isCompleted, compBuf, windowActive,
-                 clearBuf, lock, pending, contStored, suspendedSig, handoff,
-                 acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
+                 openBuf, clearBuf, lock, pending, contStored, suspendedSig,
+                 handoff, acked, cpc, ppc, hpc, kpc, wrongThreadTake>>
 
 \* TryGetNext handoff take on a NON-inline wake: only reachable when a stale
 \* gate stole the rendezvous (the inline claim consumes the slot atomically,
@@ -416,7 +463,7 @@ PullHandoffStolen ==
   /\ acked' = FALSE
   /\ wrongThreadTake' = TRUE
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, pending, contStored,
+                 windowActive, openBuf, clearBuf, lock, pending, contStored,
                  suspendedSig, cpc, ppc, hpc, kpc>>
 
 \* Miss -> WaitForNextAsync acquires the wake lock. Pg clears nothing here.
@@ -427,7 +474,7 @@ WaitAcquire ==
   /\ lock' = TRUE
   /\ cpc' = "locked"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, pending, contStored, suspendedSig,
+                 windowActive, openBuf, clearBuf, pending, contStored, suspendedSig,
                  handoff, acked, ppc, hpc, kpc, wrongThreadTake>>
 
 \* Flag-only availability re-check (peek-style; consumption stays in
@@ -440,7 +487,7 @@ WaitRecheckRetry ==
   /\ lock' = FALSE
   /\ cpc' = "run"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, pending, contStored, suspendedSig,
+                 windowActive, openBuf, clearBuf, pending, contStored, suspendedSig,
                  handoff, acked, ppc, hpc, kpc, wrongThreadTake>>
 
 \* Completed-resolution BEATS the queue (the reclaim policy): it resolves even
@@ -456,7 +503,7 @@ WaitRecheckCompleted ==
   /\ lock' = FALSE
   /\ cpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, pending, contStored, suspendedSig,
+                 windowActive, openBuf, clearBuf, pending, contStored, suspendedSig,
                  handoff, acked, ppc, hpc, kpc, wrongThreadTake>>
 
 WaitArm ==
@@ -466,7 +513,7 @@ WaitArm ==
   /\ pending' = TRUE
   /\ cpc' = "armed"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, lock, contStored, suspendedSig,
+                 windowActive, openBuf, clearBuf, lock, contStored, suspendedSig,
                  handoff, acked, ppc, hpc, kpc, wrongThreadTake>>
 
 \* Registration: store the continuation, set the suspension observation under
@@ -478,7 +525,7 @@ WaitRegister ==
   /\ lock' = FALSE
   /\ cpc' = "suspended"
   /\ UNCHANGED <<queue, enqueued, consumed, qne, qneBuf, isCompleted, compBuf,
-                 windowActive, clearBuf, pending, handoff, acked, ppc, hpc,
+                 windowActive, openBuf, clearBuf, pending, handoff, acked, ppc, hpc,
                  kpc, wrongThreadTake>>
 
 \* Shutdown's residual reclaim (DrainInertItems), unblocked by the DrainSignal
@@ -497,9 +544,9 @@ ShutdownDrain ==
   /\ queue' = 0
   /\ consumed' = consumed + queue
   /\ qne' = FALSE
-  /\ UNCHANGED <<enqueued, qneBuf, isCompleted, compBuf, windowActive, clearBuf,
-                 lock, pending, contStored, suspendedSig, handoff, acked, cpc,
-                 ppc, hpc, kpc, wrongThreadTake>>
+  /\ UNCHANGED <<enqueued, qneBuf, isCompleted, compBuf, windowActive, openBuf,
+                 clearBuf, lock, pending, contStored, suspendedSig, handoff, acked,
+                 cpc, ppc, hpc, kpc, wrongThreadTake>>
 
 -----------------------------------------------------------------------------
 
@@ -508,7 +555,7 @@ Next ==
   \/ ExecuteGateRead \/ ExecuteClaim \/ ExecuteGatedClaim
   \/ CompleteStore \/ CommitComp
   \/ CompleteGateRead \/ CompleteClaim \/ CompleteGatedClaim
-  \/ HandoffOpen \/ HandoffObserveAck \/ HandoffClaimInline \/ HandoffClaimNoop
+  \/ HandoffOpen \/ CommitOpen \/ HandoffObserveAck \/ HandoffClaimInline \/ HandoffClaimNoop
   \/ CloseClear \/ CloseReadWake \/ CloseReadSkip \/ CommitClear
   \/ PullHit \/ PullHandoffStolen
   \/ WaitAcquire \/ WaitRecheckRetry \/ WaitRecheckCompleted
@@ -524,6 +571,7 @@ Fairness ==
   \* arrive; mid-run losses must be caught without its end-of-run sweep (Drains).
   /\ WF_vars(CommitComp)
   /\ WF_vars(CompleteGateRead) /\ WF_vars(CompleteClaim) /\ WF_vars(CompleteGatedClaim)
+  /\ WF_vars(CommitOpen)
   /\ WF_vars(HandoffObserveAck) /\ WF_vars(HandoffClaimInline) /\ WF_vars(HandoffClaimNoop)
   /\ WF_vars(CloseClear) /\ WF_vars(CloseReadWake) /\ WF_vars(CloseReadSkip)
   /\ WF_vars(CommitClear)
