@@ -35,15 +35,13 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
         if (_state.WakeSignal.IsCompleted)
             ThrowCompleted();
 
-        _state.OnEnqueue?.Invoke();
         _state.NotEmpty = true;
         _state.Queue.Enqueue(item);
         return new(_state.WakeSignal);
     }
 
-    public Enumerator GetAsyncEnumerator(Action? onEnqueue = null, CancellationToken cancellationToken = default)
+    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        _state.OnEnqueue = onEnqueue;
         return new(_state, cancellationToken);
     }
 
@@ -55,7 +53,6 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
         public readonly SingleProducerSingleConsumerQueue<T> Queue = new();
         public bool NotEmpty;
         public readonly WakeSignal WakeSignal;
-        public Action? OnEnqueue;
         public readonly CancellationToken CancellationToken;
         public CancellationToken EnumerationToken;
         public readonly Func<CancellationToken, ValueTask>? OnIdle;

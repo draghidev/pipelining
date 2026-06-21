@@ -35,8 +35,12 @@ public sealed class QueuedPipeline<T, TPolicy>
     /// (CompleteAsync's returned task is the proxy for "pipeline ran to completion").</summary>
     public CancellationToken CompletionToken => Source.CancellationToken;
 
-    /// <summary>Current pipeline depth.</summary>
+    /// <summary>Current in-flight count (dispatched - completed).</summary>
     public int Depth => Pipeline.Depth;
+
+    /// <summary>Items enqueued but not yet dispatched (the source queue length). A gauge:
+    /// <c>Depth + Backlog</c> is the total outstanding. Lock-free read, may be stale.</summary>
+    public int Backlog => Source.Backlog;
 
     /// <summary>Enqueues an item for processing. See
     /// <see cref="UnboundedQueueSource{T}.Enqueue"/> for the deferred-execute semantics.</summary>

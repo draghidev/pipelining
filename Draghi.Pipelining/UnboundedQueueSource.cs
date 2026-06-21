@@ -51,15 +51,15 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         if (_state.WakeSignal.IsCompleted)
             ThrowCompleted();
 
-        // Notify the pipeline before publishing the item, so a producer thread that follows up by
-        // reading Pipeline.Depth always observes its own contribution. Ordering matters: the
-        // pipeline's executor can dequeue and complete the item before Enqueue returns, so the
-        // increment must precede the queue write that makes the item visible to the executor.
-        _state.OnEnqueue?.Invoke();
         _state.NotEmpty = true;
         _state.Queue.Enqueue(item);
         return new(_state.WakeSignal);
     }
+
+    /// <summary>Backlog: items enqueued but not yet dispatched (the queue length). With
+    /// <see cref="Pipeline{T,TPolicy,TSource,TEnumerator}.Depth"/> (in-flight = dispatched - completed),
+    /// <c>Depth + Backlog</c> is the total outstanding. Lock-free read, may be stale.</summary>
+    public int Backlog => _state.Queue.Count;
 
     /// <summary>Returns a struct enumerator that the pipeline drives via <c>await foreach</c>.</summary>
     /// <remarks>
@@ -68,9 +68,8 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// the enumerator would wait forever on the wake signal while the pipeline considers itself
     /// shut down.
     /// </remarks>
-    public Enumerator GetAsyncEnumerator(Action? onEnqueue = null, CancellationToken cancellationToken = default)
+    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        _state.OnEnqueue = onEnqueue;
         return new(_state, cancellationToken);  // Enumerator combines _state.CancellationToken internally.
     }
 
@@ -82,7 +81,6 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         public readonly SingleProducerSingleConsumerQueue<T> Queue = new();
         public bool NotEmpty;
         public readonly WakeSignal WakeSignal;
-        public Action? OnEnqueue;
         // Source-level cancellation. Per-enumeration CT (passed to GetAsyncEnumerator) gets
         // linked with this in the Enumerator's CTS construction.
         public readonly CancellationToken CancellationToken;

@@ -139,13 +139,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     // Activation.
     readonly Action _onWaiterTaskCompletedAction;
-    readonly Action _incrementDepthAction;
 
     internal Pipeline(TPolicy policy, TSource source)
     {
         // Delegate references bind to `this` and don't change.
         _onWaiterTaskCompletedAction = OnWaiterTaskCompleted;
-        _incrementDepthAction = IncrementDepth;
         Initialize(policy, source);
     }
 
@@ -162,18 +160,15 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         _source = source;
         _shutdownSlot = null;
 
-        // GetAsyncEnumerator takes the depth-increment callback inline. Source binds it before
-        // any item can be admitted, so the very first admission lands in _depthState. Pipeline
-        // doesn't pass a CT here: source owns its own cancellation lifecycle (caller-configured
-        // at source construction).
-        _enumerator = _source.GetAsyncEnumerator(_incrementDepthAction);
+        // Depth is counted at DISPATCH (the executor's single-consumer pull), not at enqueue, so the
+        // source no longer needs a depth-increment hook. Pipeline doesn't pass a CT here: source owns
+        // its own cancellation lifecycle (caller-configured at source construction).
+        _enumerator = _source.GetAsyncEnumerator();
         _executionTask = ExecuteSource();
 
         // Other per-run fields are left at default: field-initialized on first run, or zeroed by the
         // previous run's ExecuteSource-exit cleanup.
     }
-
-    void IncrementDepth() => _depthState.IncrementDepth();
 
     // Off the hot path (advancer/recovery handoff), so OS handoff on contention is preferable.
     // Lazy-allocated alongside _waiters at first escalation. Stays null while no advancer can
@@ -307,6 +302,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                         break;
                     continue;
                 }
+
+                // Count depth at DISPATCH: a source-yielded item just became in-flight. This is the
+                // single-consumer chokepoint (the executor), so the increment is single-writer - no
+                // producer race, no enqueue-side serialization. Recovery substitutes do NOT increment
+                // here (they republish SetExecutingItem for the failed item's already-counted slot).
+                _depthState.IncrementDepth();
 
                 // Publish _executingItem and the visibility flag before either activation path.
                 // _hasInFlightItem signals GetEnumerator that the in-flight item is yieldable during
@@ -2075,9 +2076,10 @@ public static class Pipeline
             [MethodImpl(MethodImplOptions.AggressiveInlining)]
             get
             {
-                // Read completed BEFORE enqueued: every completion's enqueue-side increment is
-                // visible before the completion publishes (dequeue / waiter-store acquire
-                // chains), so this order can never observe comp > enq (negative depth).
+                // Read completed BEFORE dispatched: an item is dispatch-counted (here, _enqueued) by
+                // the executor strictly BEFORE it can complete (you cannot complete what was never
+                // dispatched), so this order can never observe comp > disp (negative depth). The bump
+                // and the eventual decrement order on the same logical item.
                 var comp = Volatile.Read(ref _completed);
                 var enq = Volatile.Read(ref _enqueued.Value);
                 return (int)(enq - comp);
@@ -2087,8 +2089,9 @@ public static class Pipeline
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public void IncrementDepth()
         {
-            // Producer-owned plain read; release store publishes before the source's queue write
-            // (Enqueue calls this hook first), so a consumer that sees the item sees the count.
+            // Executor-owned (called at dispatch, the single-consumer pull) so the counter stays
+            // single-writer; plain read + release store. Depth now means in-flight (dispatched -
+            // completed), not enqueued - completed.
             var next = _enqueued.Value + 1;
             // Wrap guard against the producer-local stale snapshot: apparent live depth past
             // int.MaxValue forces a snapshot refresh (the only time the producer touches the

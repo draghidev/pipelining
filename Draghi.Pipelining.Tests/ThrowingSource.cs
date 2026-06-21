@@ -18,7 +18,6 @@ sealed class ThrowingSourceState<T>
     public readonly Exception? DisposeThrow;
     public readonly TaskCompletionSource<bool>? WaitGate;
     public readonly CancellationTokenSource Cts = new();
-    public Action? OnEnqueue;
 
     public ThrowingSourceState(IEnumerable<T> items, Exception? waitThrow, Exception? disposeThrow, bool gateWait)
     {
@@ -41,13 +40,10 @@ readonly struct ThrowingSource<T> : IPipelineSource<T, ThrowingSource<T>.Enumera
     // Faults the gated empty-wait, landing a source fault while pre-loaded items are still in flight.
     public void TriggerWaitThrow(Exception ex) => _state.WaitGate!.SetException(ex);
 
-    public Enumerator GetAsyncEnumerator(Action? onEnqueue = null, CancellationToken cancellationToken = default)
+    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
     {
-        _state.OnEnqueue = onEnqueue;
-        // One depth increment per pre-loaded item (the source contract: exactly one onEnqueue per item
-        // later returned from MoveNextAsync), so CompleteItem never observes a negative remaining depth.
-        for (var i = 0; i < _state.Items.Count; i++)
-            onEnqueue?.Invoke();
+        // Depth is counted by the pipeline at dispatch (each TryGetNext success), so the source no
+        // longer pre-increments per pre-loaded item.
         return new Enumerator(_state);
     }
 
