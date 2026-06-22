@@ -1438,9 +1438,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// false if recovery is occupying this pipeline position (advancer must stop, recovery will resume knowing it held the advancer flag).
     /// <paramref name="emptyReached"/> propagates the deferred-empty signal up to the drain caller
     /// on the sync return-true paths so it fires after the advancer release. The async return-false
-    /// path goes through the continuation chain which still uses CompleteRecoveryWaiter inline
-    /// (residual race window, but DrainReadyWaiters' do-while reclaim downstream catches any
-    /// stranded queue counts; slot-mode stranding from recovery is the case handled here).
+    /// path now fires the depth-0 signal on EVERY branch: deferred completions thread emptyReached to
+    /// AdvanceAndDrainRecovery(emptyReached) (fires after the advancer release); the inline
+    /// CompleteRecoveryWaiter branches fire OnDepthReachedZero inline. (A queue-count reclaim window
+    /// remains benign - DrainReadyWaiters' do-while reclaim catches stranded counts downstream - but
+    /// the depth-0 idle signal is no longer among the things that can strand.)
     [MethodImpl(MethodImplOptions.NoInlining)]
     // The caller consumed the waiter task (the consume-before-republish ordering, see
     // DrainSlotInline) and hands over the extracted exception.
