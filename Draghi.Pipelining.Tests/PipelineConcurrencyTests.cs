@@ -840,12 +840,15 @@ public class PipelineConcurrencyTests
         }
     }
 
-    /// Regression guard for Enqueue's depth-ordering race. Enqueue's sequence was
-    /// _queue.Enqueue (publishes item) then IncrementDepth. If the executor's TryDequeue lands
-    /// between those two writes, CompleteWaiter decrements depth before Enqueue's increment,
-    /// producing a negative remainingDepth in policy.CompleteItem. Worse, the depth==0 transition
-    /// is observed at "-1 instead of 0" so OnDepthReachedZero never fires, potentially leaving
-    /// WaitForEmptyAsync waiters hanging. Fix: IncrementDepth BEFORE _queue.Enqueue.
+    /// Depth-accounting guard: no negative remainingDepth ever surfaces to policy.CompleteItem under
+    /// a tight enqueue burst. Historically this hunted a PRODUCER-side race - Enqueue published the
+    /// item then IncrementDepth, so the executor's TryDequeue could land between and decrement before
+    /// the increment (negative depth; OnDepthReachedZero observed at -1 instead of 0, hanging
+    /// WaitForEmptyAsync). That window is now structurally closed: depth is incremented at DISPATCH by
+    /// the single-consumer executor (commit b0e45260), so Enqueue no longer touches depth and there is
+    /// no producer race to fish for. What remains is the deterministic dispatch-increment /
+    /// completion-decrement accounting, identical per item - a small burst exercises it fully (the old
+    /// 1M-iteration brute force only re-ran the same single-consumer loop).
     [TestMethod]
     public async Task Enqueue_TightBurst_RemainingDepthNeverNegative()
     {
@@ -854,12 +857,17 @@ public class PipelineConcurrencyTests
             new DepthRecordingPolicy(observed));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        const int n = 1_000_000;
+        // A tight synchronous enqueue burst maximizes executor-wakeup churn (~130us/item here, far
+        // pricier than a lock-batched enqueue), so a few hundred items already exercises the dispatch-
+        // increment / completion-decrement accounting fully. (Was 1M, which only re-ran the same
+        // single-consumer loop now that the producer-side depth race is structurally closed.)
+        const int n = 500;
         for (var i = 0; i < n; i++)
             pipeline.Enqueue(new TestPipelineItem()).Execute();
 
-        await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(120));
+        await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
 
+        Assert.IsTrue(observed.Count >= n, $"expected a CompleteItem depth observation per item, got {observed.Count} for {n}.");
         var min = int.MaxValue;
         var max = int.MinValue;
         foreach (var d in observed)
@@ -868,7 +876,6 @@ public class PipelineConcurrencyTests
             if (d > max) max = d;
             Assert.IsTrue(d >= 0, $"negative remainingDepth observed: {d}. range [{min}, {max}]");
         }
-
     }
 
     /// CompleteAsync called while a recovery continuation is in flight. DrainOnCompletionAsync

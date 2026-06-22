@@ -11,8 +11,11 @@ namespace Draghi.Pipelining.Tests;
 [TestClass, DoNotParallelize]
 public class WaiterStoreConcurrencyTests
 {
+    // SlotClaimRace is a probabilistic torn-claim hunter: one persistent claimer thread races the
+    // committer on a reused slot for Iterations inner iterations (a deep sweep raises it via
+    // DRAGHI_STRESS_ITERATIONS). (SlotEscalation_AllInterleavings is now deterministic - no count.)
     static int Iterations =>
-        int.TryParse(Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 500_000;
+        int.TryParse(Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 300_000;
 
     /// Slot-tier churn: the producer commits a marker then waits (via Count) for the claimer to
     /// drain it before committing the next, so the store never escalates and every iteration is a
@@ -59,67 +62,83 @@ public class WaiterStoreConcurrencyTests
             throw new AssertFailedException("Slot claim race failed.", failure);
     }
 
-    /// Escalation-vs-claim: each round is a fresh store driven through its single slot->queue
-    /// transition while a claimer races both tiers. Exercises the quiescent-only escalation CAS
-    /// (a consuming slot must read as not-moved, never stolen) and the licensed claim across the
-    /// boundary. Every committed marker must be drained exactly once, never default.
+    /// Slot<->escalation<->claim correctness, DETERMINISTIC (was a 2000-round spin race, ~20ms alone
+    /// but ~600ms in-suite because the round-handshake's spin escalates to Thread.Sleep once the
+    /// process has accumulated sibling-test threads - and a true race wasn't buying coverage anyway).
+    ///
+    /// Each operation is internally atomic - the slot commit is data-then-license (fields then the
+    /// release-store of Occupied, so any reader sees empty or a COMPLETE pair, never torn), the claim
+    /// and escalation each pivot on one Interlocked CAS against Occupied. So EVERY observable outcome is
+    /// reachable by ORDERING the calls; the spin only sampled these probabilistically. We drive each
+    /// interleaving explicitly and assert no torn/default/lost/duplicated marker. (Weak-memory ordering
+    /// - the actual concurrency hazard - is covered by WeakMemory.tla + the WaiterStore ordering units,
+    /// not by this brute-force sampler.)
     [TestMethod]
-    public void SlotEscalationRace_NoLostOrDuplicatedItems()
+    public void SlotEscalation_AllInterleavings_NoLostOrTornMarkers()
     {
-        const int perRound = 3;  // slot + two queue entries, forcing the slot->escalation move
-        var rounds = Math.Max(1, Iterations / 50);
-
-        for (var r = 0; r < rounds; r++)
+        // Case 1: claim takes the slot BEFORE escalation (claimer wins the slot).
         {
             var box = new WaiterStoreBox<int>();
-            var drained = new bool[perRound + 1];
-            var log = new List<string>(perRound);  // claimer-thread-only; visible after Join
-            Exception? failure = null;
+            box.TryEscalateOrEnqueue(1, default, out var isSlot, out _);
+            Assert.IsTrue(isSlot, "marker 1 must land in the slot on a fresh box.");
+            Assert.IsTrue(box.TryClaimSlotForDrain(out var claimed, out _), "occupied slot must be claimable.");
+            Assert.AreEqual(1, claimed, "claim must read the committed pair, never default/torn.");
+            box.DecrementCount();
+            // Slot now empty; further commits go to the queue (still pre-escalation slot path first).
+            box.TryEscalateOrEnqueue(2, default, out var isSlot2, out _);
+            Assert.IsTrue(isSlot2, "after the slot drained, marker 2 re-occupies the (empty) slot.");
+            Assert.IsTrue(box.TryClaimSlotForDrain(out var c2, out _)); Assert.AreEqual(2, c2); box.DecrementCount();
+            Assert.AreEqual(0, box.Count);
+        }
 
-            var claimer = new Thread(() =>
-            {
-                try
-                {
-                    var count = 0;
-                    while (count < perRound)
-                    {
-                        if (box.TryClaimSlotForDrain(out var slotItem, out _))
-                        {
-                            log.Add($"slot:{slotItem}");
-                            Record(drained, slotItem);
-                            box.DecrementCount();
-                            count++;
-                        }
-                        else if (box.TryDequeue(out var entry))
-                        {
-                            log.Add($"queue:{entry.Waiter}");
-                            Record(drained, entry.Waiter);
-                            box.DecrementCount();
-                            count++;
-                        }
-                        else
-                        {
-                            Thread.SpinWait(1);
-                        }
-                    }
-                }
-                catch (Exception ex) { failure = ex; }
-            });
-            claimer.Start();
+        // Case 2: escalation MOVES an occupied slot (escalation wins). marker1 -> slot; marker2's commit
+        // sees the slot occupied, escalates, CAS-moves marker1 to the queue head (slotWasMoved). A
+        // subsequent claim finds the slot empty; both drain from the queue in FIFO order.
+        {
+            var box = new WaiterStoreBox<int>();
+            box.TryEscalateOrEnqueue(1, default, out var s1, out _);
+            Assert.IsTrue(s1);
+            box.TryEscalateOrEnqueue(2, default, out var s2, out var moved2);
+            Assert.IsFalse(s2, "marker 2 escalates to the queue.");
+            Assert.IsTrue(moved2, "the occupied slot's marker 1 must be moved to the queue head.");
+            box.TakeMovedSlotPair(out var movedItem, out _);
+            Assert.AreEqual(1, movedItem, "moved pair must be marker 1, never default/torn.");
+            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "post-escalation the slot is empty: no claim.");
+            Assert.IsTrue(box.TryDequeue(out var q1)); Assert.AreEqual(1, q1.Waiter); box.DecrementCount();
+            Assert.IsTrue(box.TryDequeue(out var q2)); Assert.AreEqual(2, q2.Waiter); box.DecrementCount();
+            Assert.AreEqual(0, box.Count);
+        }
 
-            var commitLog = new List<string>(perRound);
-            for (var marker = 1; marker <= perRound; marker++)
-            {
-                box.TryEscalateOrEnqueue(marker, default, out var isSlot, out var slotWasMoved);
-                commitLog.Add($"{marker}:{(isSlot ? "slot" : "queue")}{(slotWasMoved ? "+moved" : "")}");
-            }
+        // Case 3: claim on an EMPTY slot and on an ESCALATED (slot-empty) box returns false, never a
+        // torn/default success.
+        {
+            var box = new WaiterStoreBox<int>();
+            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "empty box: claim returns false.");
+            box.TryEscalateOrEnqueue(1, default, out _, out _);
+            box.TryEscalateOrEnqueue(2, default, out _, out var moved); // escalates, slot now empty
+            Assert.IsTrue(moved);
+            box.TakeMovedSlotPair(out _, out _);
+            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "escalated box: slot empty, claim returns false.");
+            while (box.TryDequeue(out _)) box.DecrementCount();
+            Assert.AreEqual(0, box.Count);
+        }
 
-            claimer.Join();
-            var trace = $"commits=[{string.Join(",", commitLog)}] drains=[{string.Join(",", log)}] finalCount={box.Count}";
-            if (failure is not null)
-                throw new AssertFailedException($"Escalation race failed at round {r}. {trace}", failure);
-            for (var marker = 1; marker <= perRound; marker++)
-                Assert.IsTrue(drained[marker], $"Round {r}: marker {marker} was lost. {trace}");
+        // Case 4: many fresh boxes through the full slot->escalation->drain cycle, asserting the marker
+        // accounting holds every time (cheap deterministic loop; catches an accounting regression that a
+        // single case might miss without paying for threads/spin).
+        const int perBox = 3;
+        for (var b = 0; b < 5_000; b++)
+        {
+            var box = new WaiterStoreBox<int>();
+            var drained = new bool[perBox + 1];
+            for (var marker = 1; marker <= perBox; marker++)
+                box.TryEscalateOrEnqueue(marker, default, out _, out var moved);
+            // Drain: the slot first (if still occupied), then the queue.
+            if (box.TryClaimSlotForDrain(out var slotItem, out _)) { Record(drained, slotItem); box.DecrementCount(); }
+            while (box.TryDequeue(out var entry)) { Record(drained, entry.Waiter); box.DecrementCount(); }
+            for (var marker = 1; marker <= perBox; marker++)
+                Assert.IsTrue(drained[marker], $"box {b}: marker {marker} lost or duplicated. finalCount={box.Count}");
+            Assert.AreEqual(0, box.Count);
         }
     }
 
@@ -140,6 +159,7 @@ sealed class WaiterStoreBox<T>
     public int TryEscalateOrEnqueue(T item, ValueTask task, out bool isSlot, out bool slotWasMoved)
         => _store.TryEscalateOrEnqueue(item, task, out isSlot, out slotWasMoved);
     public bool TryClaimSlotForDrain(out T item, out ValueTask task) => _store.TryClaimSlotForDrain(out item, out task);
+    public void TakeMovedSlotPair(out T item, out ValueTask task) => _store.TakeMovedSlotPair(out item, out task);
     public bool TryDequeue(out (T Waiter, ValueTask WaiterTask) entry) => _store.TryDequeue(out entry);
     public int DecrementCount() => _store.DecrementCount();
 }

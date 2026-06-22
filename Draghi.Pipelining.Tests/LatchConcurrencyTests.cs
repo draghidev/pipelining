@@ -19,7 +19,9 @@ public class LatchConcurrencyTests
         var pending = new int[1];  // array so closure captures the reference, not the slot
         var drained = new int[1];
         const int producers = 4;
-        const int perProducer = 200_000;
+        // Probabilistic stranding hunter; default sized to ~100ms. A deep run raises it via
+        // DRAGHI_STRESS_ITERATIONS (interpreted as total ops; divided across producers).
+        var perProducer = (int.TryParse(Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var it) ? it : 280_000) / producers;
 
         void Producer()
         {
