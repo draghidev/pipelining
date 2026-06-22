@@ -1518,10 +1518,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 return;
             }
 
-            if (!RecoverWaiterResult(recoveryItem, result, out _))
+            if (!RecoverWaiterResult(recoveryItem, result, out var emptyReached))
                 return; // pipeline task pending, continuation will resume
 
-            AdvanceAndDrainRecovery();
+            AdvanceAndDrainRecovery(emptyReached);
         });
         return false;
     }
@@ -1529,7 +1529,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// Handles a completed recovery execution result. Returns true if the advancer should continue,
     /// false if the recovery's pipeline task is pending (occupying this position).
     /// <paramref name="emptyReached"/> propagates the deferred-empty signal on the sync return-true
-    /// paths. Async return-false paths run through the continuation chain (documented gap).
+    /// paths. The async continuation paths (RecoverWaiter / the trailing continuation) now capture this
+    /// out-param and pass it to AdvanceAndDrainRecovery(emptyReached), which fires OnDepthReachedZero
+    /// after the advancer release - so a recovery that retires the last in-flight item no longer drops
+    /// the depth-0 idle signal (which previously hung a parked WaitForEmptyAsync).
     bool RecoverWaiterResult(T recoveryItem, PipelineItemResult result, out bool emptyReached)
     {
         emptyReached = false;
@@ -1568,10 +1571,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                         return;
                     }
 
-                    if (!RecoverWaiterPipelineTask(recoveryItem, pipelineTask, out _))
+                    if (!RecoverWaiterPipelineTask(recoveryItem, pipelineTask, out var emptyReached))
                         return; // pipeline task pending, lock still held
 
-                    AdvanceAndDrainRecovery();
+                    AdvanceAndDrainRecovery(emptyReached);
                 });
                 return false;
             }
@@ -1581,11 +1584,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     }
 
     /// Handles the recovery item's pipeline task. Returns true if done, false if pending.
-    /// <paramref name="emptyReached"/> propagates the deferred-empty signal to the caller on the
-    /// sync return-true path. The async return-false path goes through CompleteRecoveryWaiter
-    /// inline inside the continuation (documented gap, has the same race window but the
-    /// downstream AdvanceAndDrainRecovery -> DrainReadyWaiters' reclaim catches stranded queue
-    /// counts).
+    /// <paramref name="emptyReached"/> propagates the deferred-empty signal to the caller on the sync
+    /// return-true path; callers capture it and pass it to AdvanceAndDrainRecovery (fires
+    /// OnDepthReachedZero after the advancer release). The async return-false path completes via the
+    /// NON-deferred CompleteRecoveryWaiter inside its own continuation, which fires OnDepthReachedZero
+    /// inline - so the depth-0 signal is delivered on every path.
     bool RecoverWaiterPipelineTask(T recoveryItem, ValueTask pipelineTask, out bool emptyReached)
     {
         emptyReached = false;
@@ -1655,7 +1658,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// Called from recovery continuations to continue advancer activity after the recovery item
     /// completion. Delegates to AdvanceAndDrain whose loop exit signals the advancer-idle TCS.
-    void AdvanceAndDrainRecovery() => AdvanceAndDrain();
+    ///
+    /// <paramref name="emptyReached"/> carries the depth-0 crossing that happened INSIDE this
+    /// continuation's CompleteRecoveryWaiterDeferred (the deferred variant decremented depth to 0 but
+    /// did not fire OnDepthReachedZero - the continuation must). AdvanceAndDrain's own drain loops only
+    /// fire off a freshly-accumulated local emptyReached (from draining ANOTHER waiter); when this
+    /// recovery item was the LAST in-flight item there is nothing more to drain, so that local stays
+    /// false and the zero-crossing would be lost - hanging a parked WaitForEmptyAsync. Fire it here,
+    /// AFTER AdvanceAndDrain returns (the advancer is released by then, so the ordering matches the
+    /// deferred contract: never fire OnDepthReachedZero while the advancer is held).
+    void AdvanceAndDrainRecovery(bool emptyReached = false)
+    {
+        AdvanceAndDrain();
+        if (emptyReached)
+            _depthState.OnDepthReachedZero();
+    }
 
     /// Signals any drain that's waiting for the advancer chain to quiesce. Null check is the
     /// common case (no one waiting), only allocates a Volatile.Read + null compare.

@@ -145,6 +145,58 @@ public class PipelineRecoveryTests
         Assert.IsFalse(item.IsCompleted);
     }
 
+    // Regression: an ASYNC waiter-recovery that retires the LAST in-flight item must fire the depth-0
+    // idle signal, so a WaitForEmptyAsync armed BEFORE the terminal completion is woken. The bug: the
+    // recovery continuation completes the item via CompleteRecoveryWaiterDeferred (depth -> 0 without
+    // firing OnDepthReachedZero, by design) and discarded `emptyReached` via `out _`, so the zero-
+    // crossing was lost - hanging the parked WaitForEmptyAsync. Fix threads the bit to
+    // AdvanceAndDrainRecovery(emptyReached) which fires after the advancer release.
+    [TestMethod]
+    public async Task AsyncWaiterRecovery_LastItem_FiresDepthZeroForParkedWaitForEmpty()
+    {
+        // BOTH the recovery's EXECUTE and its PIPELINE task are async. Execute-async hooks the
+        // continuation at RecoverWaiter; when that continuation runs the pipeline task is STILL pending
+        // (CompleteAsync), so RecoverWaiterPipelineTask returns false and hooks the pipeline-task
+        // continuation. Completing the pipeline task LAST runs that continuation, which completes the
+        // recovery (the last item) via CompleteRecoveryWaiterDeferred (depth -> 0, no inline fire) and
+        // returned emptyReached through the `out` now threaded to AdvanceAndDrainRecovery. With both
+        // tasks sync the flow collapses into RecoverWaiter's synchronous return-true path (where
+        // emptyReached was never dropped); the async pipeline task is required to reach the dropped site.
+        var recovery = new TestPipelineItem { ExecuteAsync = true, CompleteAsync = true };
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        // One item, committed as a waiter, whose pipeline task faults -> waiter-side recovery.
+        var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
+        pipeline.Enqueue(item).Execute();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        // Arm WaitForEmptyAsync while depth > 0 (item still in flight): it must park, not complete.
+        var drainTask = pipeline.WaitForEmptyAsync();
+        Assert.IsFalse(drainTask.IsCompleted, "WaitForEmptyAsync must park while the waiter is in flight.");
+
+        // Fault the waiter -> RecoverWaiter dispatches the substitute, whose execute is async.
+        item.CompletePipelineTask();
+
+        // Barrier: wait until RecoverWaiter has actually called ExecuteItemAsync and is parked on the
+        // PENDING execute task (SignalExecuted fires right after GetExecuteTask). Without this the test
+        // can complete the execute task before RecoverWaiter checks IsCompletedSuccessfully, collapsing
+        // into the synchronous return-true path where emptyReached was never dropped.
+        await recovery.WaitForExecutedAsync();
+
+        // Now drive the async chain to the dropped site: complete execute (-> execute continuation;
+        // pipeline still pending -> hooks the pipeline-task continuation), then complete pipeline LAST so
+        // that continuation retires the last item via the deferred path, crossing depth -> 0.
+        recovery.CompleteExecuteTask();
+        recovery.CompletePipelineTask();
+
+        // Without the fix the depth-0 fire is dropped and this hangs.
+        await drainTask.AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
     [TestMethod]
     public async Task TrailingTaskFailure_RecoveryTakesOver()
     {
