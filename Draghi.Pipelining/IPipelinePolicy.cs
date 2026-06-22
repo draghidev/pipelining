@@ -35,8 +35,27 @@ public interface IPipelinePolicy<T>
     /// executor cannot exit its main loop and the pipeline's completion task will never complete.
     /// Idiomatic handling is to either throw <see cref="OperationCanceledException"/> on
     /// cancellation or return a faulted task.
+    /// <para>
+    /// <paramref name="waiterExecution"/> identifies which side issued this dispatch. False is the
+    /// EXECUTOR side: the pump's own dispatches and the recoveries driven inline on the executor
+    /// thread (<c>RecoverItem</c>, <c>RecoverTrailingFailure</c>, <c>RecoverCommittedTailWaiterAsync</c>),
+    /// all serialized by the executor loop. True is the WAITER side: the waiter-drain recovery
+    /// (<c>RecoverWaiter</c>), dispatched off the advancer chain when a committed waiter's pipeline
+    /// task faulted. The waiter side runs off the executor thread, so it can overlap an in-flight
+    /// executor dispatch - and THAT cross-side overlap is the hazard this flag exists for.
+    /// Waiter executions do not overlap EACH OTHER even though waiters complete out of order: the
+    /// advancer latch serializes them. It is held across the recovery dispatch (a synchronous recovery
+    /// inline; an async one hands the held flag to its completion continuation, which only re-drains
+    /// via <c>AdvanceAndDrainRecovery</c> after the execute settles), so a second waiter faulting
+    /// concurrently loses <c>TryAcquireOrFlagPending</c> and defers rather than dispatching. Hence at
+    /// most one waiter execution is ever in flight, overlapping only the single executor dispatch.
+    /// A policy that shares per-dispatch state across calls on the assumption of executor-loop
+    /// serialization (e.g. a pooled builder/promise reused because one dispatch completes before the
+    /// next starts) MUST NOT reuse that state for a waiter execution - it would collide with the
+    /// concurrent executor dispatch on the shared state.
+    /// </para>
     /// </remarks>
-    ValueTask<PipelineItemResult> ExecuteItemAsync(T item, CancellationToken cancellationToken);
+    ValueTask<PipelineItemResult> ExecuteItemAsync(T item, bool waiterExecution, CancellationToken cancellationToken);
 
     /// Signals the item that it is at the head of the pipeline.
     /// When <paramref name="preferAsync"/> is true, activation should be scheduled or guarded to avoid deep recursion.

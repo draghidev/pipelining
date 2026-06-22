@@ -198,7 +198,7 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
         _recoveryFactory = recoveryFactory;
     }
 
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
     {
         if (item.ThrowOnExecute is { } ex)
             throw ex;

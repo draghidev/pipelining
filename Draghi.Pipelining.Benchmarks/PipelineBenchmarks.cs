@@ -111,7 +111,7 @@ readonly struct BareItemHandle(BareItem item)
 
 struct BareHandlePolicy : IPipelinePolicy<BareItemHandle>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItemHandle item, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItemHandle item, bool waiterExecution, CancellationToken cancellationToken)
         => new(new PipelineItemResult(ValueTask.CompletedTask));
 
     public void ActivateHeadItem(BareItemHandle item, bool preferAsync = true) { }
@@ -147,7 +147,7 @@ sealed class BareItem
 /// </summary>
 struct BarePolicy : IPipelinePolicy<BareItem>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItem item, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItem item, bool waiterExecution, CancellationToken cancellationToken)
     {
         return new(new PipelineItemResult(ValueTask.CompletedTask));
     }

@@ -276,7 +276,7 @@ sealed class ValueItemPool
 
 readonly struct ValueItemPolicy(ValueItemPool pool) : IPipelinePolicy<ValueItem>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(ValueItem item, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(ValueItem item, bool waiterExecution, CancellationToken cancellationToken)
         => new(new PipelineItemResult(default, pool.Get(item.Id).GetPipelineTask()));
 
     public void ActivateHeadItem(ValueItem item, bool preferAsync = true) => pool.Get(item.Id).Activate();
@@ -298,7 +298,7 @@ readonly record struct LargeValueItem(long A, long B, long C, long D);
 
 readonly struct LargeValueItemPolicy(ValueItemPool pool, Action<long, long, long, long>? onComplete = null) : IPipelinePolicy<LargeValueItem>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(LargeValueItem item, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(LargeValueItem item, bool waiterExecution, CancellationToken cancellationToken)
         => new(new PipelineItemResult(default, default));
 
     public void ActivateHeadItem(LargeValueItem item, bool preferAsync = true) { }

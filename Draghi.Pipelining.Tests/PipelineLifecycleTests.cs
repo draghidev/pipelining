@@ -476,7 +476,7 @@ public class PipelineLifecycleTests
 
         public DepthCapturingPolicy(List<int> depths) => _depths = depths;
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             return new(new PipelineItemResult(default));
@@ -525,7 +525,7 @@ public class PipelineLifecycleTests
         readonly Action _onExecute;
         public ReentrantCompletePolicy(Action onExecute) => _onExecute = onExecute;
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             _onExecute();
@@ -555,7 +555,7 @@ public class PipelineLifecycleTests
             _executeTokenSink = executeTokenSink;
         }
 
-        public async ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        public async ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             if (_executeTokenSink is not null)

@@ -423,7 +423,7 @@ public class PipelineConcurrencyTests
 
         public ActivationOrderRecordingPolicy(System.Collections.Concurrent.ConcurrentQueue<int> order) => _order = order;
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();
@@ -805,7 +805,7 @@ public class PipelineConcurrencyTests
 
     struct ReentrantPolicy(ReentrantBox box) : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             return new(new PipelineItemResult(default));
@@ -830,7 +830,7 @@ public class PipelineConcurrencyTests
 
     struct ActivationOrderingPolicy : IPipelinePolicy<ActivationOrderingItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(ActivationOrderingItem item, CancellationToken cancellationToken) => item.RunExecute();
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(ActivationOrderingItem item, bool waiterExecution, CancellationToken cancellationToken) => item.RunExecute();
         public void ActivateHeadItem(ActivationOrderingItem item, bool preferAsync = true) => item.RunActivate();
         public void CompleteItem(ActivationOrderingItem item, int remainingDepth, Exception? exception) => item.RunComplete();
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, ActivationOrderingItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ActivationOrderingItem? recoveryItem)
@@ -1482,7 +1482,7 @@ public class PipelineConcurrencyTests
             _observed = observed;
         }
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();

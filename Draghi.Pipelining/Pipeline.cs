@@ -332,7 +332,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
                 try
                 {
-                    itemResult = await _policy.ExecuteItemAsync(item, _enumerator.CompletionToken).ConfigureAwait(false);
+                    itemResult = await _policy.ExecuteItemAsync(item, waiterExecution: false, _enumerator.CompletionToken).ConfigureAwait(false);
                 }
                 catch (Exception ex)
                 {
@@ -570,7 +570,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, waiterExecution: false, _enumerator.CompletionToken).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
                 await result.TrailingExecutionTask.ConfigureAwait(false);
@@ -665,7 +665,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken).ConfigureAwait(false);
+            var result = await _policy.ExecuteItemAsync(recoveryItem, waiterExecution: false, _enumerator.CompletionToken).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
             {
@@ -829,7 +829,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         PipelineItemResult result;
         try
         {
-            result = await _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken).ConfigureAwait(false);
+            result = await _policy.ExecuteItemAsync(recoveryItem, waiterExecution: false, _enumerator.CompletionToken).ConfigureAwait(false);
         }
         catch (Exception recoveryEx)
         {
@@ -1472,7 +1472,10 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         ValueTask<PipelineItemResult> executeTask;
         try
         {
-            executeTask = _policy.ExecuteItemAsync(recoveryItem, _enumerator.CompletionToken);
+            // waiterExecution: this is the waiter-drain recovery (RecoverWaiter off the advancer chain
+            // via OnWaiterTaskCompleted). It can run on a non-pump thread, concurrently with the
+            // executor's own next dispatch, so a policy must not share single-pump per-dispatch state.
+            executeTask = _policy.ExecuteItemAsync(recoveryItem, waiterExecution: true, _enumerator.CompletionToken);
         }
         catch (Exception recoveryEx)
         {

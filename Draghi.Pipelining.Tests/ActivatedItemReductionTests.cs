@@ -140,7 +140,7 @@ public class ActivatedItemReductionTests
             _holder = holder;
         }
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(SyntheticItem item, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(SyntheticItem item, bool waiterExecution, CancellationToken cancellationToken)
             => new(new PipelineItemResult(default, item.GetPipelineTask()));
 
         public void ActivateHeadItem(SyntheticItem item, bool preferAsync = true)
