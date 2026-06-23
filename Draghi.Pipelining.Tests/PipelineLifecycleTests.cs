@@ -221,18 +221,30 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 5;
+        // CompleteAsync holds each item's pipeline task pending, so every item dispatches and stays
+        // in-flight (becomes a tail-waiter) without completing - in-flight Depth climbs to count. Under
+        // in-flight depth the default sync-completing item drains before the next dispatches (Depth
+        // caps at 1); holding the tasks pins all count items in-flight at once so the reported sequence
+        // is deterministic.
         var items = new TestPipelineItem[count];
         for (var i = 0; i < count; i++)
         {
-            items[i] = new TestPipelineItem();
+            items[i] = new TestPipelineItem { CompleteAsync = true };
             pipeline.Enqueue(items[i]).Execute();
         }
 
+        // Wait until all count items are dispatched and in-flight (Depth == count).
         for (var i = 0; i < count; i++)
-            await items[i].WaitForCompleteAsync();
+            await items[i].WaitForExecutedAsync();
 
-        // Each completion reports the depth *after* the decrement: count-1, count-2, ..., 0.
-        Assert.AreEqual(count, depths.Count);
+        // Release head-first, one fully before the next, so completions don't interleave. Each
+        // completion reports the in-flight depth AFTER its own decrement: count-1, count-2, ..., 0.
+        for (var i = 0; i < count; i++)
+        {
+            items[i].CompletePipelineTask();
+            await items[i].WaitForCompleteAsync();
+        }
+
         var expected = new int[count];
         for (var i = 0; i < count; i++)
             expected[i] = count - 1 - i;
@@ -479,7 +491,9 @@ public class PipelineLifecycleTests
         public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
-            return new(new PipelineItemResult(default));
+            // Carry the item's pipeline task so CompleteAsync items pend (held in-flight) until
+            // CompletePipelineTask releases them; default(CompleteAsync=false) stays sync-complete.
+            return new(new PipelineItemResult(item.GetPipelineTask()));
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();

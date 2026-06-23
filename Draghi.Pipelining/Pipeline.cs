@@ -177,8 +177,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     Lock? _activationLock;
 
 
-    /// <summary>Current count of items in the pipeline (queued + in flight + waiting). Lock-free read,
-    /// may be stale by the time the caller observes it. Use <see cref="WaitForEmptyAsync"/> to await depth zero.</summary>
+    /// <summary>Current in-flight count: items dispatched by the executor but not yet completed.
+    /// Excludes the source backlog (enqueued but not yet dispatched); a queue-backed pipeline exposes
+    /// that as <see cref="QueuedPipeline{T,TPolicy}.Backlog"/>, and <c>Depth + Backlog</c> is the total
+    /// outstanding. Lock-free read, may be stale by the time the caller observes it. Use
+    /// <see cref="WaitForEmptyAsync"/> to await empty (both halves zero).</summary>
     public int Depth => _depthState.Depth;
 
     /// <summary>
@@ -950,19 +953,22 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // the zero-signal comparison miss forever (a stranded WaitForEmptyAsync). The comparison stays
         // `is 0` deliberately: <= would mask the same corruption by double-signaling.
         Debug.Assert(depth >= 0, "Pipeline depth under-ran: double completion for a single enqueue.");
-        // Release the ActivatedItem slot only at the in-order retirement terminal: when this completion
-        // drains the pipeline to empty (depth 0). CompleteItem is the single in-order retirement seam,
-        // and the slot retires off it like depth and the policy's per-item resources. Correct and
-        // uniform across reference and value T via two properties:
-        //   - No stomp. Completion is strictly head-ordered (the store drains head-first, and the sync
-        //     fast-path is gated on _waiters.Count is 0), so any completion that is NOT the slot's owner
-        //     is an earlier item completing while the newest-activated owner is still live. Clearing
-        //     only at depth 0 means it never nulls the live owner's slot.
-        //   - Never null while live. The field's contract (see the ActivatedItem remarks) is that a
-        //     stale non-null reference between completion and the next activation is safe and preferred
-        //     over a transient null: the sole reader (PgDecoder.CurrentExecutionControl) reads the slot
-        //     only during an active read, never in that gap, so a transient null while live is the real
-        //     NRE hazard. depth-0 clears only when nothing is live, so it never produces that null.
+        // Release the ActivatedItem slot when this completion drains in-flight depth to 0. CompleteItem
+        // is the single in-order retirement seam, and the slot retires off it like depth and the
+        // policy's per-item resources. Correct and uniform across reference and value T:
+        //   - No stomp. Completion is strictly head-ordered (the store drains head-first, the sync
+        //     fast-path is gated on _waiters.Count is 0), so a completion that is NOT the slot's owner
+        //     is an earlier item completing while the newest-activated owner is still live. The depth-0
+        //     gate fires only for the LAST in-flight item, whose own body has already finished, so it
+        //     never nulls a live owner's slot.
+        //   - Null only outside an activated read. Under in-flight depth, depth 0 is also hit at every
+        //     inter-item gap (an item sync-completes while the source still has backlog), so this DOES
+        //     transiently null the slot between a completion and the next item's activation. That is
+        //     safe: the sole reader (PgDecoder.CurrentExecutionControl) reads the slot only while an
+        //     activated flow's own body is mid-decode, never in that gap, and ActivateHeadItem
+        //     publishes the slot before dispatching the next body. The field's contract prefers a stale
+        //     non-null reference in the gap over a null, which the depth-0 clear honors WITHIN an
+        //     activated tenure (it never nulls a live owner) even though it nulls in the dead gap.
         //     (Identity or a per-item generation would clear promptly but reintroduce null-while-live.)
         //     Struct-T safe by construction - a plain counter, no reference identity to box.
         if (depth is 0)

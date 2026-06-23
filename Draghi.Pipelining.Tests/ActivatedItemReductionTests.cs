@@ -132,12 +132,14 @@ public class ActivatedItemReductionTests
         readonly ActivationProbe _probe;
         readonly bool _activateOnTp;
         readonly PipelineHolder? _holder;
+        readonly bool _holdRelease;
 
-        public ProbePolicy(ActivationProbe probe, bool activateOnTp, PipelineHolder? holder = null)
+        public ProbePolicy(ActivationProbe probe, bool activateOnTp, PipelineHolder? holder = null, bool holdRelease = false)
         {
             _probe = probe;
             _activateOnTp = activateOnTp;
             _holder = holder;
+            _holdRelease = holdRelease;
         }
 
         public ValueTask<PipelineItemResult> ExecuteItemAsync(SyntheticItem item, bool waiterExecution, CancellationToken cancellationToken)
@@ -145,6 +147,26 @@ public class ActivatedItemReductionTests
 
         public void ActivateHeadItem(SyntheticItem item, bool preferAsync = true)
         {
+            if (_holdRelease)
+            {
+                // Activate now, then complete the pipeline task after a brief delay on a separate TP
+                // thread. The delay lets the executor dispatch and activate SUBSEQUENT items before
+                // this one completes, so depth climbs above 1 AND activation/completion interleave: an
+                // earlier item completes while a later one is the live activated owner - the exact
+                // live-later-owner stomp the production NRE came from. (Holding all then releasing all
+                // would separate the two phases and never interleave them.) The assert site is the
+                // test's continuous framework-slot sampler.
+                _probe.Activate(item);
+                ThreadPool.UnsafeQueueUserWorkItem(static s =>
+                {
+                    var item = (SyntheticItem)s!;
+                    var spin = new SpinWait();
+                    for (var r = 0; r < 40; r++)
+                        spin.SpinOnce();
+                    item.PipelineTcs.TrySetResult();
+                }, item, preferLocal: false);
+                return;
+            }
             if (_activateOnTp && preferAsync)
             {
                 _probe.RegisterPendingRead();
@@ -337,51 +359,89 @@ public class ActivatedItemReductionTests
     [TestMethod] public Task TenureReuse_Cas_ReleaseBeforeComplete() => RunReuseBatch(1, 10, 150, NullPolicy.DepthZeroWithCas);
 
     // The framework's own _activatedItem slot (read by Slon via Control.ActivatedFlow), under
-    // pipelined TP-dispatch load. The contract: never transient-null while the pipeline is live - a
-    // null read by the decoder mid-pipeline is the production NRE. We sample (ActivatedItem, Depth)
-    // off-thread across a single non-refilling batch; once the slot has gone non-null (first
-    // activation), it must never read null again while Depth > 0 - it may only return to default at
-    // the depth-0 retirement terminal. depth-0 holds this (it clears only at depth 0); the
-    // unconditional clear that shipped the NRE nulls the slot on every intermediate completion and
-    // is caught here. Stash-validated: fails with the unconditional clear, passes with depth-0.
+    // pipelined load with MANY items concurrently in-flight. The production contract: the sole reader
+    // (PgDecoder.CurrentExecutionControl) reads the slot only while an activated flow's own body is
+    // mid-decode. A null (or a foreign item) observed while the slot's live owner is still mid-drain
+    // is the production NRE - NoStomp (an earlier item's completion nulling a live later owner's slot).
+    // A null in the inter-item gap (a completion drove in-flight Depth to 0 while backlog remained) is
+    // SAFE: no flow body reads there, and the depth-0 clear only fires for the last in-flight item.
+    //
+    // Two pieces make this reproduce + discriminate under in-flight Depth:
+    //   - holdRelease: each item activates then self-completes its pipeline task after a brief delay,
+    //     so the executor dispatches and activates the next item before this one completes - Depth
+    //     climbs above 1 (real pipelining), not the Depth=1 of serial sync-completion, AND completions
+    //     interleave with later activations across threads, the only regime where a stomp is reachable.
+    //   - A continuous off-thread sampler (frequent sampling catches the brief transient stomp the
+    //     original test caught) that brackets each suspect read against the LAST-SEEN owner's tenure:
+    //     a hazard is null/foreign-slot while that owner is not yet Completed, re-confirmed by the
+    //     owner staying incomplete across a bounded settle (a safe retirement lag flips Completed; the
+    //     framework's clear-before-Completed order makes the raw sample ambiguous, the re-confirm
+    //     resolves it). Depth is NOT used as the liveness proxy - under in-flight it dips to 0 between
+    //     items and would false-positive the safe gap.
     static async Task RunSlotNeverNullWhileLive(int items, int batches)
     {
         for (var b = 0; b < batches; b++)
         {
             var probe = new ActivationProbe { Policy = NullPolicy.NeverNull };
-            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp: true));
+            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp: true, holdRelease: true));
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
-            for (var i = 0; i < items; i++)
-                pipeline.Enqueue(new SyntheticItem { Id = i }).Execute();
 
             var violations = 0;
-            var seen = false;
             var stop = false;
             var sampler = Task.Run(() =>
             {
+                SyntheticItem? owner = null;
                 while (!Volatile.Read(ref stop))
                 {
-                    // Read slot BEFORE depth: if the slot is non-null we're done; if it's null we then
-                    // read depth. A depth > 0 observed AFTER a null slot (with the slot still settling)
-                    // is conservative - it can only over-report, and depth-0 never produces a null here
-                    // mid-batch, so a clean run proves the property.
                     var slot = pipeline.Pipeline.ActivatedItem;
                     if (slot is not null)
-                        seen = true;
-                    else if (seen && pipeline.Depth > 0)
+                    {
+                        owner = slot;
+                        continue;
+                    }
+                    if (owner is not { CurrentTenure.Completed: false })
+                        continue;
+                    // Slot is null with the last-seen owner not yet Completed. Two causes:
+                    //   - SAFE retirement lag: the framework clears the slot a couple of instructions
+                    //     BEFORE CompleteItem marks THIS owner Completed, so the flag flips almost
+                    //     immediately.
+                    //   - HAZARD (stomp): a FOREIGN item's completion nulled the slot while this owner
+                    //     is genuinely live; this owner stays mid-drain until its own (much later)
+                    //     completion.
+                    // The owner's body delay (holdRelease) is far longer than the lag, so a TIGHT
+                    // re-confirm window separates them: the lag resolves within a few spins; a stomp
+                    // leaves the owner incomplete past the window. (A generous window would wait out the
+                    // owner's real completion and false-negative every stomp.)
+                    var tenure = owner.CurrentTenure;
+                    var spin = new SpinWait();
+                    var hazard = true;
+                    for (var r = 0; r < 8 && hazard; r++)
+                    {
+                        if (tenure.Completed)
+                            hazard = false;
+                        else
+                            spin.SpinOnce();
+                    }
+                    if (hazard)
                         Interlocked.Increment(ref violations);
                 }
             });
+
+            // Enqueue with the sampler already running. Each item activates then self-completes after a
+            // brief delay (holdRelease), so depth climbs above 1 and completions interleave with later
+            // activations across threads.
+            for (var i = 0; i < items; i++)
+                pipeline.Enqueue(new SyntheticItem { Id = i }).Execute();
 
             await pipeline.CompleteAsync();
             Volatile.Write(ref stop, true);
             await sampler;
 
             if (Volatile.Read(ref violations) > 0)
-                Assert.Fail($"batch={b} items={items}: framework ActivatedItem slot read null while live (Depth>0) " +
-                            $"{Volatile.Read(ref violations)}x - a transient-null-while-live the decoder would NRE on.");
+                Assert.Fail($"batch={b} items={items}: framework ActivatedItem slot read null while its live owner's " +
+                            $"tenure was mid-drain {Volatile.Read(ref violations)}x - the production NRE.");
         }
     }
 
-    [TestMethod] public Task FrameworkSlot_NeverNullWhileLive_Pipelined() => RunSlotNeverNullWhileLive(400, 40);
+    [TestMethod] public Task FrameworkSlot_NeverNullWhileLive_Pipelined() => RunSlotNeverNullWhileLive(60, 8);
 }
