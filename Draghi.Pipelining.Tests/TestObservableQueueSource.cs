@@ -30,6 +30,8 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
 
     public CancellationToken CancellationToken => _state.CancellationToken;
 
+    public int Backlog => _state.Queue.Count;
+
     public EnqueueResult Enqueue(T item)
     {
         if (_state.WakeSignal.IsCompleted)

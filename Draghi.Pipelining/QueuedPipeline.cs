@@ -50,7 +50,7 @@ public sealed class QueuedPipeline<T, TPolicy>
     public ValueTask CompleteAsync(Exception? exception = null) => Pipeline.CompleteAsync(exception);
 
     internal ValueTask WaitForEmptyAsync(CancellationToken cancellationToken = default)
-        => Pipeline.WaitForEmptyAsync(cancellationToken);
+        => Pipeline.WaitForEmptyAsync(Source.Backlog, cancellationToken);
 
     /// <summary>Returns an enumerator over items currently in the pipeline.</summary>
     public Pipeline<T, TPolicy, UnboundedQueueSource<T>, UnboundedQueueSource<T>.Enumerator>.Enumerator GetEnumerator()

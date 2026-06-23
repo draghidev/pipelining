@@ -182,19 +182,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     public int Depth => _depthState.Depth;
 
     /// <summary>
-    /// Waits for the pipeline depth to reach zero (all items have received
-    /// <see cref="IPipelinePolicy{T}.CompleteItem"/>). Does not prevent new items from being yielded
-    /// by the source.
+    /// Waits for the pipeline to be empty: both in-flight (<see cref="Depth"/>) and backlog
+    /// (enqueued but not yet dispatched) at zero. Does not prevent new items from being yielded by
+    /// the source.
     /// </summary>
     /// <remarks>
-    /// This is a pipeline-state query, not an executor-quiescence guarantee. The signal fires from
-    /// inside <see cref="IPipelinePolicy{T}.CompleteItem"/>, so the executor may still be inside its
-    /// inner drain loop and threadpool-resident advancer continuations may still be unwinding when
-    /// this returns. For strict "fully quiet" GC-collectability semantics use
-    /// <see cref="CompleteAsync"/>.
+    /// Depth counts in-flight only (dispatched - completed), so the backlog half is invisible to the
+    /// generic pipeline: the caller passes the current backlog snapshot from its source. A
+    /// queue-backed wrapper (<see cref="QueuedPipeline{T,TPolicy}"/>) supplies its source's queue
+    /// length. The completion fires from inside <see cref="IPipelinePolicy{T}.CompleteItem"/> or from
+    /// the executor's genuine-suspend seam, so the executor may still be inside its inner drain loop
+    /// and threadpool-resident advancer continuations may still be unwinding when this returns. For
+    /// strict "fully quiet" GC-collectability semantics use <see cref="CompleteAsync"/>.
     /// </remarks>
-    internal ValueTask WaitForEmptyAsync(CancellationToken cancellationToken = default)
-        => _depthState.GetIdleTask(cancellationToken);
+    internal ValueTask WaitForEmptyAsync(int backlog, CancellationToken cancellationToken = default)
+        => _depthState.GetIdleTask(backlog, cancellationToken);
 
     /// <summary>
     /// Initiates pipeline shutdown. First-writer wins: subsequent calls return the same execution task.
@@ -298,7 +300,21 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                         item = default!;
                     itemResult = default;
-                    if (!await _enumerator.WaitForNextAsync())
+
+                    // Drain-empty fire. The backlog half of "empty" (enqueued - dispatched == 0) is
+                    // only observable to the single consumer, and only at the moment it commits to a
+                    // genuine suspend: WaitForNextAsync re-checked the source empty under the wake
+                    // lock and armed (Awaiter.IsCompleted == false). A synchronous resolve
+                    // (retry/completed, IsCompleted == true) means an item may be present, so no fire.
+                    // At a genuine arm with Depth 0, in-flight is also empty: fire the drain waiter.
+                    // OnDepthReachedZero revalidates Depth and is idempotent against a racing completer.
+                    // A producer that enqueues after the arm trips Signal, which claims this wait and
+                    // wakes us, so there is no parked state with an item queued and unsignalled.
+                    var wait = _enumerator.WaitForNextAsync();
+                    var waitAwaiter = wait.GetAwaiter();
+                    if (!waitAwaiter.IsCompleted && _depthState.Depth is 0)
+                        _depthState.OnDepthReachedZero();
+                    if (!await wait)
                         break;
                     continue;
                 }
@@ -2146,20 +2162,27 @@ public static class Pipeline
         }
 
         /// <summary>
-        /// Returns a task that completes when depth reaches 0 (momentarily; see remarks on the
-        /// containing type). Publish-arm-recheck; single-caller API.
+        /// Returns a task that completes when the pipeline is empty (momentarily; see remarks on the
+        /// containing type). Empty has two halves: in-flight (Depth) and backlog (enqueued but not
+        /// dispatched). DepthState owns only the in-flight half, so the caller passes the current
+        /// backlog snapshot; both must read zero for a synchronous empty. The armed TCS is fired by
+        /// the executor at the genuine-suspend seam (its authoritative backlog == 0 observation) or by
+        /// a completer crossing Depth to zero while the executor is already parked-empty. Publish-arm-
+        /// recheck; single-caller API.
         /// </summary>
-        public ValueTask GetIdleTask(CancellationToken cancellationToken)
+        public ValueTask GetIdleTask(int backlog, CancellationToken cancellationToken)
         {
-            if (Depth is 0)
+            if (backlog is 0 && Depth is 0)
                 return ValueTask.CompletedTask;
 
             var newTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             // The publish IS the arm: the CAS is the full-fence RMW, so the re-check below is ordered
             // after it. A completer that hit zero before observing the publish skipped its fire, and
-            // the re-check catches that case and self-signals.
+            // the re-check catches that case and self-signals. The backlog snapshot gates the self-
+            // fire: a backlog seen non-empty at the call means an item is still queued, so the
+            // executor's park-seam fire (not this synchronous path) resolves the wait when it drains.
             var tcs = Interlocked.CompareExchange(ref _drainTcs, newTcs, null) ?? newTcs;
-            if (Depth is 0)
+            if (backlog is 0 && Depth is 0)
                 SignalDrainWaiter();
 
             return new(tcs.Task.WaitAsync(cancellationToken));

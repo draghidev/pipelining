@@ -44,7 +44,7 @@ sealed class ObservablePipeline<T, TPolicy>
     public ValueTask CompleteAsync(Exception? exception = null) => Pipeline.CompleteAsync(exception);
 
     public ValueTask WaitForEmptyAsync(CancellationToken cancellationToken = default)
-        => Pipeline.WaitForEmptyAsync(cancellationToken);
+        => Pipeline.WaitForEmptyAsync(Source.Backlog, cancellationToken);
 
     public Pipeline<T, TPolicy, TestObservableQueueSource<T>, TestObservableQueueSource<T>.Enumerator>.Enumerator GetEnumerator()
         => Pipeline.GetEnumerator();
