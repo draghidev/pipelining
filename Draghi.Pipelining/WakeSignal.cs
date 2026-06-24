@@ -93,11 +93,22 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
         // "uncontended wake path" ordering was the bug). The woken producer's Signal briefly
         // spins on the lock until this release - correctness over a few ns.
         _suspendedMres?.Set();
+        // Park notification for a source that must react to WHICH item the pull parked on (e.g. a
+        // FIFO sync-handoff source signalling the specific waiter whose item the executor fake-missed
+        // on). Invoked under the wake lock so the source's read of its own state + its waiter signal
+        // are ordered against a concurrent claim's Reset, same as the suspension observation above.
+        OnSuspended?.Invoke();
         ReleaseWakeLock();
 
         if (IsCompleted)
             SignalCore(runContinuationsAsynchronously: true);
     }
+
+    /// Invoked under the wake lock each time the consumer's wait arms (the suspension point), after
+    /// the suspension observation is set. A source sets this when it needs to react to the executor
+    /// parking - typically to signal a specific waiter that the pull fake-missed on its item.
+    /// Generalized building-block hook; null for sources without a park-reactive waiter protocol.
+    public Action? OnSuspended { get; set; }
 
     /// <summary>
     /// Blocks until the consumer's wait is armed and its continuation registered (the suspension
