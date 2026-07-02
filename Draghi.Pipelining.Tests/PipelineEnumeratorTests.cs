@@ -16,21 +16,18 @@ public class PipelineEnumeratorTests
         source.Enqueue(2);
         source.Enqueue(3);
 
-        using var cts = new CancellationTokenSource(TimeSpan.FromMilliseconds(200));
+        using var cts = new CancellationTokenSource();
 
         var adapter = new PipelineSourceAsyncEnumerable<int, UnboundedQueueSource<int>, UnboundedQueueSource<int>.Enumerator>(source);
         var observed = new List<int>();
-        try
+        // The source is never completed. Cancel after the third item so the enumerator's token
+        // registration completes the wake signal and the loop exits instead of parking forever.
+        await foreach (var item in adapter.WithCancellation(cts.Token))
         {
-            await foreach (var item in adapter)
-            {
-                observed.Add(item);
-                if (observed.Count == 3)
-                    cts.Cancel();
-                cts.Token.ThrowIfCancellationRequested();
-            }
+            observed.Add(item);
+            if (observed.Count == 3)
+                cts.Cancel();
         }
-        catch (OperationCanceledException) { }
 
         CollectionAssert.AreEqual(new[] { 1, 2, 3 }, observed);
     }
