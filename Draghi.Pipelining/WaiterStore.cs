@@ -23,8 +23,8 @@ namespace Draghi.Pipelining;
 [StructLayout(LayoutKind.Auto)]
 struct WaiterStore<T>
 {
-    // Tri-state slot word, the latch's medicine applied to the slot (backlog #7 fix, verified
-    // Pipeline.tla TriStateSlotClaim). 0 empty / 1 occupied / 2 consuming. The two-state word
+    // Tri-state slot word, the latch's medicine applied to the slot.
+    // 0 empty / 1 occupied / 2 consuming. The two-state word
     // (empty/occupied) plus the SPSC fields tore: a claim Exchange that won between a successor
     // commit's flag publish and its field writes read a torn or stale pair. The consuming state
     // brackets the drainer's read+clear so neither a successor commit nor the escalation move can
@@ -37,12 +37,18 @@ struct WaiterStore<T>
     T _slotItem;
     ValueTask _slotTask;
     int _slotState;
+    // The moved task's completion, read under the escalation's won slot claim (the last point the
+    // producer may legally touch the task). Executor-only: written by TryEscalateOrEnqueue's move,
+    // read by the same thread's TakeMovedSlotPair.
+    bool _movedWasCompleted;
     SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)>? _queue;
     int _count; // Combined slot + queue.
 
     /// Total committed waiters (slot + queue). Volatile-read, reflecting the latest committed
-    /// increment/decrement across executor and advancer threads.
-    public int Count => Volatile.Read(ref _count);
+    /// increment/decrement across executor and advancer threads. Clamped at zero: the internal
+    /// count dips to a bounded -1 transient (see DecrementCount) that no consumer needs to
+    /// observe - the negative never leaves this type.
+    public int Count => Math.Max(Volatile.Read(ref _count), 0);
 
     /// True once the store has escalated to the queue tier. Stable after first true.
     public bool IsEscalated => Volatile.Read(ref _queue) is not null;
@@ -91,6 +97,13 @@ struct WaiterStore<T>
             slotWasMoved = Interlocked.CompareExchange(ref _slotState, SlotEmpty, SlotOccupied) == SlotOccupied;
             if (slotWasMoved)
             {
+                // Capture the moved task's completion NOW, while the won CAS still confers
+                // exclusive ownership: the enqueue below publishes the pair to the queue head
+                // where a drain may claim and consume it, ending the task token's lifetime -
+                // after that no producer-side read of the task is legal. The caller's
+                // compensation decision (activate vs leave for drain) consumes this captured
+                // verdict via TakeMovedSlotPair.
+                _movedWasCompleted = _slotTask.IsCompleted;
                 queue.Enqueue((_slotItem, _slotTask));
                 // Fields deliberately NOT cleared here: the caller pulls its copy of the moved
                 // pair via TakeMovedSlotPair (compensation check needs the identity, and the
@@ -106,13 +119,16 @@ struct WaiterStore<T>
     }
 
     /// Executor-only, immediately after a slotWasMoved = true return from
-    /// <see cref="TryEscalateOrEnqueue"/>: hands over the moved pair (for the chain-arm
-    /// compensation check) and clears the slot fields. Must be called exactly once per
+    /// <see cref="TryEscalateOrEnqueue"/>: hands over the moved item's identity and the
+    /// completion verdict captured at the escalation claim (for the chain-arm compensation
+    /// check), and clears the slot fields. The task itself is deliberately NOT handed out: the
+    /// pair is published at the queue head and a drain may consume it at any moment, so no
+    /// producer-side read of it is legal past the claim. Must be called exactly once per
     /// slotWasMoved so a cached-but-idle shell doesn't pin the moved references.
-    public void TakeMovedSlotPair(out T item, out ValueTask task)
+    public void TakeMovedSlotPair(out T item, out bool wasCompletedAtMove)
     {
         item = _slotItem;
-        task = _slotTask;
+        wasCompletedAtMove = _movedWasCompleted;
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _slotItem = default!;
         _slotTask = default;
@@ -123,7 +139,7 @@ struct WaiterStore<T>
     /// elsewhere (escalation or a concurrent drainer). The caller is responsible for decrementing
     /// the count via <see cref="DecrementCount"/> after processing.
     ///
-    /// Tri-state protocol (backlog #7 fix): peek the task under the stable Occupied state - a
+    /// Tri-state protocol: peek the task under the stable Occupied state. A
     /// 1 -> 0 -> 1 cycle is impossible (the only droppers are this latch-serialized claimer and
     /// the escalation, which drops permanently), so the field read is licensed. A still-running
     /// task bails with NO state change: the occupant's wired callback drains it on completion, so
@@ -150,13 +166,26 @@ struct WaiterStore<T>
         return false;
     }
 
-    /// Decrement the combined count. Returns the new value.
+    /// Accounts one consumed entry against the combined count. Returns TRUE when this decrement
+    /// drained the store (no successor's commit counted before it), FALSE when a successor's
+    /// commit-increment preceded it. The raw count and its skew floor are internal: a consumer
+    /// taking a visible-but-uncounted entry (the committer is between its enqueue/slot-write and
+    /// its increment - the increment is deliberately LAST, it is the release that licenses the
+    /// consumer's peek) sends the count transiently negative, bounded at -1 by the single
+    /// producer. Hence drained means at-or-below zero, never exactly zero: the -1 face says the
+    /// in-flight commit's entry was itself the one consumed, so nothing peekable remains - treating
+    /// it as not-drained would peek an empty store.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int DecrementCount() => Interlocked.Decrement(ref _count);
+    public bool DecrementCount()
+    {
+        var count = Interlocked.Decrement(ref _count);
+        Debug.Assert(count >= -1);
+        return count <= 0;
+    }
 
     /// Advancer-latch-holder-only peek of the slot occupant for chain activation
-    /// (DrainSlotInline's count > 0 arm). Only valid after the caller's DecrementCount
-    /// returned > 0: the occupant's commit wrote the slot fields before its count increment,
+    /// (DrainSlotInline's D-path arm). Only valid after the caller's DecrementCount
+    /// returned FALSE (not drained): the occupant's commit wrote the slot fields before its count increment,
     /// and the caller's atomic decrement observed that increment, so the fields are fully
     /// published to the caller. Returns false when a first escalation raced in and owns (or
     /// owned) the contents - the occupant is, or is about to be, the queue head. The queue
@@ -213,6 +242,14 @@ struct WaiterStore<T>
         item = default!;
         return false;
     }
+
+    /// Committer-side probe for the commit verify: whether the just-committed sole head has been
+    /// taken by a drain (slot claimed or cleared, or the queue emptied). Only meaningful under the
+    /// commit's activation lock and AFTER a Count re-read observed zero: that acquire orders these
+    /// reads behind the drain's fenced decrement so they are fresh, and the committer is the sole
+    /// producer so nothing can refill the store during the hold.
+    public bool CommitHeadTaken()
+        => _queue is null ? Volatile.Read(ref _slotState) != SlotOccupied : _queue.IsEmpty;
 
     /// The underlying queue if escalated. Used by the public Enumerator to walk queue entries.
     public SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)>? Queue => _queue;
