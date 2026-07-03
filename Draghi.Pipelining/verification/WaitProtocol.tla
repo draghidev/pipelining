@@ -66,7 +66,16 @@ Properties:
 
 EXTENDS Naturals, TLC
 
-CONSTANTS MaxItems, RecheckFix, LockThroughFix, ClearOnClaimFix
+CONSTANTS MaxItems, RecheckFix, LockThroughFix, ClearOnClaimFix,
+  \* July 2026 (strand hunt): TRUE splits the async claim from its invoke - the code's
+  \* DispatchClaimed queues an IThreadPoolWorkItem whose Execute (the continuation) runs an
+  \* UNBOUNDED time later on a possibly-stolen TP thread; the fused shape teleports the
+  \* consumer to "run" at claim time and so cannot represent anything interleaving into the
+  \* claimed-but-not-yet-resumed window. The sync-handoff inline claim stays fused (it IS
+  \* inline: Signal(false) invokes on the producer's thread with no queue). Expected: all
+  \* properties HOLD - the protocol should be dispatch-delay-tolerant; a violation here is a
+  \* candidate mechanism for the observed FIFO-violating permanent strand.
+  SplitClaimInvoke
 
 VARIABLES
   queue,      \* published items pending consumption
@@ -82,10 +91,11 @@ VARIABLES
   ppc,        \* producer: "idle" | "flagged" | "published" (signal pending)
   suspendedSig, \* the MRES: set when the consumer's registration completed
   handoff,      \* 0..1: the sync flow published into the handoff slot
-  hpc           \* handoff producer: "idle" | "waiting" | "signaling" | "done"
+  hpc,          \* handoff producer: "idle" | "waiting" | "signaling" | "done"
+  wakeQueued    \* SplitClaimInvoke: a claimed wake's work item is queued, not yet run
 
 vars == <<queue, enqueued, consumed, notEmpty, lock, pending, contStored,
-          completed, lostWake, cpc, ppc, suspendedSig, handoff, hpc>>
+          completed, lostWake, cpc, ppc, suspendedSig, handoff, hpc, wakeQueued>>
 
 TypeOK ==
   /\ queue \in 0..MaxItems
@@ -103,6 +113,7 @@ TypeOK ==
   /\ suspendedSig \in BOOLEAN
   /\ handoff \in 0..1
   /\ hpc \in {"idle", "waiting", "signaling", "done"}
+  /\ wakeQueued \in BOOLEAN
 
 Init ==
   /\ queue = 0 /\ enqueued = 0 /\ consumed = 0
@@ -110,6 +121,7 @@ Init ==
   /\ contStored = FALSE /\ completed = FALSE /\ lostWake = FALSE
   /\ cpc = "run" /\ ppc = "idle"
   /\ suspendedSig = FALSE /\ handoff = 0 /\ hpc = "idle"
+  /\ wakeQueued = FALSE
 
 -----------------------------------------------------------------------------
 \* Async producer (single, per the SPSC source contract).
@@ -119,18 +131,21 @@ EnqFlag ==
   /\ notEmpty' = TRUE
   /\ ppc' = "flagged"
   /\ UNCHANGED <<queue, enqueued, consumed, lock, pending, contStored,
-                 completed, lostWake, cpc, suspendedSig, handoff, hpc>>
+                 completed, lostWake, cpc, suspendedSig, handoff, hpc, wakeQueued>>
 
 EnqPublish ==
   /\ ppc = "flagged"
   /\ queue' = queue + 1 /\ enqueued' = enqueued + 1
   /\ ppc' = "published"
   /\ UNCHANGED <<consumed, notEmpty, lock, pending, contStored, completed,
-                 lostWake, cpc, suspendedSig, handoff, hpc>>
+                 lostWake, cpc, suspendedSig, handoff, hpc, wakeQueued>>
 
 \* Signal: acquire the lock (disabled while held), claim _pending, clear the
-\* suspended signal (under the fix), release, invoke. Claim + invoke collapse
-\* into one step per outcome; the lock gating is represented exactly.
+\* suspended signal (under the fix), release, invoke. Under ~SplitClaimInvoke,
+\* claim + invoke collapse into one step per outcome (the fused fiction); under
+\* SplitClaimInvoke the claim QUEUES the wake (wakeQueued) and a separate
+\* WakeInvoke action runs the continuation an unbounded time later - the code's
+\* DispatchClaimed -> IThreadPoolWorkItem -> stolen-thread Execute path.
 SignalClaimWakes ==
   /\ ppc = "published" /\ ~lock
   /\ hpc \notin {"waiting", "signaling"}   \* Execute's HandoffActive gate: async signals defer during the handoff window
@@ -139,10 +154,24 @@ SignalClaimWakes ==
   /\ pending' = FALSE
   /\ contStored' = FALSE
   /\ suspendedSig' = IF ClearOnClaimFix THEN FALSE ELSE suspendedSig
-  /\ cpc' = "run"
+  /\ IF SplitClaimInvoke
+       THEN /\ wakeQueued' = TRUE
+            /\ cpc' = cpc     \* consumer stays suspended until the queued work item runs
+       ELSE /\ cpc' = "run"
+            /\ wakeQueued' = wakeQueued
   /\ ppc' = "idle"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, completed,
                  lostWake, handoff, hpc>>
+
+\* The queued wake's Execute: the continuation finally runs (possibly on a stolen TP
+\* thread, arbitrarily delayed). Only exists under SplitClaimInvoke.
+WakeInvoke ==
+  /\ SplitClaimInvoke
+  /\ wakeQueued
+  /\ wakeQueued' = FALSE
+  /\ cpc' = "run"
+  /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, pending, contStored,
+                 completed, lostWake, ppc, suspendedSig, handoff, hpc>>
 
 \* The hole LockThroughFix closes: claim in the arm-to-registration gap.
 SignalClaimLost ==
@@ -154,7 +183,7 @@ SignalClaimLost ==
   /\ lostWake' = TRUE
   /\ ppc' = "idle"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, contStored,
-                 completed, cpc, suspendedSig, handoff, hpc>>
+                 completed, cpc, suspendedSig, handoff, hpc, wakeQueued>>
 
 SignalNoop ==
   /\ ppc = "published" /\ ~lock
@@ -163,7 +192,7 @@ SignalNoop ==
   /\ ppc' = "idle"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, pending,
                  contStored, completed, lostWake, cpc, suspendedSig,
-                 handoff, hpc>>
+                 handoff, hpc, wakeQueued>>
 
 \* Complete: shutdown after the async producer is done; rides the claim path.
 \* The claim DEFERS during the handoff window, same as async signals: TLC
@@ -178,15 +207,19 @@ CompleteWakes ==
   /\ ppc = "idle" /\ enqueued = MaxItems /\ ~completed /\ ~lock
   /\ completed' = TRUE
   /\ IF hpc \in {"waiting", "signaling"}
-       THEN UNCHANGED <<pending, contStored, cpc, lostWake, suspendedSig>>
+       THEN UNCHANGED <<pending, contStored, cpc, lostWake, suspendedSig, wakeQueued>>
        ELSE IF pending /\ contStored
-         THEN /\ pending' = FALSE /\ contStored' = FALSE /\ cpc' = "run"
+         THEN /\ pending' = FALSE /\ contStored' = FALSE
               /\ suspendedSig' = IF ClearOnClaimFix THEN FALSE ELSE suspendedSig
               /\ lostWake' = lostWake
+              \* Complete rides the same claim path: SignalCore -> DispatchClaimed(true) queues.
+              /\ IF SplitClaimInvoke
+                   THEN /\ wakeQueued' = TRUE /\ cpc' = cpc
+                   ELSE /\ cpc' = "run" /\ wakeQueued' = wakeQueued
          ELSE IF pending /\ ~contStored
            THEN /\ pending' = FALSE /\ lostWake' = TRUE
-                /\ UNCHANGED <<contStored, cpc, suspendedSig>>
-           ELSE UNCHANGED <<pending, contStored, cpc, lostWake, suspendedSig>>
+                /\ UNCHANGED <<contStored, cpc, suspendedSig, wakeQueued>>
+           ELSE UNCHANGED <<pending, contStored, cpc, lostWake, suspendedSig, wakeQueued>>
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, ppc, handoff, hpc>>
 
 -----------------------------------------------------------------------------
@@ -199,7 +232,7 @@ HandoffPublish ==
   /\ handoff' = 1
   /\ hpc' = "waiting"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, pending,
-                 contStored, completed, lostWake, cpc, ppc, suspendedSig>>
+                 contStored, completed, lostWake, cpc, ppc, suspendedSig, wakeQueued>>
 
 \* WaitForSuspended satisfied (the MRES fired - or was STALE without the fix).
 HandoffObserve ==
@@ -208,7 +241,7 @@ HandoffObserve ==
   /\ hpc' = "signaling"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, pending,
                  contStored, completed, lostWake, cpc, ppc, suspendedSig,
-                 handoff>>
+                 handoff, wakeQueued>>
 
 \* Inline claim: consume the wait and run the flow on this thread. Modeled
 \* atomically (claim + the executor's inline consumption of the handoff slot)
@@ -224,7 +257,7 @@ HandoffClaimInline ==
   /\ cpc' = "run"
   /\ hpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, completed,
-                 lostWake, ppc>>
+                 lostWake, ppc, wakeQueued>>
 
 \* Claim into the registration gap (reachable only without LockThroughFix).
 HandoffClaimLost ==
@@ -234,7 +267,7 @@ HandoffClaimLost ==
   /\ lostWake' = TRUE
   /\ hpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, contStored,
-                 completed, cpc, ppc, suspendedSig, handoff>>
+                 completed, cpc, ppc, suspendedSig, handoff, wakeQueued>>
 
 \* Claim no-op: nothing pending - the consumer was RUNNING, the observation was
 \* stale. The producer returns with its flow unexecuted (handoff still 1).
@@ -245,7 +278,7 @@ HandoffClaimNoop ==
   /\ hpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, lock, pending,
                  contStored, completed, lostWake, cpc, ppc, suspendedSig,
-                 handoff>>
+                 handoff, wakeQueued>>
 
 -----------------------------------------------------------------------------
 \* Consumer (the executor's pull loop).
@@ -255,7 +288,7 @@ PullHit ==
   /\ cpc = "run" /\ queue > 0
   /\ queue' = queue - 1 /\ consumed' = consumed + 1
   /\ UNCHANGED <<enqueued, notEmpty, lock, pending, contStored, completed,
-                 lostWake, cpc, ppc, suspendedSig, handoff, hpc>>
+                 lostWake, cpc, ppc, suspendedSig, handoff, hpc, wakeQueued>>
 
 \* TryGetNext miss -> WaitForNextAsync acquires the wake lock.
 WaitAcquire ==
@@ -264,7 +297,7 @@ WaitAcquire ==
   /\ notEmpty' = FALSE
   /\ cpc' = "locked"
   /\ UNCHANGED <<queue, enqueued, consumed, pending, contStored, completed,
-                 lostWake, ppc, suspendedSig, handoff, hpc>>
+                 lostWake, ppc, suspendedSig, handoff, hpc, wakeQueued>>
 
 WaitRecheckRetry ==
   /\ RecheckFix
@@ -273,7 +306,7 @@ WaitRecheckRetry ==
   /\ lock' = FALSE
   /\ cpc' = "run"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, pending, contStored,
-                 completed, lostWake, ppc, suspendedSig, handoff, hpc>>
+                 completed, lostWake, ppc, suspendedSig, handoff, hpc, wakeQueued>>
 
 \* Completed and drained - but a pending handoff still needs its rendezvous:
 \* the executor must not resolve Completed out from under a waiting sync
@@ -286,7 +319,7 @@ WaitRecheckCompleted ==
   /\ lock' = FALSE
   /\ cpc' = "done"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, pending, contStored,
-                 completed, lostWake, ppc, suspendedSig, handoff, hpc>>
+                 completed, lostWake, ppc, suspendedSig, handoff, hpc, wakeQueued>>
 
 \* Arm. With the fix the guard is the full under-lock re-check: empty, no
 \* in-flight publish, and NOT the completed-resolution case (note: completed
@@ -302,7 +335,7 @@ WaitArm ==
   /\ lock' = IF LockThroughFix THEN TRUE ELSE FALSE
   /\ cpc' = "armed"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, contStored, completed,
-                 lostWake, ppc, suspendedSig, handoff, hpc>>
+                 lostWake, ppc, suspendedSig, handoff, hpc, wakeQueued>>
 
 \* Registration: store the continuation, release the lock, set the suspended
 \* signal (WaitOnCompleted; the MRES set comes after the store + release).
@@ -313,22 +346,35 @@ WaitRegister ==
   /\ suspendedSig' = TRUE
   /\ cpc' = "suspended"
   /\ UNCHANGED <<queue, enqueued, consumed, notEmpty, pending, completed,
-                 lostWake, ppc, handoff, hpc>>
+                 lostWake, ppc, handoff, hpc, wakeQueued>>
 
 -----------------------------------------------------------------------------
+
+\* The one INTENDED quiescent state, as an explicit self-loop so the model runs WITH deadlock
+\* detection: any other successor-less state is then a structural deadlock error - every strand
+\* is caught whether or not a named liveness property covers it. (Previously the configs ran
+\* with -deadlock, which silenced the terminal state but also would have silenced any stuck
+\* state a property didn't happen to name.)
+Done ==
+  /\ cpc = "done"
+  /\ hpc \in {"idle", "done"}
+  /\ UNCHANGED vars
 
 Next ==
   \/ EnqFlag \/ EnqPublish
   \/ SignalClaimWakes \/ SignalClaimLost \/ SignalNoop
+  \/ WakeInvoke
   \/ CompleteWakes
   \/ HandoffPublish \/ HandoffObserve
   \/ HandoffClaimInline \/ HandoffClaimLost \/ HandoffClaimNoop
   \/ PullHit \/ WaitAcquire
   \/ WaitRecheckRetry \/ WaitRecheckCompleted \/ WaitArm \/ WaitRegister
+  \/ Done
 
 Fairness ==
   /\ WF_vars(EnqPublish)
   /\ WF_vars(SignalClaimWakes) /\ WF_vars(SignalClaimLost) /\ WF_vars(SignalNoop)
+  /\ WF_vars(WakeInvoke)
   /\ WF_vars(CompleteWakes)
   /\ WF_vars(HandoffObserve)
   /\ WF_vars(HandoffClaimInline) /\ WF_vars(HandoffClaimLost) /\ WF_vars(HandoffClaimNoop)

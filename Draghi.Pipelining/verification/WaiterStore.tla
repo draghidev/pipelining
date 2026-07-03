@@ -319,7 +319,16 @@ StoreTypeOK ==
   /\ escPhase \in {"idle", "publish_done", "cas_done", "move_done", "esc_enqueued",
                    "q_enq_act", "q_enq_noact", "compensate", "nudge_check",
                    "slot_cas_act", "slot_cas_noact", "slot_f_act", "slot_f_noact",
-                   "slot_w_act", "slot_w_noact"}
+                   "slot_w_act", "slot_w_noact",
+                   \* SplitCommitSelfActivate PCs: the ARM-parked commit self-activate,
+                   \* verdict captured, awaiting the lock/gate/activate ACT.
+                   "q_selfact_fire", "q_selfact_done",
+                   "slot_selfact_fire", "slot_selfact_done",
+                   \* SplitCommitSelfActRecheck sub-phases: the in-lock RECHECK parks
+                   \* "*_dofire" (not done -> FIRE will try), FIRE parks "*_verify" on a
+                   \* grant (CommitSelfActVerify), each a distinct step of the one lock hold.
+                   "q_selfact_dofire", "q_selfact_verify",
+                   "slot_selfact_dofire", "slot_selfact_verify"}
   /\ escTail \in Item \cup {NoItem}
   /\ escSlotClaimed \in BOOLEAN
   /\ escMoved \in Item \cup {NoItem}
@@ -358,12 +367,25 @@ StoreEscalationConsistent ==
                                            "esc_enqueued", "q_enq_act", "q_enq_noact",
                                            "slot_cas_act", "slot_cas_noact",
                                            "slot_f_act", "slot_f_noact",
-                                           "slot_w_act", "slot_w_noact"})
+                                           "slot_w_act", "slot_w_noact",
+                                           \* SplitCommitSelfActivate keeps escTail as the
+                                           \* item handle across the ARM->ACT window.
+                                           "q_selfact_fire", "q_selfact_done",
+                                           "slot_selfact_fire", "slot_selfact_done",
+                                           \* SplitCommitSelfActRecheck: escTail survives the
+                                           \* RECHECK->FIRE(->VERIFY) window as the item handle.
+                                           "q_selfact_dofire", "q_selfact_verify",
+                                           "slot_selfact_dofire", "slot_selfact_verify"})
   \* The slot-split commit phases (SplitSlotFieldOps) are the one pre-escalation use of
   \* the executor PC; every other non-idle phase implies the queue tier exists.
+  \* The slot self-activate PCs are pre-escalation too (do NOT imply escalated); the queue
+  \* self-activate PCs are post-escalation (fall through to the => escalated implication).
   /\ (escPhase \notin {"idle", "slot_cas_act", "slot_cas_noact",
                        "slot_f_act", "slot_f_noact",
-                       "slot_w_act", "slot_w_noact"}) => escalated
+                       "slot_w_act", "slot_w_noact",
+                       "slot_selfact_fire", "slot_selfact_done",
+                       \* the slot RECHECK/FIRE/VERIFY sub-phases are pre-escalation too
+                       "slot_selfact_dofire", "slot_selfact_verify"}) => escalated
   /\ (escPhase = "compensate") => (escMoved # NoItem)
 
 =============================================================================

@@ -323,6 +323,75 @@ CONSTANTS
                              \* FALSE reproduces the witness: NoStompedActivation must HOLD
                              \* with TRUE, must FAIL with FALSE.
   ,
+  SplitCPathExchange         \* The read-turn round (July 2026). TRUE splits the queue C-path's
+                             \* lock block into its two real instructions: the Count<=0 read
+                             \* (arm) and the pending Exchange + activate (fire), with the
+                             \* executor free to interleave between them. The window is real:
+                             \* the advancer's Count read can go STALE while it is preempted
+                             \* inside the lock - the executor commits the next waiter
+                             \* (count 0->1, wasEmpty self-activates it, pre-fix lock-free)
+                             \* AND dispatches+publishes its successor; the woken advancer's
+                             \* Exchange then consumes that FRESH publish, activating a second
+                             \* flow while the wasEmpty one is live. Two flows on the
+                             \* single-tenant read baton = Slon's "async method is already
+                             \* executing" (ConcurrentSyncAndAsync_RecordingReads, ~1/35 soak
+                             \* loops, July 2026). FALSE = fused (the verified configs,
+                             \* unaffected). ReadTurnMutex must FAIL with TRUE (witness of the
+                             \* production bug) until the single-reader gate is modeled.
+  ,
+  SingleActivationGate       \* The gate round (July 2026). TRUE models the SHIPPED _liveActivation
+                             \* occupancy bit (Pipeline.cs ~2003): set TRUE in ActivateHeadItem -
+                             \* EVERY activation path - and cleared FALSE in CompleteWaiterDeferred
+                             \* at every retirement (just before _policy.CompleteItem). It GATES
+                             \* exactly TWO activation sites: (1) CommitWaiter's wasEmpty
+                             \* self-activate (activate the sole committed waiter only when
+                             \* !_liveActivation; else leave it committed-unactivated on the claim
+                             \* "the advancer activates it in FIFO order when the live reader
+                             \* retires"), and (2) the advancer's queue C-path (`_waiters.Count is
+                             \* 0 && !_liveActivation && Volatile.Read(pending)`; on a gate-skip
+                             \* the pending flag is LEFT in place on the claim "this C-path
+                             \* re-fires in the same advancer pass"). BOTH coverage claims are
+                             \* UNVERIFIED - whether a gate-skip can strand an activation
+                             \* (EventuallyActivated) is what this toggle exists to adjudicate
+                             \* (the live suspect for a rare field strand). The slot C-path
+                             \* (SlotDrainCompleteCPath), the D-path arms, the slot-chain arms,
+                             \* dispatch-inline, and the recovery activations are NOT gated - the
+                             \* code doesn't gate them. FALSE = ungated (pre-fix shape); the
+                             \* liveActivation variable is threaded but inert, so every prior
+                             \* config is behaviorally unaffected.
+  ,
+  PeekGatedCPathLicense      \* The double-act FIX, load-bearing half (July 2026, gate round -
+                             \* Pipeline_GateDoubleActWitness.cfg's chain). TRUE = the queue
+                             \* C-path license requires the queue to be empty BY RESIDENCY, not
+                             \* merely count 0: closes the enqueue-before-increment under-promise
+                             \* window (SplitCountCommit) that lets the C-path fire past a
+                             \* resident completed-unactivated head - the out-of-FIFO fire that
+                             \* seeds the same-flow double activation. Queue C-path only (the
+                             \* fused AdvancerCPath, where the atomic guard already reads
+                             \* residency, and the split AdvancerCPathFire, where the residency
+                             \* peek joins the fire's fresh under-lock reads). A declined license
+                             \* LEAVES the pending publish for the re-fire, exactly like the
+                             \* gate skip (AdvancerCPathFirePeekDecline exits the lock phase).
+                             \* At-most-once is delivered by STRUCTURE (single license + FIFO),
+                             \* never by IsCompleted checks - this conjunct carries the whole
+                             \* correctness weight of the fix. FALSE = shipped count-0 license
+                             \* (every prior config unaffected).
+  ,
+  QueueDPathCompletedGuard   \* The double-act fix, dispatch-saver half (July 2026). TRUE = the
+                             \* queue D-arm (AdvancerDrainHead / DrainHeadRecovers activating the
+                             \* peeked next head after a retirement) SKIPS activation when the
+                             \* head's task is already completed, mirroring the slot D-path's
+                             \* guard (SlotDrainCompleteChainSlot's IsCompleted skip and
+                             \* SlotDrainHandoffReclaim's taskDone arm); the drain loop's own
+                             \* next iteration dequeues the completed head. Completed-at-commit
+                             \* items are drain-only by design (their tasks can complete long
+                             \* before activation reaches them, e.g. timeouts) - but this check
+                             \* is a check-then-activate TOCTOU against a monotonic-but-
+                             \* asynchronous completion, so it must NOT be load-bearing for
+                             \* at-most-once (Pipeline_GateDoubleActFixNoGuard.cfg adjudicates
+                             \* that). FALSE = shipped unconditional D-arm activate (every prior
+                             \* config unaffected).
+  ,
   RecoverySplit             \* The recovery round (June 2026, backlog #2/#5). FALSE = legacy
                              \* identity-reuse: the substitute reuses the failed item's identity
                              \* (RecoverItemWins/Loses re-dispatch loc[i]), so a failed item
@@ -335,6 +404,367 @@ CONSTANTS
                              \* activation bound is uniform <=1, and recovery-on-recovery /
                              \* policy-refuse / the trailing-fault injection points get modeled.
                              \* FALSE = the 9 configs (unaffected); TRUE = the recovery witness.
+  ,
+  LockFreeIdleDispatch       \* The lock-elision round (July 2026). TRUE = the ESCALATED dispatch
+                             \* (Pipeline.cs ~390-421: once _activationLock exists, every dispatch
+                             \* serializes its "Count is 0 -> activate the head inline" decision
+                             \* under the lock, publishing _executingItemActivationPending then
+                             \* claiming it back at Count 0) gains an ELISION arm: when its guard
+                             \*   storeCount = 0 (the clamped public Count read; modeled <= 0,
+                             \*     the -1 face reads 0 through the clamp)
+                             \*   /\ ~latchHeld  (the advancer latch word - advancingVisible, the
+                             \*     remote read; acquires are interlocked so a FALSE read is never
+                             \*     stale-free, only a TRUE read can be stale-held = conservative)
+                             \*   /\ ~pending    (the executor's own _executingItemActivationPending
+                             \*     read - hasExecuting, own-thread store-to-load forwarding)
+                             \* holds - all read at elision time - it activates the head inline
+                             \* WITHOUT the lock and without publishing pending, exactly like the
+                             \* never-escalated fork (~376-388). When the guard fails it falls to
+                             \* the existing locked arm unchanged (SourceYieldInline /
+                             \* SourceYieldDeferred stay enabled as-is). Rationale under
+                             \* adjudication: the C-path and all drain-time activation decisions
+                             \* run with the latch held end to end, so "latch free" should mean no
+                             \* concurrent activation decision exists; sequential-shape dispatches
+                             \* would skip ~1 of their ~3 per-item lock acquires. The DANGER is
+                             \* the check-then-act window (SplitIdleDispatchGuard below).
+                             \* FALSE = shipped locked dispatch (every prior config unaffected).
+  ,
+  SplitIdleDispatchGuard     \* FIDELITY toggle, meaningful only under LockFreeIdleDispatch.
+                             \* FALSE = FUSED: the elision guard's three reads and the activation
+                             \* are one atomic action (SourceYieldElide) - adjudicates the pure
+                             \* LOGIC (is the idle observation sound when reads are truth?).
+                             \* TRUE = SPLIT: the guard reads are one action (SourceYieldElideArm,
+                             \* parking the picked item in the DispatchArmed location) and the
+                             \* activation a following action (SourceYieldElideAct, NO re-reads),
+                             \* with every other thread free to interleave between them - the
+                             \* latch can be acquired, counts can change. This is the shape
+                             \* SplitCPathExchange used for the C-path lock block, and it found
+                             \* the production bug there; whether the elision guard is stable as
+                             \* a check-then-act is exactly what this level adjudicates
+                             \* (Pipeline_IdleDispatchSplit.cfg).
+  ,
+  CPathPendingPreCheck       \* The C-path lock-elision round (July 2026). TRUE = the three
+                             \* C-path claim sites (the queue drain's count-0 C-path, the slot
+                             \* drain's C-path, and the recovery rejoin's copy - the last folds
+                             \* into the slot C-path in this model) READ the deferred-publish
+                             \* pending flag (hasExecutingVisible, a Volatile.Read) OUTSIDE the
+                             \* _activationLock and SKIP the lock phase entirely when it reads
+                             \* FALSE. The lock body is UNCHANGED when entered (all existing
+                             \* under-lock checks - the count re-read, the Exchange, the gate -
+                             \* run as before). Rationale under adjudication: the pending flag
+                             \* is usually FALSE after a drain empties the store, so the
+                             \* unconditional lock acquire is pure overhead; a stale-FALSE
+                             \* pre-check that skips a publish landing just after the read is
+                             \* claimed harmless because the publisher (the executor's dispatch
+                             \* or commit) always returns to claim its own publish - its locked
+                             \* arm re-reads Count and self-activates at count 0, or leaves it
+                             \* for the CommitTailWaiter reclaim at count > 0. The DANGER is the
+                             \* stale-read window (SplitCPathPreCheck below): whether a
+                             \* pre-check that captured FALSE just before a publisher set pending
+                             \* can strand that activation. FALSE = shipped unconditional lock
+                             \* entry (every prior config unaffected). Modeled only in the
+                             \* ModelCPathClear regime (the C-path is its own "cpath_lock" phase);
+                             \* the pre-check gates entry to that phase.
+  ,
+  SplitCPathPreCheck         \* FIDELITY toggle, meaningful only under CPathPendingPreCheck.
+                             \* FALSE = FUSED: the pre-check read + the skip/enter decision are
+                             \* one atomic action against the TRUE pending value (no stale
+                             \* window). Adjudicates the pure logic; a FUSED skip only fires when
+                             \* pending is genuinely FALSE at that instant, so it coincides with
+                             \* the existing model's lock-exit-on-no-publish (green baseline).
+                             \* TRUE = SPLIT: the pre-check read is its OWN action (capturing the
+                             \* pending value into the drain's PC), every other thread free to
+                             \* interleave, then the skip/enter acts on the CAPTURED value with
+                             \* NO re-read - so a stale FALSE (pending set by a concurrent
+                             \* publisher between the read and the skip) still skips the lock,
+                             \* LEAVING the fresh publish for the publisher's own rescue. This is
+                             \* the shape SplitCPathExchange / SplitIdleDispatchGuard used, and it
+                             \* found the production bug in the first; whether the pre-check is
+                             \* stable as a check-then-act is exactly what this level adjudicates
+                             \* (Pipeline_CPathPreCheckSplit.cfg). EventuallyActivated is THE
+                             \* verdict: a stranded activation here refutes the elision.
+  ,
+  SplitCommitSelfActivate    \* FIDELITY toggle (July 2026, the commit self-activate round).
+                             \* CommitWaiter's wasEmpty self-activate is, in the code, TWO
+                             \* instructions with a lock boundary between them:
+                             \*   wasEmpty = _waiters.Enqueue(item);       // increment; returns wasEmpty
+                             \*   if (wasEmpty && !waiterTask.IsCompleted) // OUTSIDE _activationLock
+                             \*     lock (_activationLock)
+                             \*       if (!_liveActivation) ActivateHeadItem(item);  // gate + act
+                             \* FALSE = FUSED: the shipped modeling (ExecCommitQueueCountWins /
+                             \* ExecCommitSlotCountWins) reads wasEmpty (pre-increment count 0),
+                             \* the IsCompleted check (i \notin taskDone) and the _liveActivation
+                             \* gate all ATOMICALLY at the count step - every prior config is
+                             \* behaviorally unaffected. TRUE = SPLIT: the increment + the
+                             \* wasEmpty/IsCompleted capture are ONE action (ExecCommit*CountArm,
+                             \* parking the commit in the "*_selfact_fire"/"*_selfact_done" PC on
+                             \* escPhase, verdict CAPTURED, escTail preserved as the item handle),
+                             \* and the lock/gate/activate a FOLLOWING action (ExecCommit*CountAct*)
+                             \* acting on the CAPTURED IsCompleted verdict with NO re-read (the
+                             \* gate IS re-read fresh - it is under the lock in the code). Every
+                             \* OTHER thread interleaves between them: in particular the item's
+                             \* task completes (CompleteTask*), its callback acquires the advancer
+                             \* latch, the drain dequeues the item (its enqueue preceded the check)
+                             \* and RETIRES it - CompleteWaiterDeferred's liveActivation clear is a
+                             \* plain drain-side write, NOT under _activationLock - and THEN the
+                             \* commit's activation lands on the already-retired item. The suspect:
+                             \* an activation with no future retirement, liveActivation stuck TRUE.
+                             \* The queue arm mirrors ExecCommitQueueCountWins (no activatedSlot
+                             \* write); the slot arm mirrors ExecCommitSlotCountWins (writes
+                             \* activatedSlot, runs ReadTurnMonitor) - each SPLIT arm's effects are
+                             \* effect-identical to its FUSED twin, only time-separated, so any
+                             \* violation is attributable to the TOCTOU window alone.
+                             \* FALSE = every prior config unaffected; TRUE =
+                             \* Pipeline_CommitSelfActWitness.cfg (the adjudication).
+  ,
+  CommitSelfActRecheck       \* Candidate FIX, meaningful only under SplitCommitSelfActivate.
+                             \* FALSE = shipped: the activate step acts on the CAPTURED IsCompleted
+                             \* verdict, no re-read (the code has no re-check inside the lock).
+                             \* TRUE = the activate step RE-READS taskDone at act time (an
+                             \* IsCompleted re-read inside the lock, immediately before
+                             \* ActivateHeadItem, skipping the activation when the task completed
+                             \* meanwhile). This SHRINKS but need not CLOSE the window: retirement
+                             \* still does not take the lock, and the task can complete AFTER the
+                             \* re-check but before the activate - TLC adjudicates whether the
+                             \* residual window is real at this granularity
+                             \* (Pipeline_CommitSelfActFix.cfg). FALSE = every prior config
+                             \* unaffected (the re-read only exists under the split arms).
+  ,
+  SplitCommitSelfActRecheck  \* Candidate FIX granularity toggle (July 2026, the residual round).
+                             \* Requires SplitCommitSelfActivate /\ CommitSelfActRecheck. The fused
+                             \* CommitSelfActRecheck models the in-lock IsCompleted re-read and the
+                             \* ActivateHeadItem as ONE atomic action (ExecCommit*CountActFire) - it
+                             \* came back GREEN, but the fusion HIDES a residual: in code the re-read
+                             \* (Pipeline.cs:1134) and the activate (Pipeline.cs:1137) are SEPARATE
+                             \* instructions inside the SAME lock hold (the lock is taken at
+                             \* Pipeline.cs:1127), and the drain's retirement (CompleteWaiterDeferred,
+                             \* Pipeline.cs:1087 - a lock-FREE Volatile.Write) can land BETWEEN them if
+                             \* the committing thread is preempted mid-lock.
+                             \* FALSE = the fused ActFire stands (re-read fused with activate).
+                             \* TRUE = SPLIT the ActFire into RECHECK and FIRE:
+                             \*   RECHECK (ExecCommit*Recheck): re-read taskDone under the lock, park
+                             \*     the verdict onto a new escPhase ("q_selfact_dofire"/"slot_selfact
+                             \*     _dofire" when the item is not done, straight to idle when it is).
+                             \*   FIRE (ExecCommit*Fire): the activate, consuming the parked verdict;
+                             \*     the gate (GateOpen) is re-read fresh. On a grant, park
+                             \*     "*_selfact_verify" (under CommitSelfActVerify) or return to idle.
+                             \* The drain's retirement CLEAR (liveActivation' = FALSE) and the task's
+                             \* completion (CompleteTask*) take NO lock and stay FREE to interleave
+                             \* between RECHECK and FIRE - that is the residual window.
+                             \* ENCODING of the single lock hold: RECHECK, FIRE and VERIFY act from
+                             \* escPhase \in {"q_selfact_fire","q_selfact_dofire","q_selfact_verify",
+                             \* "slot_selfact_fire","slot_selfact_dofire","slot_selfact_verify"} - that
+                             \* phase-window IS the _activationLock hold (SelfActLockHeld). Every OTHER
+                             \* action that models an _activationLock-taking region (the commit gate for
+                             \* other items, the C-path license family, any gated / drain / recovery
+                             \* ActivateHeadItem) is forbidden from GRANTING while the window is open,
+                             \* enforced UNIFORMLY by NoForeignGrant (no liveActivation FALSE -> TRUE
+                             \* transition outside the self-act family during SelfActLockHeld) rather
+                             \* than per-action guards. The lock-FREE retirement clears (liveActivation
+                             \* FALSE -> FALSE / TRUE -> FALSE) and every non-granting action stay
+                             \* enabled. FALSE = SelfActLockHeld is never TRUE, NoForeignGrant is
+                             \* vacuous, every prior config bit-identical. TRUE =
+                             \* Pipeline_CommitSelfActResidualWitness.cfg (expected liveness RED: the
+                             \* completion + retirement land between RECHECK and FIRE, the stale "fire"
+                             \* verdict activates the retired item, liveActivation stuck TRUE).
+  ,
+  CommitSelfActVerify        \* Candidate STRONGER FIX, requires SplitCommitSelfActRecheck.
+                             \* FALSE = the residual stands (FIRE returns to idle right after the
+                             \* activate, leaving no window to catch a grant on an item the drain
+                             \* retired between RECHECK and FIRE).
+                             \* TRUE = after FIRE a third action VERIFY (ExecCommit*Verify) runs INSIDE
+                             \* the same lock hold, before the phase returns to idle (reached only when
+                             \* FIRE actually GRANTED - "*_selfact_verify" is set only on doAct): it
+                             \* re-reads taskDone; if the item is now done, release the just-planted
+                             \* turn - liveActivation' = FALSE (a task-done item must not keep the
+                             \* reader turn; its callback drains it). The slot arm's activatedSlot
+                             \* RESTORE, however, fires ONLY when the item was actually RETIRED
+                             \* (loc = "Completed") - that is the genuine stuck-grant case - and then
+                             \* mirrors the drain's clear (activatedSlot' = DepthZeroClear when the slot
+                             \* still points at the item). A task-done-but-RESIDENT item's grant is
+                             \* transient-legit (the drain retires it the normal way); nulling
+                             \* activatedSlot there would STOMP a live slot occupant (NoNullWhileLive).
+                             \* Item not done -> passthrough. MODEL FINDING (this round): keying the
+                             \* slot restore on mere completion over-fires; it must key on retirement.
+                             \* RATIONALE: every re-grant path serializes on the lock, so inside the
+                             \* hold only the drain's lock-free clear can interleave; a double-clear is
+                             \* idempotent and a self-clear of a retired item's grant restores exactly
+                             \* the drain-clear state. The SPURIOUS policy activation (activations[i]
+                             \* bumped at FIRE for an already-completed item) is ACCEPTED - VERIFY does
+                             \* NOT undo it. FALSE = every prior config unaffected. TRUE =
+                             \* Pipeline_CommitSelfActVerifyFix.cfg (expected GREEN).
+  ,
+  CommitSelfActVerifyOnTaken \* PORTABILITY variant of the VERIFY trigger, meaningful only under
+                             \* CommitSelfActVerify. The retirement-keyed trip (loc = "Completed")
+                             \* has no clean committer-observable in code: the retirement's side
+                             \* effects (depth-0 slot clear, liveActivation clear) are not
+                             \* attributable to OUR item. What the committer CAN legally read under
+                             \* the lock is "our item has left the store":
+                             \*   slot arm  = the slot-state word + item identity (a Volatile
+                             \*               snapshot is claim-safe from any thread) - modeled as
+                             \*               slotItem # i;
+                             \*   queue arm = the producer-side first==last emptiness read (the
+                             \*               committer IS the SPSC producer; the drain dequeues
+                             \*               before completing) - modeled as waiters = <<>>.
+                             \* FALSE = the retirement-keyed VERIFY (the previous green shape).
+                             \* TRUE = BOTH the liveActivation self-clear AND the slot arm's
+                             \* activatedSlot restore key on "task-done AND taken" instead. This
+                             \* trips EARLIER: it also fires in the taken-but-not-yet-completed
+                             \* window (the drain has claimed/dequeued the item; its GetResult /
+                             \* CompleteWaiterDeferred / clear are still pending). The hand argument
+                             \* under adjudication: (1) a taken item is no longer resident, so the
+                             \* NoNullWhileLive stomp face is gone; (2) the drain's own clear still
+                             \* runs after ours - double clear idempotent, no re-grant inside our
+                             \* hold; (3) grants serialize on the lock we hold. The suspect: the
+                             \* drain's clear is NOT inside our hold - after we release, a successor
+                             \* grant can land through the (now-open) gate BEFORE the drain's
+                             \* pending clear, which then stomps the fresh grant. TLC adjudicates
+                             \* (Pipeline_CommitSelfActVerifyOnTakenFix.cfg). FALSE = every prior
+                             \* config unaffected.
+                             \* VERDICT (July 2026): REFUTED - NoNullWhileLive, 33-state trace. Not
+                             \* via the successor-grant suspect (that face is UNREACHABLE: the store
+                             \* still COUNTS a claimed-but-not-yet-counted item, so every grant path
+                             \* - wasEmpty, C-path - stays closed through the taken window; probe
+                             \* OnTakenSuccessorGrantWindowUnreached HOLDS). The real face: hand
+                             \* argument (1) is false - "taken" is NOT "no longer resident" for the
+                             \* PIPELINE. In the claimed/dequeued-but-uncounted window the depth is
+                             \* still >= 1, and the restore nulls the activated slot mid-tenure (the
+                             \* _activatedItem NRE; the depth-0 clear discipline). The sound
+                             \* committer-observable is done /\ taken /\ COUNT RE-READ = 0:
+                             \* VerifyCountZeroImpliesRetired proves that conjunction implies
+                             \* loc = "Completed" over this variant's full state space.
+  ,
+  SplitRecoveryInlineAct     \* FIDELITY toggle (July 2026, the recovery inline-activate round).
+                             \* The execute-phase fault's ClearExecutingItem claim race and the
+                             \* recovery twins' ungated inline-activate. In code the fault (the
+                             \* throw) does NOT touch the deferred publish - the teardown belongs to
+                             \* ClearExecutingItem (Pipeline.cs 2214-2250), a LATER step whose
+                             \* in-lock claim races the advancer's C-path claim+activate; the LOST
+                             \* arm (2242-2244) leaves _executingItem populated because the advancer
+                             \* activated it - possibly AFTER the item already faulted (the fault is
+                             \* not lock-visible). Recovery (RecoverItem ~672-687 and
+                             \* RecoverCommittedTailWaiterAsync ~936-950) then republishes the
+                             \* substitute and inline-activates it on Count==0 with NO lock and NO
+                             \* _liveActivation gate - the only ungated activation sites in the file.
+                             \* FALSE = the shipped modeling: ExecItemFailure / ExecCommitTailRecovers
+                             \* FUSE the fault with the publish rollback (the claim race's
+                             \* executor-wins branch only, as their comments admit), so the C-path
+                             \* can never observe a faulted publish and the post-mortem grant is
+                             \* UNREACHABLE. TRUE = the fault leaves the publish INTACT; the
+                             \* executor's won-claim is its own following action (ExecFaultClearWon),
+                             \* the advancer's lost arm needs no new action - AdvancerCPathFire
+                             \* consuming the still-up publish of the now-Recovering item IS the
+                             \* post-mortem grant (the code's claim+activate under the lock, blind
+                             \* to the fault); and RecoverInstallWins/Loses + RecoverRefuse
+                             \* ("Recovering" face) are gated on claim-resolved (the publish no
+                             \* longer holds the parked item), matching the code's ordering -
+                             \* TryRecoverItemFailure runs strictly after ClearExecutingItem
+                             \* returned. A substitute's own fault (RecoverOnRecoveryFails) stays
+                             \* fused - the chain is single-level by construction and the
+                             \* second-level claim race is out of the Phase A bound. FALSE = every
+                             \* prior config unaffected. TRUE =
+                             \* Pipeline_RecoveryPostMortemWitness.cfg (the adjudication; control =
+                             \* Pipeline_RecoveryCPathBaseline.cfg with FALSE).
+  ,
+  QueueTrailingFault         \* Injection gate for DrainHeadRecovers (the Phase C queue trailing
+                             \* fault). TRUE = the injection as Phase C modeled it - which is now a
+                             \* KNOWN WIRING INFIDELITY (July 2026, found by the recovery
+                             \* inline-activate round's baseline control): DrainHeadRecovers parks
+                             \* the faulted queue head at "Recovering" (the EXECUTOR-side,
+                             \* enqueue-behind lifecycle: RecoverInstallWins/Loses commit the
+                             \* substitute to the store tail) and runs the next-head activation
+                             \* partition AT the fault. The code does neither: DrainReadyWaiters'
+                             \* catch (Pipeline.cs ~1534) routes to RecoverWaiter (~1765), which
+                             \* activates the substitute UNCONDITIONALLY IN PLACE (~1788) and
+                             \* executes it on the advancer chain - the substitute never enqueues;
+                             \* the DecrementCount AND the partition are DEFERRED past recovery
+                             \* (the advance=false return; AdvanceAndDrainRecovery rejoins) - the
+                             \* recovering item HOLDS its count credit. Under SingleActivationGate
+                             \* the mis-wiring manufactures a FALSE DEADLOCK: the fault-parked
+                             \* head's turn stays live, a committed waiter's wasEmpty self-activate
+                             \* gate-skips against it, the enqueue-behind substitute lands BEHIND
+                             \* that waiter, and the turn's clear waits on the substitute - a cycle
+                             \* the code cannot form precisely BECAUSE the in-place activation
+                             \* bypasses the gate (the substitution inherits the turn by design;
+                             \* that ungated activate is load-bearing for gate liveness).
+                             \* 33-state lasso: Pipeline_RecoveryCPathBaseline run of 2026-07-03
+                             \* pre-gate. GREEN pre-gate rounds are unaffected by the infidelity
+                             \* (nothing gates on the turn there), so TRUE preserves every prior
+                             \* config bit-for-bit. FALSE = injection excluded (the recovery
+                             \* inline-activate round's configs, which adjudicate the
+                             \* EXECUTOR-side twins - ExecItemFailure and ExecCommitTailRecovers
+                             \* remain live). The faithful repair - park "RecoveringInline",
+                             \* dequeue WITHOUT decrement (a new store op + a CountConsistency
+                             \* credit term), defer the partition to a queue rejoin action - is
+                             \* QUEUED, not in this round.
+  ,
+  ConsumableTaskTokens       \* FIDELITY toggle (July 2026, the consumable-token round). The
+                             \* spec's `taskDone` is a PERSISTENT, freely re-readable set - a
+                             \* fidelity gap: the code's waiter task is a ValueTask over a pooled
+                             \* IValueTaskSource, a SINGLE-CONSUMPTION token. It is readable
+                             \* (IsCompleted / GetStatus / OnCompleted) only until someone CONSUMES
+                             \* it (GetResult); consumption ends the token's lifetime and the
+                             \* pooled promise box is re-rented by a later flow (version bump), so
+                             \* any read from a STALE holder after consumption observes a recycled
+                             \* source and the version guard THROWS (Slon MRVTSC.GetStatus
+                             \* token-validation, the pump-fault convicted UPDATE 8, 2026-07-04).
+                             \* TRUE turns on the token lifecycle Live -> Completed -> Consumed:
+                             \* `tokenConsumed` marks an item at the drain's GetResult step (any
+                             \* read after that is the error; Recycled is modeled identical to
+                             \* Consumed), and every COMMIT-side POST-PUBLICATION task-state read
+                             \* (ExecCommitQueue/SlotCountArm's out-of-lock IsCompleted =
+                             \* Pipeline.cs:1136, the in-lock recheck = 1152, the verify done-leg =
+                             \* 1169, the callback-wiring IsCompleted = 1185 - the convicted
+                             \* thrower) trips `staleTokenRead` when it reads a Consumed token.
+                             \* The CONSUMER side (the drain claim paths under the advancer latch,
+                             \* WaiterStore's TryClaimSlotForDrain IsCompleted read) is
+                             \* protocol-protected - the claim confers EXCLUSIVE consumption, so
+                             \* those reads are legal PRE-CLAIM by construction and never trip.
+                             \* Meaningful only under the split-commit fidelity (SplitCommitSelfActivate
+                             \* /\ SplitCountCommit): the fused arms read task state atomically with
+                             \* the count and model no post-publication window. FALSE = tokenConsumed
+                             \* stays {} and staleTokenRead stays FALSE (both constant), so every
+                             \* prior config is behaviorally unaffected and state-count identical.
+                             \* Witness: Pipeline_CommitTokenWitness.cfg (NoStaleTokenRead RED).
+  ,
+  CommitOwnershipRestructure \* The FIX to adjudicate (July 2026, UPDATE 8 direction B). Meaningful
+                             \* only under ConsumableTaskTokens /\ the split-commit fidelity.
+                             \* Redesigns CommitWaiter so it NEVER touches the waiter task after
+                             \* publication:
+                             \*   (1) capture-once PRE-publication: `wasCompleted =
+                             \*       waiterTask.IsCompleted` read BEFORE TryEscalateOrEnqueue, in
+                             \*       the exclusive-ownership window (the item is still InTail, no
+                             \*       drain can have claimed it) - always token-legal. Modeled as
+                             \*       commitWasCompleted' captured at the VisibleWins/Loses publish.
+                             \*   (2) callback wiring moves BEFORE publication (RestructureWireBeforePublish
+                             \*       models the resulting late-visible-deposit face).
+                             \*   (3) all POST-publication decisions key on STORE WORDS only: the
+                             \*       ARM's wasEmpty self-activate uses the captured wasCompleted
+                             \*       (not a fresh taskDone read); the RECHECK drops its task read;
+                             \*       the VERIFY drops its task-done leg and keys on
+                             \*       storeCount = 0 /\ waiters = <<>> (count re-read + taken - the
+                             \*       observables the OnTaken/CountZero round proved imply
+                             \*       retirement under complete-before-decrement).
+                             \* TRUE: the post-publication commit reads take NO token, so
+                             \* NoStaleTokenRead holds BY CONSTRUCTION; the adjudication is whether
+                             \* the store-word decisions still deliver ActivatedAtMostOnce /
+                             \* ReadTurnMutex / EventuallyActivated. FALSE = the shipped protocol
+                             \* (the witness). Green target: Pipeline_CommitOwnershipFix.cfg.
+  ,
+  RestructureWireBeforePublish \* The late-visible-deposit face (July 2026), meaningful only under
+                             \* CommitOwnershipRestructure. Moving the callback wiring before the
+                             \* enqueue means the completion callback can FIRE (set the drain
+                             \* signal, trigger a pass) while the item is NOT YET VISIBLE in the
+                             \* store - the drain peeks nothing. TRUE injects that face: at the
+                             \* publish step, if the item's task is already done at capture
+                             \* (commitWasCompleted), the pre-wired callback's signal is raised
+                             \* BEFORE the enqueue lands (cbWiredPrePublish tracks the deposit),
+                             \* so the machinery that must rescue it (the commit's post-publication
+                             \* drainSignal nudge re-check + PendingWordLatch deposit +
+                             \* count-gated SignalConservation) is exercised against a genuinely
+                             \* early signal. FALSE = the callback's signal rides the ordinary
+                             \* post-publish path (no early window). Non-vacuity probes:
+                             \* Pipeline_CommitTokenLateVisible.cfg.
 
 VARIABLES
   loc,                  \* [Item -> Location] - per-item bucket.
@@ -467,9 +897,56 @@ VARIABLES
   \* TRUE if the slot drain's clear ever wiped activatedSlot while it pointed at an
   \* item that hadn't yet been completed - the stomp face of the bug. Bug witness for
   \* NoStompedActivation. Set in SlotDrainCompleteClear and never reset within a run.
-  slotStomped
+  slotStomped,
+
+  \* TRUE if an ACTIVATION ever moved activatedSlot off a still-live reader onto a new item -
+  \* two flows holding the one read turn at once. slotStomped catches a CLEAR stomping a live
+  \* reader; this catches an ACTIVATION doing it (the deferred-publish's "overrides any racing
+  \* write", the C-path/wasEmpty self-activate). The root is a single invariant - one read turn
+  \* at a time; a violation surfaces in several variations, no one of them canonical:
+  \* ReadState.ReadPromise's single-tenant TryStart throwing "async method already executing",
+  \* the shared PgDecoder re-armed under a live read, the _activatedItem slot stomped to NoItem
+  \* (the NRE). All faces of the same two-turn collision the _liveReaderActive single-reader gate
+  \* closes (Pipeline.cs, June 2026). Bug witness for ReadTurnMutex; set by ReadTurnMonitor,
+  \* conjoined into every action that writes activatedSlot (mirrors slotStomped/activatedSlot's
+  \* own UNCHANGED partition), never reset within a run.
+  readTurnStomped,
+
+\* The _liveActivation occupancy bit (SingleActivationGate; Pipeline.cs ~2003). TRUE while an
+\* activation is live: set by every ActivateHeadItem-equivalent (any action that bumps
+\* activations), cleared at every retirement (the CompleteWaiterDeferred-equivalents - the
+\* waiter/recovery completion transitions; the fault parks skip it, as the code's catch routes
+\* to RecoverWaiter instead of CompleteWaiterDeferred). Threaded through every action so the
+\* prior configs stay well-formed; READ only under SingleActivationGate, at the two gated sites.
+  liveActivation,
+
+\* Consumable-token lifecycle (ConsumableTaskTokens). A waiter task's single-consumption
+\* ValueTask: readable until a drain's GetResult CONSUMES it, after which any stale-holder read
+\* observes a recycled promise box (version bump) and throws. tokenConsumed is the set of items
+\* whose task has been GetResult'd (a drain reached its consume point); Recycled is modeled
+\* identical to Consumed (any read after Consumed is the error). Empty unless ConsumableTaskTokens.
+  tokenConsumed,
+
+\* Witness (ConsumableTaskTokens): a COMMIT-side POST-PUBLICATION action read a Consumed token's
+\* state (the shipped protocol's out-of-lock IsCompleted / in-lock recheck / verify done-leg /
+\* callback-wiring IsCompleted - Pipeline.cs 1136/1152/1169/1185). Bug witness for NoStaleTokenRead;
+\* set true and never reset. FALSE unless ConsumableTaskTokens, so prior configs are state-identical.
+  staleTokenRead,
+
+\* The restructure's PRE-publication IsCompleted capture (CommitOwnershipRestructure). Read in the
+\* exclusive-ownership window (item still InTail, before TryEscalateOrEnqueue) and consumed by the
+\* post-publication ARM/VERIFY decisions in place of a fresh taskDone read. One commit in flight
+\* (the executor is sequential), so a single boolean suffices. FALSE unless CommitOwnershipRestructure.
+  commitWasCompleted,
+
+\* Late-visible-deposit bookkeeping (RestructureWireBeforePublish). TRUE while a pre-wired callback
+\* raised the drain signal BEFORE its item became visible in the store (the enqueue not yet landed),
+\* so the drain it triggered peeked nothing - the window the commit's post-publish nudge + the
+\* PendingWordLatch deposit + count-gated conservation must rescue. FALSE unless the face toggle.
+  cbWiredPrePublish
 
 \* Variable groupings - used as `UNCHANGED group_name` in action bodies for compactness.
+token_vars   == <<tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 publish_vars == <<executingItem, executingItemVisible, hasExecuting, hasExecutingVisible>>
 tail_vars    == <<tailWaiter, hasTail>>
 adv_vars     == <<advancing, advancingVisible>>
@@ -483,30 +960,48 @@ item_vars    == <<loc, taskDone, activations, callbackFired, failed>>
 \* is included here so non-activation actions UNCHANGE it without ceremony; the W-wrappers
 \* for activation actions (which DO write activatedSlot) use aux_vars_act instead, which
 \* drops activatedSlot from the UNCHANGED bundle so the body's write isn't shadowed.
+\* Token-FREE aux copies (aux_vars0 / aux_vars_act0) for the commit token-WRITERS: those actions
+\* fully specify token_vars in their bodies (the stale-read trip, the pre-publication capture), so
+\* their wrappers must NOT re-constrain tokens. Every OTHER wrapper uses the token-FULL bundles.
+aux_vars0    == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
+                  tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
+                  callbackSignaled, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+aux_vars_act0   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, slotStomped,
+                     tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
+                     callbackSignaled, slotStomped, recoveryOf>>
 aux_vars     == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
                   tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
-                  callbackSignaled, slotStomped, recoveryOf>>
+                  callbackSignaled, slotStomped, recoveryOf, readTurnStomped, liveActivation,
+                  tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 \* aux minus the queue-drain PC, for wrappers of actions that WRITE qDrainPhase
 \* (the advancer-acquire entries under PassOnceDrain).
 aux_nophase  == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                   tenure, assertFailed, nullActivation, advancingPending,
-                  callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                  callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation,
+                  tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 \* aux minus the PC and the latch pending bit, for the release steps (they write both).
 aux_relmin   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
-                  tenure, assertFailed, nullActivation, callbackSignaled, slotStomped, recoveryOf>>
+                  tenure, assertFailed, nullActivation, callbackSignaled, slotStomped, recoveryOf, readTurnStomped, liveActivation,
+                  tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 \* aux minus only the latch pending bit, for the bail wrappers (failed acquire deposits).
 aux_nopend   == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
                   tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                  callbackSignaled, slotStomped, recoveryOf>>
+                  callbackSignaled, slotStomped, recoveryOf, readTurnStomped, liveActivation,
+                  tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 \* aux_vars variants for actions that WRITE activatedSlot (any ActivateHeadItem-equivalent
 \* and any CompleteWaiterDeferred-equivalent slot clear). Identical to the matching aux_*
 \* but DROPS activatedSlot so the W-wrapper doesn't conflict with the body's write.
+\* NOTE: the _act bundles stay token-FREE (like they are activatedSlot/readTurnStomped/
+\* liveActivation-free): the activation-writing actions manage token vars explicitly at the
+\* wrapper level (the commit arms write them; every other _act wrapper adds UNCHANGED token_vars).
 aux_vars_act    == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, slotStomped,
                      tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
-                     callbackSignaled, slotStomped, recoveryOf>>
+                     callbackSignaled, slotStomped, recoveryOf,
+                     tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 aux_nophase_act == <<drainPhase, drainItem, drainRemaining, pendingHeadActivation, slotStomped,
                      tenure, assertFailed, nullActivation, advancingPending,
-                     callbackSignaled, slotStomped, recoveryOf>>
+                     callbackSignaled, slotStomped, recoveryOf,
+                     tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 
 vars == <<loc, taskDone, activations, callbackFired, failed,
           executingItem, executingItemVisible, hasExecuting, hasExecutingVisible,
@@ -515,7 +1010,8 @@ vars == <<loc, taskDone, activations, callbackFired, failed,
           escPhase, escTail, escSlotClaimed, escMoved, drainerActive,
           drainPhase, drainItem, drainRemaining, pendingHeadActivation, activatedSlot, slotStomped,
           tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
-          callbackSignaled, slotStomped, recoveryOf>>
+          callbackSignaled, slotStomped, recoveryOf, readTurnStomped, liveActivation,
+          tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
 
 \* Item / NoItem come from WaiterStore.tla.
 \* InWaitersPending: transient state inside CommitWaiter's queue path between waiters.Enqueue
@@ -539,6 +1035,11 @@ vars == <<loc, taskDone, activations, callbackFired, failed,
 \* InSlotPending: the slot commit's CAS landed but the field writes haven't (SplitSlotFieldOps;
 \* the slot-tier mirror of InWaitersPending). The slot is claimable in this state - a claim
 \* Exchange here reads the previous tenure's cleared fields (NoDefaultSlotClaim's window).
+\* DispatchArmed: the split elision window (SplitIdleDispatchGuard): the executor has read the
+\* elision guard (count/latch/pending) and vouched for idle, but has not yet run ActivateHeadItem.
+\* Executor PC state riding loc - the item is in the executor's hand, in no store tier, its task
+\* cannot complete (ExecuteItemAsync has not run). Unreachable unless LockFreeIdleDispatch /\
+\* SplitIdleDispatchGuard.
 \* RecoveringInline: a DRAIN-side park (the drain's GetResult faulted on a committed waiter;
 \* RecoverWaiter on the advancer thread). Distinct from "Recovering" (executor-side parks)
 \* because the two recovery lifecycles diverge in code: the executor-side substitute mirrors
@@ -550,7 +1051,7 @@ vars == <<loc, taskDone, activations, callbackFired, failed,
 \* re-activated by the store's wasEmpty/D-path arms once it queued behind a live successor).
 Locations == {"Nowhere", "Executing", "InTail", "InSlot", "InSlotPending", "InEscalation",
               "InWaitersPending", "InWaiters", "Recovering", "RecoveringInline", "Draining",
-              "Completed"}
+              "DispatchArmed", "Completed"}
 
 \* depth-0 slot clear (the shipped CompleteWaiterDeferred): the slot returns to NoItem only when THIS
 \* completion empties the pipeline (every other item already Completed). Otherwise the slot keeps its
@@ -558,6 +1059,58 @@ Locations == {"Nowhere", "Executing", "InTail", "InSlot", "InSlotPending", "InEs
 \* by this action. Replaces the pre-fix identity-clear, which nulled the owner the instant it
 \* completed (violating NoNullWhileLive when a later item was still pending).
 DepthZeroClear(S) == IF (\A j \in Item \ S : loc[j] = "Completed") THEN NoItem ELSE activatedSlot
+
+\* The _liveActivation gate's read (SingleActivationGate): TRUE when an activation may be
+\* granted at a gated site - either the gate is unmodeled (pre-fix configs) or no activation
+\* is live. Used ONLY by the two gated sites (CommitWaiter's wasEmpty self-activate and the
+\* advancer's queue C-path); every other activation path ignores it, as the code does.
+GateOpen == ~SingleActivationGate \/ ~liveActivation
+
+\* Consumable-token helpers (ConsumableTaskTokens). Gated on the toggle so both stay CONSTANT
+\* (tokenConsumed = {}, staleTokenRead = FALSE) in every prior config - the state count is preserved.
+\* ConsumeToken marks item i's waiter task Consumed at a drain's GetResult (the token's lifetime
+\* ends; Recycled is modeled identical). CommitTokenTrip fires the witness when a COMMIT-side
+\* POST-PUBLICATION read (SHIPPED protocol only - the restructure never reads task state after
+\* publication) observes item i already Consumed (Pipeline.cs 1136/1152/1169/1185, the same
+\* single-consumption ValueTask read class; 1185's callback-wiring IsCompleted is the convicted thrower).
+ConsumeToken(i) == tokenConsumed' = IF ConsumableTaskTokens THEN tokenConsumed \cup {i} ELSE tokenConsumed
+CommitTokenTrip(i) ==
+  staleTokenRead' = IF ConsumableTaskTokens /\ ~CommitOwnershipRestructure /\ i \in tokenConsumed
+                    THEN TRUE ELSE staleTokenRead
+
+\* Read-turn mutex witness. Conjoined into every action that WRITES activatedSlot (the same
+\* actions that drop it from their UNCHANGED - the _act W-forms and the in-body activators/
+\* clearers); non-writers UNCHANGE readTurnStomped via the aux bundles, exactly as they do
+\* activatedSlot. Reading activatedSlot' generically means one conjunct covers every arm and
+\* every conditional activatedSlot' the action may take. Sets the witness TRUE when an
+\* ACTIVATION moves the slot off a still-live reader onto a new item - two flows holding the
+\* single-tenant read baton (ReadState.ReadPromise) at once, and the shared PgDecoder re-armed
+\* under a live read. slotStomped catches the mirror face (a CLEAR landing on a live item); the
+\* live-reader predicate is shared (loc \notin {Completed, Nowhere}). A legitimate handoff
+\* activates only after the predecessor retired (loc = Completed), so it does not trip. Note
+\* tenure is NOT this resource: tenure = activation-occupancy from the EXECUTOR's single
+\* dispatch (set on inline-dispatch / recovery-install, released at consume), so the advancer/
+\* drain activations (C-path, wasEmpty, drain-head) never touch it - the read turn as a
+\* cross-path shared resource was never modeled at all. That is the fidelity gap this fills.
+ReadTurnMonitor ==
+  readTurnStomped' =
+    IF /\ activatedSlot \in Item          \* slot held a real item...
+       /\ activatedSlot' \in Item         \* ...and the step is an ACTIVATION (fresh real item), not a clear
+       /\ activatedSlot' # activatedSlot  \* ...moved to a DIFFERENT item
+       \* ...whose predecessor was still a live reader of the SHARED tenure. Excludes Completed/
+       \* Nowhere (as slotStomped does) AND Recovering/RecoveringInline: a faulted item does not
+       \* hold a SECOND tenure - its substitute takes over that SAME read tenure in place (the
+       \* faulted identity is replaced and disappears, RecoverInstall*/RecoverItem*), so installing
+       \* the substitute over a Recovering slot is a handoff of the one tenure, not two readers.
+       /\ loc[activatedSlot] \notin {"Completed", "Nowhere", "Recovering", "RecoveringInline"}
+       \* ...AND the predecessor is not being RETIRED in this same step. A single-path handoff
+       \* (AdvancerDrainHead completes the drained head AND activates the next head atomically)
+       \* moves the slot off a pre-state-live item that is Completed by the very same step - the
+       \* turn ends as the next begins, one reader throughout. The stomp is TWO turns coexisting:
+       \* the displaced item must STILL be live after the step (post-state loc also live).
+       /\ loc'[activatedSlot] \notin {"Completed", "Nowhere", "Recovering", "RecoveringInline"}
+    THEN TRUE
+    ELSE readTurnStomped
 
 (* ===========================================================================
    Init
@@ -594,6 +1147,12 @@ Init ==
   /\ nullActivation = FALSE
   /\ activatedSlot = NoItem
   /\ slotStomped = FALSE
+  /\ readTurnStomped = FALSE
+  /\ liveActivation = FALSE
+  /\ tokenConsumed = {}
+  /\ staleTokenRead = FALSE
+  /\ commitWasCompleted = FALSE
+  /\ cbWiredPrePublish = FALSE
 
 (* ===========================================================================
    External actions: task completion
@@ -654,6 +1213,7 @@ SourceYieldInline ==
   /\ escPhase = "idle"  \* executor only yields next item after current commit completes
   /\ \A i \in Item : loc[i] # "Executing"  \* executor is sequential
   /\ \A i \in Item : loc[i] # "Recovering" \* pending recovery must install before next yield
+  /\ \A i \in Item : loc[i] # "DispatchArmed"  \* executor is mid-elision (one thread, one PC)
   /\ tenure = NoItem  \* the dispatch's TryStart
   /\ \E i \in Item :
        /\ loc[i] = "Nowhere"  \* item not yet yielded by source
@@ -662,9 +1222,12 @@ SourceYieldInline ==
        /\ activations' = [activations EXCEPT ![i] = @ + 1]
        /\ tenure' = i
        /\ activatedSlot' = i  \* ActivateHeadItem writes _activatedItem = item
+       /\ liveActivation' = TRUE  \* ActivateHeadItem grants the activation turn
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
                  taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Source yields next item with existing waiters - deferred publish.
 SourceYieldDeferred ==
@@ -673,6 +1236,7 @@ SourceYieldDeferred ==
   /\ escPhase = "idle"
   /\ \A i \in Item : loc[i] # "Executing"
   /\ \A i \in Item : loc[i] # "Recovering"
+  /\ \A i \in Item : loc[i] # "DispatchArmed"  \* executor is mid-elision (one thread, one PC)
   /\ \E i \in Item :
        /\ loc[i] = "Nowhere"
        /\ SourceSlot(i)
@@ -686,6 +1250,106 @@ SourceYieldDeferred ==
             ELSE FencedWriteOk(hasExecuting', hasExecutingVisible', TRUE)
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars,
                  taskDone, activations, callbackFired, failed, waiters, esc_vars, drainer_vars>>
+
+(* ===========================================================================
+   Idle-regime lock elision (LockFreeIdleDispatch): the escalated dispatch's
+   proposed lock-free arm. The shipped escalated dispatch (Pipeline.cs ~390-421)
+   is modeled by SourceYieldInline (count 0: publish pending + claim it back +
+   activate, net inline - fused as one atomic action, honest because the lock
+   serializes it against the C-path lock block) and SourceYieldDeferred
+   (count > 0: deferred publish). The elision arm reads
+     count = 0 (clamped public read: storeCount <= 0; at dispatch the
+       executor-side skew windows are closed - escPhase = "idle" - so <= 0
+       coincides with = 0, stated clamped for fidelity)
+     /\ ~advancingVisible (the latch word, remote read; acquires are
+       interlocked so FALSE is never stale-free)
+     /\ ~hasExecuting (pending, own-thread read)
+   and on success activates the head inline with NO lock and NO pending
+   publish. Guard failure falls to the locked arm - SourceYieldInline /
+   SourceYieldDeferred stay enabled unchanged (the model keeps the locked
+   count-0 dispatch enabled even where the guard holds: an over-approximation
+   that only adds already-verified behaviors).
+   =========================================================================== *)
+
+\* FUSED fidelity level (~SplitIdleDispatchGuard): guard reads + activation as one atomic
+\* action. Adjudicates the pure logic. Note the guard is strictly stronger than
+\* SourceYieldInline's (same dispatch state, extra latch/pending conjuncts + escalated), so
+\* this action's behaviors are a SUBSET of the verified locked dispatch's - fused green is
+\* the expected baseline, not evidence about the check-then-act window.
+SourceYieldElide ==
+  /\ LockFreeIdleDispatch
+  /\ ~SplitIdleDispatchGuard
+  /\ escalated              \* the elision arm is the ESCALATED fork's; pre-escalation
+                            \* dispatch is already lock-free (SourceYieldInline as-is)
+  /\ storeCount <= 0        \* the clamped public Count read (see block comment)
+  /\ ~advancingVisible      \* latch not held (remote read of the latch word)
+  /\ ~hasExecuting          \* pending not set (own-thread read)
+  /\ ~hasTail
+  /\ escPhase = "idle"
+  /\ \A i \in Item : loc[i] # "Executing"
+  /\ \A i \in Item : loc[i] # "Recovering"
+  /\ \A i \in Item : loc[i] # "DispatchArmed"
+  /\ tenure = NoItem
+  /\ \E i \in Item :
+       /\ loc[i] = "Nowhere"
+       /\ SourceSlot(i)
+       /\ loc' = [loc EXCEPT ![i] = "Executing"]
+       /\ activations' = [activations EXCEPT ![i] = @ + 1]
+       /\ tenure' = i
+       /\ activatedSlot' = i  \* ActivateHeadItem writes _activatedItem = item
+       /\ liveActivation' = TRUE  \* ActivateHeadItem grants the activation turn
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
+                 taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
+
+\* SPLIT fidelity level, step 1 (SplitIdleDispatchGuard): the guard's three reads as their
+\* own action - the check half of the check-then-act. The picked item parks in
+\* DispatchArmed (executor PC riding loc; blocks every other executor dispatch step, as
+\* one thread's program order does). Every OTHER thread interleaves freely before the act:
+\* a callback can acquire the latch, a drainer's post-release tail can reclaim, counts can
+\* move - whatever work exists to move them.
+SourceYieldElideArm ==
+  /\ LockFreeIdleDispatch
+  /\ SplitIdleDispatchGuard
+  /\ escalated
+  /\ storeCount <= 0        \* guard read 1: the clamped public Count
+  /\ ~advancingVisible      \* guard read 2: the latch word
+  /\ ~hasExecuting          \* guard read 3: pending
+  /\ ~hasTail
+  /\ escPhase = "idle"
+  /\ \A i \in Item : loc[i] # "Executing"
+  /\ \A i \in Item : loc[i] # "Recovering"
+  /\ \A i \in Item : loc[i] # "DispatchArmed"
+  /\ tenure = NoItem
+  /\ \E i \in Item :
+       /\ loc[i] = "Nowhere"
+       /\ SourceSlot(i)
+       /\ loc' = [loc EXCEPT ![i] = "DispatchArmed"]
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
+                 taskDone, activations, callbackFired, failed, waiters, esc_vars, drainer_vars,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
+                 callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
+
+\* SPLIT fidelity level, step 2: the act. NO re-reads - the arm's guard is the only
+\* license, possibly stale by now. Activates inline exactly as the fused arm does. WF in
+\* Spec: this is the executor's unconditional next program step once armed.
+SourceYieldElideAct ==
+  /\ \E i \in Item :
+       /\ loc[i] = "DispatchArmed"
+       /\ loc' = [loc EXCEPT ![i] = "Executing"]
+       /\ activations' = [activations EXCEPT ![i] = @ + 1]
+       /\ tenure' = i
+       /\ activatedSlot' = i
+       /\ liveActivation' = TRUE
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars,
+                 taskDone, callbackFired, failed, waiters, esc_vars, drainer_vars,
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Executor stores item as tail after ExecuteItemAsync returns (async pipelineTask).
 \* ~hasTail: _tailWaiter is a single executor-owned cell, written only after the previous
@@ -753,6 +1417,7 @@ ExecCommitTailExecutorWins ==
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
             /\ activatedSlot' = DepthZeroClear({i})
+            /\ liveActivation' = FALSE  \* CompleteWaiterDeferred releases the turn at retirement
             /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
@@ -760,28 +1425,35 @@ ExecCommitTailExecutorWins ==
               THEN \* Slot path: zero-alloc, wire slot callback. Fused fiction only; the
                    \* split triple (ExecCommitSlotCAS*/Fields/Count*) covers this case
                    \* under SplitSlotFieldOps.
+                   \* wasEmpty self-activate: GATED under SingleActivationGate - a live
+                   \* activation defers to the advancer's FIFO; the commit still lands.
                 /\ ~SplitSlotFieldOps
                 /\ StoreSlotCommit(i)
                 /\ loc' = [loc EXCEPT ![i] = "InSlot"]
-                /\ activations' = IF storeCount = 0
+                /\ activations' = IF storeCount = 0 /\ GateOpen
                                   THEN [activations EXCEPT ![i] = @ + 1]
                                   ELSE activations
-                /\ activatedSlot' = IF storeCount = 0 THEN i ELSE activatedSlot
+                /\ activatedSlot' = IF storeCount = 0 /\ GateOpen THEN i ELSE activatedSlot
+                /\ liveActivation' = IF storeCount = 0 /\ GateOpen THEN TRUE ELSE liveActivation
                 /\ drainSignal' = drainSignal
               ELSE \* Post-escalation queue path (escalated guard inside the operator).
                    \* Loosened CAS: no slot manipulation (PostEscalationSlotEmpty).
                    \* Fused fiction only; the split pair (ExecCommitQueueVisible*/Count*)
                    \* covers this case under SplitCountCommit.
+                   \* wasEmpty self-activate: GATED (see the slot arm).
                 /\ ~SplitCountCommit
                 /\ StoreQueueEnqueue(i)
                 /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
-                /\ activations' = IF storeCount = 0
+                /\ activations' = IF storeCount = 0 /\ GateOpen
                                   THEN [activations EXCEPT ![i] = @ + 1]
                                   ELSE activations
-                /\ activatedSlot' = IF storeCount = 0 THEN i ELSE activatedSlot
+                /\ activatedSlot' = IF storeCount = 0 /\ GateOpen THEN i ELSE activatedSlot
+                /\ liveActivation' = IF storeCount = 0 /\ GateOpen THEN TRUE ELSE liveActivation
                 /\ drainSignal' = drainSignal
   /\ UNCHANGED <<adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* CommitTailWaiter, advancer won (alreadyActivated = true). Executor skips _executingItem clear.
 ExecCommitTailExecutorLoses ==
@@ -800,6 +1472,7 @@ ExecCommitTailExecutorLoses ==
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activations' = activations
             /\ activatedSlot' = DepthZeroClear({i})
+            /\ liveActivation' = FALSE  \* CompleteWaiterDeferred releases the turn at retirement
             /\ drainSignal' = drainSignal
             /\ UNCHANGED <<hasSlot, slotItem, escalated, waiters, storeCount>>
           ELSE
@@ -811,6 +1484,7 @@ ExecCommitTailExecutorLoses ==
                 /\ loc' = [loc EXCEPT ![i] = "InSlot"]
                 /\ activations' = activations
                 /\ activatedSlot' = activatedSlot
+                /\ liveActivation' = liveActivation
                 /\ drainSignal' = drainSignal
               ELSE \* Post-escalation queue path (loosened CAS, escalated guard in the operator).
                    \* Fused fiction only (see ExecCommitTailExecutorWins's queue arm).
@@ -819,9 +1493,12 @@ ExecCommitTailExecutorLoses ==
                 /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
                 /\ activations' = activations
                 /\ activatedSlot' = activatedSlot
+                /\ liveActivation' = liveActivation
                 /\ drainSignal' = drainSignal
   /\ UNCHANGED <<publish_vars, adv_vars, taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Pre-faulted commit (RecoverySplit, Phase D). CommitTailWaiter observes the tail's pipeline
 \* task already SETTLED and FAULTED at commit time - the code's
@@ -852,6 +1529,12 @@ ExecCommitTailRecovers ==
        /\ tailWaiter' = NoItem
        /\ hasTail' = FALSE
        /\ tenure' = IF tenure = i THEN NoItem ELSE tenure
+       \* NOT split under SplitRecoveryInlineAct: this twin's claim race resolves BEFORE the
+       \* fault park in program order (CommitTailWaiter's in-lock claim precedes the
+       \* IsCompleted check - Pipeline.cs ~863-882), so the fused consume is already
+       \* faithful; a C-path grant of the settled tail lands PRE-park (while InTail) and is
+       \* explored as-is. Only the execute-phase twin (ExecItemFailure), where the fault
+       \* precedes ClearExecutingItem, gets the split.
        /\ (IF hasExecuting  \* own-thread observation: the Exchange preceded the IsCompleted check
             THEN /\ hasExecuting' = FALSE
                  /\ hasExecutingVisible' = FALSE
@@ -862,7 +1545,8 @@ ExecCommitTailRecovers ==
                  taskDone, activations, callbackFired, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending,
-                 callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 (* ===========================================================================
    Truthful queue commit (SplitCountCommit): TryEscalateOrEnqueue's post-
@@ -891,8 +1575,24 @@ ExecCommitQueueVisibleWins ==
        /\ tailWaiter' = NoItem
        /\ hasTail' = FALSE
        /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
-  /\ UNCHANGED <<adv_vars, drainSignal, taskDone, activations, callbackFired, failed,
-                 drainer_vars>>
+       \* CommitOwnershipRestructure: capture-once PRE-publication (Pipeline.cs restructured
+       \* 1125-ish: `wasCompleted = waiterTask.IsCompleted` BEFORE TryEscalateOrEnqueue). The item
+       \* is still exclusively owned (InTail pre-state; no drain has claimed it), so this read is
+       \* always token-legal. The VisibleWins guard already routes a done-at-commit item to the
+       \* fused sync path, so on the split path the captured value is FALSE - faithful: the
+       \* restructure's whole point is that a mid-flight completion is NOT re-observed.
+       /\ commitWasCompleted' = IF CommitOwnershipRestructure THEN (i \in taskDone) ELSE commitWasCompleted
+       \* Late-visible-deposit face (RestructureWireBeforePublish): with the callback wired
+       \* BEFORE this enqueue, its completion signal can already be up when the item becomes
+       \* visible, and the pre-wired callback's own drain pass peeked NOTHING (the item was still
+       \* InTail). Model the conserved deposit: the drain signal is raised and the window flag set
+       \* as the item lands resident-but-un-drained. The rescue is the commit's own post-publish
+       \* nudge (Pipeline.cs:1217 re-reads _drainSignal after TryEscalateOrEnqueue and drains) plus
+       \* count-gated SignalConservation - EventuallyCompleted/Activated must still hold.
+       /\ drainSignal' = IF RestructureWireBeforePublish THEN TRUE ELSE drainSignal
+       /\ cbWiredPrePublish' = IF RestructureWireBeforePublish THEN TRUE ELSE cbWiredPrePublish
+  /\ UNCHANGED <<adv_vars, taskDone, activations, callbackFired, failed,
+                 drainer_vars, tokenConsumed, staleTokenRead>>
 
 \* Step 1, executor lost (alreadyActivated = true): no publish touch, no activation later.
 ExecCommitQueueVisibleLoses ==
@@ -905,8 +1605,9 @@ ExecCommitQueueVisibleLoses ==
        /\ tailWaiter' = NoItem
        /\ hasTail' = FALSE
        /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
+       /\ commitWasCompleted' = IF CommitOwnershipRestructure THEN (i \in taskDone) ELSE commitWasCompleted
   /\ UNCHANGED <<publish_vars, adv_vars, drainSignal, taskDone, activations,
-                 callbackFired, failed, drainer_vars>>
+                 callbackFired, failed, drainer_vars, tokenConsumed, staleTokenRead, cbWiredPrePublish>>
 
 \* Step 2: the increment. The wasEmpty partition (post-increment count == 1, i.e.
 \* pre-increment 0) and the activation's IsCompleted skip both live HERE, where the code
@@ -914,20 +1615,180 @@ ExecCommitQueueVisibleLoses ==
 \* quiet face of the count-skew: at a skewed pre-increment count of -1 the post value is 0,
 \* wasEmpty is FALSE, and the committer skips an activation no drain will perform either.
 ExecCommitQueueCountWins ==
+  /\ ~SplitCommitSelfActivate  \* FUSED: the split arm (ARM/ACT) replaces this under the toggle
   /\ escPhase = "q_enq_act"
   /\ LET i == escTail IN
-       activations' = IF storeCount = 0 /\ i \notin taskDone
-                      THEN [activations EXCEPT ![i] = @ + 1]
-                      ELSE activations
+       \* wasEmpty self-activate, split-commit form: GATED under SingleActivationGate
+       \* (the code's `wasEmpty && !IsCompleted && !_liveActivation` under _activationLock).
+       /\ activations' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen
+                         THEN [activations EXCEPT ![i] = @ + 1]
+                         ELSE activations
+       /\ liveActivation' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen
+                            THEN TRUE ELSE liveActivation
   /\ StoreCommitCount("idle")
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
                  callbackFired, failed, drainer_vars>>
 
+(* ===========================================================================
+   SplitCommitSelfActivate: ExecCommitQueueCountWins as its two real instructions.
+
+   ARM  = _waiters.Enqueue's Interlocked.Increment (StoreCommitCount inlined so escTail
+          survives as the item handle) fused with the CAPTURE of `wasEmpty` (pre-increment
+          storeCount = 0) and the OUT-OF-LOCK IsCompleted check (i \notin taskDone). The
+          verdict rides escPhase: "q_selfact_fire" (both held -> the lock will be taken) or
+          "q_selfact_done" (either failed -> the code takes no lock, no activation). The item
+          stays InWaitersPending, now COUNTED; every other thread is free to run.
+
+   ACT  = the lock/gate/activate. The IsCompleted verdict is the CAPTURED one (no re-read);
+          the gate (GateOpen) IS re-read fresh, matching `!_liveActivation` under the lock.
+          CommitSelfActRecheck adds an IsCompleted re-read at act time. Queue arm: no
+          activatedSlot write (mirrors ExecCommitQueueCountWins exactly).
+   =========================================================================== *)
+
+\* ARM: the increment + the wasEmpty/IsCompleted capture, verdict onto escPhase, escTail kept.
+ExecCommitQueueCountArm ==
+  /\ SplitCommitSelfActivate
+  /\ escPhase = "q_enq_act"
+  /\ LET i == escTail IN
+       \* wasEmpty && !IsCompleted. SHIPPED: fresh post-publication `i \notin taskDone`
+       \* (Pipeline.cs:1136 out-of-lock IsCompleted) - a POST-PUBLICATION token read, tripped
+       \* by CommitTokenTrip when the item was drain-Consumed. RESTRUCTURE: the pre-publication
+       \* captured verdict `~commitWasCompleted` (no token read - the exclusive-window capture).
+       LET notDone == IF CommitOwnershipRestructure THEN ~commitWasCompleted ELSE i \notin taskDone IN
+       /\ storeCount' = storeCount + 1                          \* Interlocked.Increment
+       /\ escPhase' = IF storeCount = 0 /\ notDone
+                      THEN "q_selfact_fire" ELSE "q_selfact_done"
+       /\ CommitTokenTrip(i)
+  /\ escTail' = escTail                                          \* item handle preserved
+  /\ escSlotClaimed' = FALSE
+  /\ escMoved' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, tokenConsumed, commitWasCompleted, cbWiredPrePublish>>
+
+\* ACT, fire face: captured wasEmpty && !IsCompleted. The lock body re-reads the gate fresh
+\* (GateOpen) and, under CommitSelfActRecheck, re-reads IsCompleted; on a live gate (or a
+\* re-checked completed task) it leaves the item committed-unactivated, exactly as the code's
+\* `if (!_liveActivation)` / IsCompleted skip does. NO activatedSlot write (queue mirror).
+ExecCommitQueueCountActFire ==
+  /\ ~SplitCommitSelfActRecheck  \* SPLIT: RECHECK/FIRE(/VERIFY) replace the fused re-read+activate
+  /\ escPhase = "q_selfact_fire"
+  /\ LET i == escTail IN
+       \* SHIPPED: the in-lock recheck (Pipeline.cs:1152) re-reads `i \notin taskDone` under
+       \* CommitSelfActRecheck - a POST-PUBLICATION token read. RESTRUCTURE: dropped (gate only).
+       LET doAct == GateOpen /\ (CommitOwnershipRestructure \/ ~CommitSelfActRecheck \/ i \notin taskDone) IN
+       /\ activations' = IF doAct THEN [activations EXCEPT ![i] = @ + 1] ELSE activations
+       /\ liveActivation' = IF doAct THEN TRUE ELSE liveActivation
+       \* trip only when the recheck read actually exists (shipped CommitSelfActRecheck)
+       /\ staleTokenRead' = IF ConsumableTaskTokens /\ ~CommitOwnershipRestructure /\ CommitSelfActRecheck /\ i \in tokenConsumed
+                            THEN TRUE ELSE staleTokenRead
+  /\ escPhase' = "idle"
+  /\ escTail' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved,
+                 tokenConsumed, commitWasCompleted, cbWiredPrePublish>>
+
+(* ===========================================================================
+   SplitCommitSelfActRecheck, queue arm: the fused ActFire as the two (RECHECK, FIRE) or three
+   (RECHECK, FIRE, VERIFY) instructions the code performs inside the ONE _activationLock hold
+   (Pipeline.cs 1127-1144). The lock is taken at 1127; escPhase in the *_selfact_{fire,dofire,
+   verify} window IS that hold (SelfActLockHeld / NoForeignGrant enforce mutual exclusion).
+   =========================================================================== *)
+
+\* RECHECK (queue): Pipeline.cs:1134 `!waiterTask.IsCompleted` re-read as its own in-lock step;
+\* park "q_selfact_dofire" when not done, else go idle (the code skips the activate). The gate
+\* re-read is deferred to FIRE (matching the fresh `!_liveActivation` read at act time).
+ExecCommitQueueRecheck ==
+  /\ SplitCommitSelfActRecheck
+  /\ escPhase = "q_selfact_fire"
+  \* SHIPPED: `escTail \notin taskDone` re-read (Pipeline.cs:1152) - POST-PUBLICATION token read.
+  \* RESTRUCTURE: the in-lock recheck is DROPPED; the phase advances to FIRE unconditionally and
+  \* FIRE decides on the gate + store words alone (no token read here).
+  /\ LET i == escTail
+         goFire == IF CommitOwnershipRestructure THEN TRUE ELSE i \notin taskDone IN
+       /\ IF goFire
+            THEN /\ escPhase' = "q_selfact_dofire"
+                 /\ escTail'  = escTail
+            ELSE /\ escPhase' = "idle"
+                 /\ escTail'  = NoItem
+       /\ CommitTokenTrip(i)
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved,
+                 tokenConsumed, commitWasCompleted, cbWiredPrePublish>>
+
+\* FIRE (queue): Pipeline.cs:1137 ActivateHeadItem, a SEPARATE in-lock instruction. Consumes the
+\* CAPTURED (recheck) not-done verdict; the gate (GateOpen) is re-read fresh. The completion +
+\* off-lock retirement can land between RECHECK and FIRE - the stale verdict then fires on the
+\* retired item. On a grant, park "q_selfact_verify" (CommitSelfActVerify) else return to idle.
+ExecCommitQueueFire ==
+  /\ escPhase = "q_selfact_dofire"
+  /\ LET i == escTail IN
+       LET doAct == GateOpen IN
+       /\ activations' = IF doAct THEN [activations EXCEPT ![i] = @ + 1] ELSE activations
+       /\ liveActivation' = IF doAct THEN TRUE ELSE liveActivation
+       /\ escPhase' = IF doAct /\ CommitSelfActVerify THEN "q_selfact_verify" ELSE "idle"
+       /\ escTail' = IF doAct /\ CommitSelfActVerify THEN escTail ELSE NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved,
+                 tokenConsumed, staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
+
+\* VERIFY (queue): still inside the lock, reached only when FIRE granted. Re-read taskDone; if the
+\* item is now done the grant is stuck (its retirement ran off-lock between RECHECK and FIRE), so
+\* self-clear it - liveActivation' = FALSE, idempotent with the drain's clear. Not done ->
+\* passthrough (a legitimately live activation). The spurious activations[i] bump is ACCEPTED.
+\* CommitSelfActVerifyOnTaken: the trip keys on task-done AND taken (the producer-side first==last
+\* emptiness read - the drain dequeues before completing, so emptiness proves our sole enqueue
+\* left the store), the committer-observable the code actually has; trips earlier than the
+\* retirement-keyed shape (also fires with the dequeue done but the drain's own clear pending).
+ExecCommitQueueVerify ==
+  /\ escPhase = "q_selfact_verify"
+  /\ LET i == escTail
+         \* SHIPPED: reads `i \in taskDone` (Pipeline.cs:1169 verify done-leg) - POST-PUBLICATION
+         \* token read, tripped by staleTokenRead when Consumed. RESTRUCTURE: drops the task-done
+         \* leg entirely and keys on STORE WORDS - storeCount = 0 (the count re-read) AND
+         \* waiters = <<>> (producer-side taken). VerifyCountZeroImpliesRetired /
+         \* RestructureVerifyStoreWordsImplyRetired adjudicate whether that two-way conjunction
+         \* implies the item is retired without the task-done leg.
+         trip == IF CommitOwnershipRestructure
+                   THEN storeCount = 0 /\ waiters = <<>>
+                   ELSE i \in taskDone /\ (~CommitSelfActVerifyOnTaken \/ waiters = <<>>)
+     IN /\ liveActivation' = IF trip THEN FALSE ELSE liveActivation
+        /\ staleTokenRead' = IF ConsumableTaskTokens /\ ~CommitOwnershipRestructure /\ i \in tokenConsumed
+                             THEN TRUE ELSE staleTokenRead
+  /\ escPhase' = "idle"
+  /\ escTail' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved,
+                 tokenConsumed, commitWasCompleted, cbWiredPrePublish>>
+
+\* ACT, done face: captured verdict was don't-fire (not wasEmpty, or task already done at ARM).
+\* The code takes no lock and does not activate; the commit simply returns.
+ExecCommitQueueCountActDone ==
+  /\ escPhase = "q_selfact_done"
+  \* The unconditional callback-wiring read (Pipeline.cs:1185 `if (waiterTask.IsCompleted)`) - THE
+  \* convicted thrower - runs at every commit exit, including this non-self-activating one. SHIPPED:
+  \* a POST-PUBLICATION token read on `escTail`, tripped when Consumed. RESTRUCTURE: moved
+  \* pre-publication (the callback was wired before TryEscalateOrEnqueue), so no read here.
+  /\ CommitTokenTrip(escTail)
+  /\ escPhase' = "idle"
+  /\ escTail' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved,
+                 tokenConsumed, commitWasCompleted, cbWiredPrePublish>>
+
 ExecCommitQueueCountLoses ==
   /\ escPhase = "q_enq_noact"
   /\ StoreCommitCount("idle")
+  \* The callback-wiring read (Pipeline.cs:1185) on the alreadyActivated commit path.
+  /\ CommitTokenTrip(escTail)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
-                 activations, callbackFired, failed, drainer_vars>>
+                 activations, callbackFired, failed, drainer_vars,
+                 tokenConsumed, commitWasCompleted, cbWiredPrePublish>>
 
 (* ===========================================================================
    Truthful slot commit (SplitSlotFieldOps): TryEscalateOrEnqueue's pre-
@@ -1028,15 +1889,138 @@ ExecCommitSlotPublish ==
 \* reads both AFTER the count lands - CommitWaiter's `if (wasEmpty && !waiterTask
 \* .IsCompleted)` - so a task completing mid-commit changes both answers).
 ExecCommitSlotCountWins ==
+  /\ ~SplitCommitSelfActivate  \* FUSED: the split arm (ARM/ACT) replaces this under the toggle
   /\ escPhase = "slot_f_act"
   /\ LET i == escTail IN
-       /\ activations' = IF storeCount = 0 /\ i \notin taskDone
+       \* wasEmpty self-activate, split-slot form: GATED under SingleActivationGate.
+       /\ activations' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen
                          THEN [activations EXCEPT ![i] = @ + 1]
                          ELSE activations
-       /\ activatedSlot' = IF storeCount = 0 /\ i \notin taskDone THEN i ELSE activatedSlot
+       /\ activatedSlot' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen THEN i ELSE activatedSlot
+       /\ liveActivation' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen
+                            THEN TRUE ELSE liveActivation
   /\ StoreCommitCount("idle")
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
                  callbackFired, failed, drainer_vars>>
+
+(* ===========================================================================
+   SplitCommitSelfActivate, slot arm: ExecCommitSlotCountWins as its two instructions.
+   Same shape as the queue arm, but the ACT writes activatedSlot and runs ReadTurnMonitor
+   (ActivateHeadItem's _activatedItem = item), mirroring ExecCommitSlotCountWins exactly.
+   The slot item lives InSlot (counted after ARM); its slot callback + DrainSlotInline can
+   claim and RETIRE it in the ARM->ACT window (loc -> Completed, liveActivation cleared off
+   the lock), and the ACT then activates the retired slot occupant.
+   =========================================================================== *)
+
+\* ARM: the increment + the wasEmpty/IsCompleted capture, verdict onto escPhase, escTail kept.
+ExecCommitSlotCountArm ==
+  /\ SplitCommitSelfActivate
+  /\ escPhase = "slot_f_act"
+  /\ LET i == escTail IN
+       /\ storeCount' = storeCount + 1
+       /\ escPhase' = IF storeCount = 0 /\ i \notin taskDone
+                      THEN "slot_selfact_fire" ELSE "slot_selfact_done"
+  /\ escTail' = escTail
+  /\ escSlotClaimed' = FALSE
+  /\ escMoved' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters>>
+
+\* ACT, fire face: gate re-read fresh, IsCompleted the captured verdict (re-read under
+\* CommitSelfActRecheck). Writes activatedSlot on activate (ActivateHeadItem), ReadTurnMonitor
+\* on the write. On a closed gate / re-checked completed task: no activate, commit returns.
+ExecCommitSlotCountActFire ==
+  /\ ~SplitCommitSelfActRecheck  \* SPLIT: RECHECK/FIRE(/VERIFY) replace the fused re-read+activate
+  /\ escPhase = "slot_selfact_fire"
+  /\ LET i == escTail IN
+       LET doAct == GateOpen /\ (~CommitSelfActRecheck \/ i \notin taskDone) IN
+       /\ activations' = IF doAct THEN [activations EXCEPT ![i] = @ + 1] ELSE activations
+       /\ activatedSlot' = IF doAct THEN i ELSE activatedSlot
+       /\ liveActivation' = IF doAct THEN TRUE ELSE liveActivation
+  /\ escPhase' = "idle"
+  /\ escTail' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+
+(* ===========================================================================
+   SplitCommitSelfActRecheck, slot arm: same three-instruction split as the queue arm, but FIRE
+   writes activatedSlot (ActivateHeadItem's _activatedItem = item) and runs ReadTurnMonitor, and
+   VERIFY restores the activated slot on a self-clear. One _activationLock hold (Pipeline.cs
+   1127-1144); the slot occupant can be claimed + retired by DrainSlotInline off-lock in the
+   RECHECK->FIRE window.
+   =========================================================================== *)
+
+\* RECHECK (slot): re-read taskDone under the lock; park "slot_selfact_dofire" when not done,
+\* else go idle. No activatedSlot write (the gate + activate are FIRE's).
+ExecCommitSlotRecheck ==
+  /\ SplitCommitSelfActRecheck
+  /\ escPhase = "slot_selfact_fire"
+  /\ IF escTail \notin taskDone
+       THEN /\ escPhase' = "slot_selfact_dofire"
+            /\ escTail'  = escTail
+       ELSE /\ escPhase' = "idle"
+            /\ escTail'  = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved>>
+
+\* FIRE (slot): the activate; gate re-read fresh; writes activatedSlot + ReadTurnMonitor, mirroring
+\* the fused slot ActFire. On a grant, park "slot_selfact_verify" (CommitSelfActVerify) else idle.
+ExecCommitSlotFire ==
+  /\ escPhase = "slot_selfact_dofire"
+  /\ LET i == escTail IN
+       LET doAct == GateOpen IN
+       /\ activations' = IF doAct THEN [activations EXCEPT ![i] = @ + 1] ELSE activations
+       /\ activatedSlot' = IF doAct THEN i ELSE activatedSlot
+       /\ liveActivation' = IF doAct THEN TRUE ELSE liveActivation
+       /\ escPhase' = IF doAct /\ CommitSelfActVerify THEN "slot_selfact_verify" ELSE "idle"
+       /\ escTail' = IF doAct /\ CommitSelfActVerify THEN escTail ELSE NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+
+\* VERIFY (slot): still in the lock, reached only when FIRE granted. Re-read taskDone and release
+\* the just-planted turn (liveActivation' = FALSE) when done - the item's completion callback drains
+\* it, so it must not keep the reader turn (RECHECK's own skip-completed logic). The activated-slot
+\* RESTORE, however, must fire ONLY when the item was actually RETIRED (loc = "Completed") - THAT is
+\* the stuck-grant case (no future retirement will clear it), and the restore then mirrors exactly
+\* the drain's clear (DepthZeroClear, guarded on the slot still pointing at the item). When the item
+\* is task-done but STILL RESIDENT (loc = "InSlot"), the grant is transient-legit (the drain will
+\* retire it and clear the slot the normal way) - nulling activatedSlot here would STOMP a live slot
+\* occupant (NoNullWhileLive: the _activatedItem NRE). Model finding: re-reading taskDone alone
+\* over-fires the slot restore; the restore must key on retirement, not mere completion.
+\* CommitSelfActVerifyOnTaken: retirement has no committer-observable in code, so BOTH the turn
+\* release and the restore key on task-done AND taken (the Volatile slot-word snapshot no longer
+\* holding our item - slotItem # i); trips earlier (also in the claimed/dequeued-but-not-yet-
+\* completed drain window, loc = "Draining"). TLC adjudicates the early trip's soundness.
+ExecCommitSlotVerify ==
+  /\ escPhase = "slot_selfact_verify"
+  /\ LET i == escTail
+         taken   == slotItem # i  \* the slot word + identity snapshot: our item left the store
+         trip    == i \in taskDone /\ (~CommitSelfActVerifyOnTaken \/ taken)
+         restore == i \in taskDone /\ activatedSlot = i
+                    /\ (IF CommitSelfActVerifyOnTaken THEN taken ELSE loc[i] = "Completed")
+     IN /\ liveActivation' = IF trip THEN FALSE ELSE liveActivation
+        /\ activatedSlot'  = IF restore THEN DepthZeroClear({i}) ELSE activatedSlot
+  /\ escPhase' = "idle"
+  /\ escTail' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved>>
+  /\ ReadTurnMonitor  \* self-clear writes activatedSlot; witness the read-turn stomp
+
+\* ACT, done face: captured don't-fire. No lock, no activation; the commit returns.
+ExecCommitSlotCountActDone ==
+  /\ escPhase = "slot_selfact_done"
+  /\ escPhase' = "idle"
+  /\ escTail' = NoItem
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, drainSignal, loc, taskDone,
+                 activations, callbackFired, failed, drainer_vars,
+                 hasSlot, slotItem, escalated, waiters, escSlotClaimed, escMoved>>
 
 ExecCommitSlotCountLoses ==
   /\ escPhase = "slot_f_noact"
@@ -1148,9 +2132,11 @@ ExecEscalationEnqueueNew ==
   /\ LET i == escTail IN
        /\ StoreEscalateEnqueue(IF SlotChainActivation /\ escSlotClaimed THEN "compensate" ELSE "idle")
        /\ loc' = [loc EXCEPT ![i] = "InWaitersPending"]
-       /\ activations' = IF storeCount = 0
+       \* wasEmpty self-activate, first-escalation form: GATED under SingleActivationGate.
+       /\ activations' = IF storeCount = 0 /\ GateOpen
                          THEN [activations EXCEPT ![i] = @ + 1]
                          ELSE activations
+       /\ liveActivation' = IF storeCount = 0 /\ GateOpen THEN TRUE ELSE liveActivation
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  taskDone, callbackFired, failed, drainer_vars>>
 
@@ -1204,10 +2190,13 @@ ExecEscalationEnqueueTail ==
 ExecEscalationCommitCount ==
   /\ escPhase = "esc_enqueued"
   /\ LET i == escTail IN
-       /\ activations' = IF storeCount = 0 /\ i \notin taskDone
+       \* wasEmpty self-activate, split first-escalation form: GATED under SingleActivationGate.
+       /\ activations' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen
                          THEN [activations EXCEPT ![i] = @ + 1]
                          ELSE activations
-       /\ activatedSlot' = IF storeCount = 0 /\ i \notin taskDone THEN i ELSE activatedSlot
+       /\ activatedSlot' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen THEN i ELSE activatedSlot
+       /\ liveActivation' = IF storeCount = 0 /\ i \notin taskDone /\ GateOpen
+                            THEN TRUE ELSE liveActivation
   /\ StoreCommitCount(IF SlotChainActivation /\ escSlotClaimed THEN "compensate" ELSE "nudge_check")
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal, loc, taskDone,
                  callbackFired, failed, drainer_vars>>
@@ -1228,13 +2217,17 @@ ExecEscalationCompensate ==
                              THEN activations
                              ELSE [activations EXCEPT ![target] = @ + 1]
            /\ activatedSlot' = IF target \in taskDone THEN activatedSlot ELSE target
+           /\ liveActivation' = IF target \in taskDone THEN liveActivation ELSE TRUE
          ELSE
            /\ pendingHeadActivation' = pendingHeadActivation
            /\ activations' = activations
            /\ activatedSlot' = activatedSlot
+           /\ liveActivation' = liveActivation
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, drainSignal,
                  loc, taskDone, callbackFired, failed, drainer_vars,
                  drainPhase, drainItem, drainRemaining, tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 (* Inline-callback race in CommitWaiter queue path: at the post-Enqueue check, if task is
    already done the executor fires the wired callback inline; otherwise it registers it for
@@ -1366,7 +2359,8 @@ SlotDrainClaim ==
     /\ drainSignal' = FALSE
     /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                    taskDone, activations, esc_vars, failed, drainRemaining, pendingHeadActivation,
-                   assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, activatedSlot, slotStomped, recoveryOf>>
+                   assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 (* ===========================================================================
    Truthful slot claim (SplitSlotFieldOps): the two entry routes (callback fire,
@@ -1405,7 +2399,8 @@ SlotDrainClaimEntry ==
   /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, esc_vars, failed, drainItem, drainRemaining,
                  pendingHeadActivation, tenure, assertFailed, nullActivation,
-                 qDrainPhase, qDrainedAny, advancingPending, activatedSlot, slotStomped, recoveryOf>>
+                 qDrainPhase, qDrainedAny, advancingPending, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Reclaim-path entry, the TRUTHFUL gate: drainSignal + the latch win. No identity, no
 \* taskDone, no callbackFired knowledge - the fused SlotDrainerReclaim's
@@ -1426,7 +2421,8 @@ SlotDrainerReclaimEntry ==
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Claim step 1: the Exchange. The flag transfers; the fields are whatever they are.
 SlotClaimExchange ==
@@ -1438,7 +2434,8 @@ SlotClaimExchange ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, waiters,
                  loc, taskDone, activations, callbackFired, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Claim miss: the slot is empty (escalation or a prior claim owned it). Code: IsEscalated
 \* reroutes into DrainReadyWaiters holding the latch (do-top clear and the queue drain's
@@ -1457,7 +2454,8 @@ SlotClaimMiss ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 (* TriStateSlotClaim claim: peek under the stable flag, claim only the completed, consume
    under exclusive ownership. The 1 -> 0 -> 1 cycle that would invalidate the peek is
@@ -1476,7 +2474,8 @@ SlotClaimPeekLive ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* The peek, completed verdict: proceed toward the claim CAS. taskDone is monotonic, so the
 \* verdict cannot go stale; the FLAG can (escalation takes the pair) - the own-win/lose pair
@@ -1490,7 +2489,8 @@ SlotClaimPeekDone ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* The claim CAS (1 -> 2) won: the consuming state begins. The word stays non-zero (hasSlot
 \* TRUE + this PC = state 2), so commits route to escalation and the escalation's
@@ -1502,7 +2502,8 @@ SlotClaimOwnWin ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* The claim CAS lost: the escalation took the pair between our peek and our CAS (the only
 \* possible taker). The occupant is, or is about to be, the queue head - reroute into the
@@ -1518,7 +2519,8 @@ SlotClaimOwnLose ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* The consume: read + clear + release (2 -> 0) + the post-claim signal clear. Fused as one
 \* step because state 2 admits no interfering field access BY GUARD - commits need word 0,
@@ -1536,7 +2538,8 @@ SlotClaimConsume ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, escalated, waiters,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainRemaining, pendingHeadActivation,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 (* The claim-fail exit: the code's fail arm releases the latch and RETURNS - no reclaim
    tail check (that belongs to the successful-drain path). The v5 pending arm applies: a
@@ -1563,7 +2566,8 @@ SlotClaimFailRelease ==
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 SlotClaimPendReacqWin ==
   /\ drainPhase = "cl_pendReacq"
@@ -1575,7 +2579,8 @@ SlotClaimPendReacqWin ==
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 SlotClaimPendReacqLose ==
   /\ drainPhase = "cl_pendReacq"
@@ -1587,7 +2592,8 @@ SlotClaimPendReacqLose ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Claim step 2: the field read, TRUTHFUL. drainItem takes slotItem as it is at this
 \* instant - NoItem when the claim won against a commit's CAS before its field writes
@@ -1601,7 +2607,8 @@ SlotClaimRead ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Claim step 3: the field clear (unconditional, like the code - if a successor's CAS
 \* re-occupied the flag and its writes landed, this WIPES them under _hasSlot = 1), plus
@@ -1619,7 +2626,8 @@ SlotClaimClear ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, storeCount, hasSlot, escalated, waiters,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Pipeline.cs:1148-1163 audit reorder, ReorderFix shipped June 2026: CompleteWaiterDeferred
 \* fires BEFORE DecrementCount, mirroring the recovery-fault path's own audit reorder. Active
@@ -1645,11 +2653,14 @@ SlotDrainCompleteClear ==
        \* still points at an older live item) - is orthogonal and out of scope here.
        /\ slotStomped' = slotStomped
        /\ activatedSlot' = DepthZeroClear({drainItem})  \* depth-0 clear; only nulls when this empties the pipeline
+       /\ liveActivation' = FALSE  \* CompleteWaiterDeferred releases the turn at retirement
   /\ drainPhase' = "completed"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, drainSignal, storeCount,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, assertFailed,
                  nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot (DepthZeroClear); witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Slot drain, step 2 of 3: DecrementCount - the position republish. The executor's Count==0
 \* inline-activation gate (SourceYieldInline's storeCount = 0) can pass the instant this
@@ -1683,7 +2694,8 @@ SlotDrainCount ==
   /\ drainPhase' = "counted"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars, waiters, drainSignal,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
-                 drainItem, pendingHeadActivation, tenure, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 drainItem, pendingHeadActivation, tenure, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Slot drain, step 3 of 3, SHIPPED code (~SlotChainActivation): CompleteWaiter + the
 \* lock-guarded C-path. The lock block consumes the publish whenever held; it re-checks the
@@ -1717,6 +2729,10 @@ SlotDrainCompleteLegacy ==
                                 THEN TRUE ELSE slotStomped
               /\ activatedSlot' = IF storeCount = 0 THEN executingItemVisible
                                   ELSE (IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem)
+              \* Code order: the retirement clear ran (in Clear under the fix, here pre-fix),
+              \* then the C-path activation re-grants - a step that activates ends TRUE.
+              /\ liveActivation' = IF storeCount = 0 THEN TRUE
+                                   ELSE (IF CompleteBeforeCount THEN liveActivation ELSE FALSE)
               /\ hasExecuting' = FALSE
               /\ hasExecutingVisible' = FALSE
               /\ executingItem' = NoItem
@@ -1730,6 +2746,7 @@ SlotDrainCompleteLegacy ==
                                    /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                                 THEN TRUE ELSE slotStomped
               /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
+              /\ liveActivation' = IF CompleteBeforeCount THEN liveActivation ELSE FALSE
               /\ UNCHANGED publish_vars
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
@@ -1737,6 +2754,8 @@ SlotDrainCompleteLegacy ==
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Slot drain, step 3 of 3, FIX, chain arm, slot-visible case (drainRemaining > 0,
 \* ~escalated): a successor's commit landed before our decrement, so it observed count >= 2
@@ -1779,12 +2798,19 @@ SlotDrainCompleteChainSlot ==
        /\ activatedSlot' = IF target \in taskDone
                            THEN (IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem)
                            ELSE target
+       \* Retire-then-activate: the chain activation re-grants the turn; the IsCompleted-skip
+       \* arm only completes (clear ran in Clear under the fix, here pre-fix).
+       /\ liveActivation' = IF target \in taskDone
+                            THEN (IF CompleteBeforeCount THEN liveActivation ELSE FALSE)
+                            ELSE TRUE
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
   /\ drainRemaining' = 0
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Chain arm, escalation-raced case: the peek saw IsEscalated - a first escalation is (or
 \* finished) relocating the head slot -> queue, so the head cannot be named from the slot
@@ -1805,6 +2831,7 @@ SlotDrainCompleteChainHandoff ==
                             /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                          THEN TRUE ELSE slotStomped
        /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
+       /\ liveActivation' = IF CompleteBeforeCount THEN liveActivation ELSE FALSE
   /\ pendingHeadActivation' = TRUE
   /\ drainPhase' = "handoff"
   /\ drainItem' = NoItem
@@ -1812,6 +2839,8 @@ SlotDrainCompleteChainHandoff ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Handoff resolution, drainer reclaims: the one-shot re-peek found the head visible (the
 \* escalation's move landed), so the drainer claims its own obligation back (Exchange wins)
@@ -1825,11 +2854,14 @@ SlotDrainHandoffReclaim ==
                          THEN activations
                          ELSE [activations EXCEPT ![target] = @ + 1]
        /\ activatedSlot' = IF target \in taskDone THEN activatedSlot ELSE target
+       /\ liveActivation' = IF target \in taskDone THEN liveActivation ELSE TRUE
   /\ pendingHeadActivation' = FALSE
   /\ drainPhase' = "idle"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  drainItem, drainRemaining, tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Handoff resolution, drainer trusts the escalator: the re-peek found no visible head (the
 \* move hasn't landed). The flag's full fence makes this safe: had the escalator's
@@ -1845,7 +2877,8 @@ SlotDrainHandoffTrust ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Slot drain, step 3 of 3, FIX, C-path arm (drainRemaining = 0): no successor preceded our
 \* decrement, so any LATER commit observes count 1 = wasEmpty and self-activates - the
@@ -1858,6 +2891,12 @@ SlotDrainHandoffTrust ==
 \* decision exactly once - this atomic action models that linearization.
 SlotDrainCompleteCPath ==
   /\ SlotChainActivation
+  \* Under the FUSED pre-check (CPathPendingPreCheck /\ ~SplitCPathPreCheck) this action IS
+  \* the pre-check: it reads hasExecutingVisible atomically with the activate/skip decision,
+  \* exactly the fused semantics - no separate action needed. Only the SPLIT pre-check
+  \* intercepts (the SlotCPathPre* actions below); this guard hands the "counted" <=0 case
+  \* to them. Both toggles FALSE => vacuously TRUE (every prior config unaffected).
+  /\ ~(CPathPendingPreCheck /\ SplitCPathPreCheck)
   /\ drainPhase = "counted"
   \* <= 0 under the skew fix, mirroring DrainSlotInline's shipped `count <= 0` partition
   \* and AdvancerCPath: a -1 means the consumed pair was the in-flight commit (already
@@ -1874,6 +2913,10 @@ SlotDrainCompleteCPath ==
             THEN
               /\ activations' = [activations EXCEPT ![executingItemVisible] = @ + 1]
               /\ activatedSlot' = executingItemVisible  \* ActivateHeadItem publishes the deferred-published item
+              \* The SLOT C-path is deliberately NOT gated on liveActivation - the code's
+              \* DrainSlotInline C-path carries no _liveActivation check (only the QUEUE
+              \* C-path in DrainReadyWaiters does). Activation re-grants the turn.
+              /\ liveActivation' = TRUE
               /\ slotStomped' = slotStomped  \* the deferred-publish activation overrides any racing write
               /\ hasExecuting' = FALSE
               /\ hasExecutingVisible' = FALSE
@@ -1888,6 +2931,7 @@ SlotDrainCompleteCPath ==
                                    /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
                                 THEN TRUE ELSE slotStomped
               /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
+              /\ liveActivation' = IF CompleteBeforeCount THEN liveActivation ELSE FALSE
               /\ UNCHANGED publish_vars
   /\ drainPhase' = "idle"
   /\ drainItem' = NoItem
@@ -1895,6 +2939,119 @@ SlotDrainCompleteCPath ==
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
+
+(* ===========================================================================
+   SPLIT slot C-path pending pre-check (CPathPendingPreCheck /\ SplitCPathPreCheck).
+   The slot-drain twin of the queue AdvancerCPathPre* trio. The FUSED level needs
+   NO action: SlotDrainCompleteCPath already reads hasExecutingVisible atomically
+   with its activate/skip decision (that IS the fused pre-check). Only the SPLIT
+   level intercepts the "counted" <=0 C-path case (SlotDrainCompleteCPath's
+   exclusion guard hands it here). The read captures pending into drainPhase
+   ("cnt_pt"/"cnt_pf"); the act/skip runs a following step on the captured value.
+   The recovery rejoin's C-arm folds into SlotDrainCompleteCPath in this model, so
+   it inherits the same pre-check (RecoverySplit = FALSE in the pre-check configs,
+   so that path is dormant here regardless).
+   =========================================================================== *)
+
+\* SPLIT read, TRUE face: capture pending = TRUE. The act (SlotCPathPreActTrue) re-reads
+\* pending/count FRESH under the lock, so a captured-TRUE-then-vanished publish misses cleanly.
+SlotCPathPreReadTrue ==
+  /\ SlotChainActivation
+  /\ CPathPendingPreCheck
+  /\ SplitCPathPreCheck
+  /\ drainPhase = "counted"
+  /\ (IF SkewTolerantPartition THEN drainRemaining <= 0 ELSE drainRemaining = 0)
+  /\ hasExecutingVisible
+  /\ drainPhase' = "cnt_pt"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation,
+                 qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot,
+                 slotStomped, recoveryOf, tenure, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
+
+\* SPLIT read, FALSE face: capture pending = FALSE. SlotCPathPreSkipFalse then fires on this
+\* STALE capture even if a publisher sets pending TRUE before it runs - the stranding suspect.
+SlotCPathPreReadFalse ==
+  /\ SlotChainActivation
+  /\ CPathPendingPreCheck
+  /\ SplitCPathPreCheck
+  /\ drainPhase = "counted"
+  /\ (IF SkewTolerantPartition THEN drainRemaining <= 0 ELSE drainRemaining = 0)
+  /\ ~hasExecutingVisible
+  /\ drainPhase' = "cnt_pf"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
+                 drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation,
+                 qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot,
+                 slotStomped, recoveryOf, tenure, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
+
+\* SPLIT act: captured TRUE -> enter the lock body unchanged. Duplicates SlotDrainCompleteCPath's
+\* body verbatim (fresh storeCount / hasExecutingVisible reads under the lock), differing only in
+\* the "cnt_pt" phase guard.
+SlotCPathPreActTrue ==
+  /\ drainPhase = "cnt_pt"
+  /\ LET i == drainItem IN
+       /\ loc' = IF CompleteBeforeCount THEN loc ELSE [loc EXCEPT ![i] = "Completed"]
+       /\ tenure' = IF CompleteBeforeCount THEN tenure
+                    ELSE (IF tenure = i THEN NoItem ELSE tenure)
+       /\ IF (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)
+             /\ hasExecutingVisible /\ executingItemVisible # NoItem
+            THEN
+              /\ activations' = [activations EXCEPT ![executingItemVisible] = @ + 1]
+              /\ activatedSlot' = executingItemVisible
+              /\ liveActivation' = TRUE
+              /\ slotStomped' = slotStomped
+              /\ hasExecuting' = FALSE
+              /\ hasExecutingVisible' = FALSE
+              /\ executingItem' = NoItem
+              /\ executingItemVisible' = NoItem
+            ELSE
+              /\ activations' = activations
+              /\ slotStomped' = IF ~CompleteBeforeCount
+                                   /\ activatedSlot # NoItem /\ activatedSlot # i
+                                   /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+                                THEN TRUE ELSE slotStomped
+              /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
+              /\ liveActivation' = IF CompleteBeforeCount THEN liveActivation ELSE FALSE
+              /\ UNCHANGED publish_vars
+  /\ drainPhase' = "idle"
+  /\ drainItem' = NoItem
+  /\ drainRemaining' = 0
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
+                 taskDone, callbackFired, failed, esc_vars, drainer_vars,
+                 pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
+
+\* SPLIT skip: captured FALSE -> skip the activation, NO re-read of pending. Runs only the
+\* ELSE (retire) bookkeeping and returns to idle, LEAVING any publish that landed after the
+\* stale read for the publisher's own rescue. Fires regardless of the current hasExecutingVisible.
+SlotCPathPreSkipFalse ==
+  /\ drainPhase = "cnt_pf"
+  /\ LET i == drainItem IN
+       /\ loc' = IF CompleteBeforeCount THEN loc ELSE [loc EXCEPT ![i] = "Completed"]
+       /\ tenure' = IF CompleteBeforeCount THEN tenure
+                    ELSE (IF tenure = i THEN NoItem ELSE tenure)
+       /\ activations' = activations
+       /\ slotStomped' = IF ~CompleteBeforeCount
+                            /\ activatedSlot # NoItem /\ activatedSlot # i
+                            /\ loc[activatedSlot] \notin {"Completed", "Nowhere"}
+                         THEN TRUE ELSE slotStomped
+       /\ activatedSlot' = IF CompleteBeforeCount THEN DepthZeroClear({i}) ELSE NoItem
+       /\ liveActivation' = IF CompleteBeforeCount THEN liveActivation ELSE FALSE
+       /\ UNCHANGED publish_vars
+  /\ drainPhase' = "idle"
+  /\ drainItem' = NoItem
+  /\ drainRemaining' = 0
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
+                 taskDone, callbackFired, failed, esc_vars, drainer_vars,
+                 pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Trailing read fault on a committed SLOT waiter (RecoverySplit, Phase D) - the slot-tier
 \* twin of DrainHeadRecovers. DrainSlotInline consumed the claimed task and its GetResult
@@ -1949,7 +3106,8 @@ SlotHeadRecovers ==
                  taskDone, activations, callbackFired, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                 advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Drainer's release step. Mirrors DrainSlotInline's _advancing.Release() tail. Between
 \* SlotCallbackDrains and this release, the slot is empty but the advancer is still held.
@@ -1999,7 +3157,8 @@ SlotDrainerRelease ==
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Pass-once slot-method tail, escalated arm: DrainSlotInline's post-release reclaim finds
 \* the store escalated and reroutes into DrainReadyWaiters (a fresh queue pass with the
@@ -2060,7 +3219,8 @@ SlotServeReacqEscalated ==
   /\ UNCHANGED <<publish_vars, tail_vars, storeCount, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 SlotServeReacqSlot ==
   /\ drainPhase = "sl_serve"
@@ -2072,7 +3232,8 @@ SlotServeReacqSlot ==
   /\ UNCHANGED <<publish_vars, tail_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 SlotServeReacqLose ==
   /\ drainPhase = "sl_serve"
@@ -2083,7 +3244,8 @@ SlotServeReacqLose ==
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  loc, taskDone, activations, callbackFired, failed, esc_vars,
                  drainItem, drainRemaining, pendingHeadActivation, tenure,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* The slot-mode reclaim (the strand fix under design): post-release, the drainer re-checks
 \* for a waiter whose callback bailed against its hold (recorded in drainSignal, callback
@@ -2114,7 +3276,8 @@ SlotDrainerReclaim ==
        /\ tenure' = tenure
   /\ UNCHANGED <<publish_vars, tail_vars, escalated, waiters, storeCount,
                  taskDone, activations, callbackFired, esc_vars, failed, drainer_vars,
-                 drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                 drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* The race the originally-atomic SlotCallbackDrains hid: a follow-up slot callback fires
 \* while the previous drain still holds the advancer (between SlotDrainerDrains and
@@ -2203,7 +3366,8 @@ CallbackSetSignal ==
                       esc_vars, drainer_vars, loc, taskDone, activations, callbackFired, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                       tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                      advancingPending, activatedSlot, slotStomped, recoveryOf>>
+                      advancingPending, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Step 2, won: TryAcquireOrFlagPending won (advancer free). Become the advancer; the do-top
 \* Exchange clears the signal (which a concurrent sibling's set may since have re-raised - that
@@ -2229,7 +3393,8 @@ CallbackAcquireWin ==
        /\ UNCHANGED <<publish_vars, tail_vars, slot_vars, waiters, storeCount,
                       esc_vars, loc, taskDone, activations, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                      tenure, assertFailed, nullActivation, advancingPending, activatedSlot, slotStomped, recoveryOf>>
+                      tenure, assertFailed, nullActivation, advancingPending, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Step 2, lost: the advancer was held. Deposit the obligation in the latch word (the holder's
 \* release serves it); the signal stays set (this callback's own store, not yet cleared).
@@ -2249,7 +3414,8 @@ CallbackAcquireLose ==
        /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                       esc_vars, drainer_vars, loc, taskDone, activations, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
-                      tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, activatedSlot, slotStomped, recoveryOf>>
+                      tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* The signaled slot occupant was drained out from under its own callback: the holder's
 \* reclaim took it between the set and the acquire (reachable precisely because the
@@ -2273,7 +3439,8 @@ SlotCallbackSpent ==
                       esc_vars, drainer_vars, loc, taskDone, activations, failed,
                       drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                       tenure, assertFailed, nullActivation, qDrainPhase, qDrainedAny,
-                      advancingPending, activatedSlot, slotStomped, recoveryOf>>
+                      advancingPending, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 (* ===========================================================================
    Advancer actions
@@ -2295,6 +3462,12 @@ AdvancerDrainHead ==
          newCount == storeCount - 1 IN
        /\ StoreDequeueHead
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
+       \* CONSUMPTION POINT: the drain's `item.WaiterTask.GetAwaiter().GetResult()` (Pipeline.cs
+       \* ~1529) - the single consumption that ends the token's lifetime. A concurrent committer
+       \* still mid-self-act for THIS item now holds a stale ValueTask; its next post-publication
+       \* read (ARM/recheck/verify/wiring) hits a Consumed token. This is the drain claim path
+       \* under the advancer latch: the claim confers exclusive consumption (legal here).
+       /\ ConsumeToken(i)
        \* This pass satisfied at least one signal's worth of work (SignalConservation's input).
        /\ qDrainedAny' = (IF PassOnceDrain THEN TRUE ELSE qDrainedAny)
        \* No per-item signal bookkeeping: the dirty flag was cleared at pass start and the
@@ -2320,25 +3493,50 @@ AdvancerDrainHead ==
           IF (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
             THEN /\ activations' = activations
                  /\ activatedSlot' = DepthZeroClear({i})
+                 /\ liveActivation' = FALSE  \* retire-only: CompleteWaiterDeferred's clear
                  /\ nullActivation' = nullActivation
           ELSE IF Len(waiters) > 1
-            THEN /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
-                 /\ activatedSlot' = Head(Tail(waiters))
-                 /\ nullActivation' = nullActivation
+            \* QueueDPathCompletedGuard: the D-arm's IsCompleted skip, mirroring the slot
+            \* D-path (SlotDrainCompleteChainSlot / SlotDrainHandoffReclaim). A completed
+            \* head is drain-only - ActivateHeadItem is skipped, the retirement clear still
+            \* runs (retire-only effects, same as the C-branch), and the obligation is
+            \* discharged by this very pass's next iteration: the head is in taskDone and
+            \* qDrainPhase stays "pass", so AdvancerDrainHead (WF) dequeues it next.
+            \* Dispatch-saver ONLY - never load-bearing for at-most-once (a check-then-
+            \* activate TOCTOU; Pipeline_GateDoubleActFixNoGuard.cfg holds without it).
+            THEN IF QueueDPathCompletedGuard /\ Head(Tail(waiters)) \in taskDone
+                   THEN /\ activations' = activations
+                        /\ activatedSlot' = DepthZeroClear({i})
+                        /\ liveActivation' = FALSE  \* retire-only: the activate is skipped
+                        /\ nullActivation' = nullActivation
+                   ELSE /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
+                        /\ activatedSlot' = Head(Tail(waiters))
+                        \* Retire + D-arm activate in one step: code order is clear-at-retirement
+                        \* then ActivateHeadItem's set - the step ends TRUE. The D-path is NOT
+                        \* gated on liveActivation (the code doesn't gate it).
+                        /\ liveActivation' = TRUE
+                        /\ nullActivation' = nullActivation
             ELSE /\ activations' = activations
                  /\ activatedSlot' = DepthZeroClear({i})
+                 /\ liveActivation' = FALSE  \* retire-only (the null-arm canary)
                  /\ nullActivation' = TRUE
        \* Backlog #8 (ModelCPathClear): a <=0 decrement enters the C-path LOCK block as a
        \* distinct phase, so the lock's storeCount re-read (which can differ from newCount -
        \* a successor committing in between is the whole point) is a separate step. Without
        \* the toggle, qDrainPhase stays "pass" (the lock-activate folds into AdvancerCPath, as
        \* the 9 verified configs have it). A >0 decrement is the D-path and never enters the lock.
+       \* CPathPendingPreCheck routes to the pre-check phase "cpath_pre" instead of "cpath_lock":
+       \* the pending flag is read OUTSIDE the lock and the lock ("cpath_lock") is entered only
+       \* when it reads TRUE (see the AdvancerCPathPre* actions).
        /\ qDrainPhase' = (IF ModelCPathClear
                              /\ (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
-                          THEN "cpath_lock" ELSE qDrainPhase)
+                          THEN (IF CPathPendingPreCheck THEN "cpath_pre" ELSE "cpath_lock")
+                          ELSE qDrainPhase)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
-                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+                 drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, advancingPending, callbackSignaled, slotStomped, recoveryOf,
+                 staleTokenRead, commitWasCompleted, cbWiredPrePublish>>
+  /\ ReadTurnMonitor  \* writes activatedSlot (D-arm activate / clear); witness the read-turn stomp
 
 \* Trailing read fault on a committed queue waiter (RecoverySplit, backlog #2/#5 Phase C). The
 \* drainer reaches a settled head whose pipeline task FAULTED (not completed): the code's
@@ -2349,8 +3547,13 @@ AdvancerDrainHead ==
 \* alternative at drain time (a settled head either succeeded -> AdvancerDrainHead, or faulted ->
 \* here); recovery then resolves the parked item via RecoverInstall / RecoverRefuse - the floor
 \* must catch a trailing fault, not let it hose the wire. Phase C one-failure bound (failed = {}).
+\* KNOWN WIRING INFIDELITY under SingleActivationGate - see the QueueTrailingFault constant:
+\* the code's queue trailing fault recovers IN PLACE (RecoverWaiter, unconditional activate,
+\* count credit held); this action's executor-side park + at-fault partition manufacture a
+\* false gate deadlock. Kept as-is (gated) until the faithful rewiring round.
 DrainHeadRecovers ==
   /\ RecoverySplit
+  /\ QueueTrailingFault          \* injection gate; see the constant's comment
   /\ failed = {}                 \* Phase C single-failure bound (NumItems=3 substitute reservoir)
   /\ advancing
   /\ drainPhase = "idle"
@@ -2375,26 +3578,45 @@ DrainHeadRecovers ==
        \* The next-head activation partition, identical to AdvancerDrainHead: the faulted head
        \* leaving is an ordinary dequeue for the REST of the queue. activatedSlot mirrors:
        \* clear if slot pointed at the faulted i; set to the new head on the D-arm.
+       \* liveActivation: the fault park does NOT run CompleteWaiterDeferred (the catch routes
+       \* to RecoverWaiter), so the faulted head's clear happens later at its recovery
+       \* completion - non-activating arms leave the bit; the D-arm's activation sets it.
        /\ IF (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
             THEN /\ activations' = activations
                  /\ activatedSlot' = DepthZeroClear({i})
+                 /\ liveActivation' = liveActivation
                  /\ nullActivation' = nullActivation
           ELSE IF Len(waiters) > 1
-            THEN /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
-                 /\ activatedSlot' = Head(Tail(waiters))
-                 /\ nullActivation' = nullActivation
+            \* QueueDPathCompletedGuard: same IsCompleted skip as AdvancerDrainHead's D-arm.
+            \* The fault park leaves liveActivation as the non-activating arms here do (no
+            \* CompleteWaiterDeferred ran); the skipped completed head is dequeued by the
+            \* pass's own next AdvancerDrainHead iteration.
+            THEN IF QueueDPathCompletedGuard /\ Head(Tail(waiters)) \in taskDone
+                   THEN /\ activations' = activations
+                        /\ activatedSlot' = DepthZeroClear({i})
+                        /\ liveActivation' = liveActivation
+                        /\ nullActivation' = nullActivation
+                   ELSE /\ activations' = [activations EXCEPT ![Head(Tail(waiters))] = @ + 1]
+                        /\ activatedSlot' = Head(Tail(waiters))
+                        /\ liveActivation' = TRUE
+                        /\ nullActivation' = nullActivation
             ELSE /\ activations' = activations
                  /\ activatedSlot' = DepthZeroClear({i})
+                 /\ liveActivation' = liveActivation
                  /\ nullActivation' = TRUE
        /\ qDrainPhase' = (IF ModelCPathClear
                              /\ (IF SkewTolerantPartition THEN newCount <= 0 ELSE newCount = 0)
-                          THEN "cpath_lock" ELSE qDrainPhase)
+                          THEN (IF CPathPendingPreCheck THEN "cpath_pre" ELSE "cpath_lock")
+                          ELSE qDrainPhase)
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, slot_vars,
                  taskDone, callbackFired, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, advancingPending, callbackSignaled, slotStomped, recoveryOf>>
+  /\ ReadTurnMonitor  \* writes activatedSlot (D-arm activate / clear); witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Advancer at count=0, executes C-path activation under lock.
 AdvancerCPath ==
+  /\ ~SplitCPathExchange  \* fused fiction; the split trio below is the truthful shape
   /\ advancing
   /\ drainPhase = "idle"  \* see AdvancerDrainHead
   \* Under ModelCPathClear the C-path lock is its own phase ("cpath_lock", set by the <=0
@@ -2405,13 +3627,25 @@ AdvancerCPath ==
   \* deferred publish is the only live responsibility and this claim is correct. Shipped
   \* code's == 0 is the quiet-face skip.
   /\ (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)
+  \* The QUEUE C-path is gated site (2): `_waiters.Count is 0 && !_liveActivation &&
+  \* Volatile.Read(pending)`. Fused form: the gate in the guard suffices - the alternative
+  \* to firing is simply not firing (the publish and pending stay; the lock-phase exit is
+  \* AdvancerCPathLockExit, whose activate-arm negation mirrors this gate).
+  /\ GateOpen
   /\ hasExecutingVisible
+  \* PeekGatedCPathLicense: the residency half of the license. The fused form has always
+  \* read Len(waiters) = 0 atomically with the count, so the peek gate is inherently
+  \* satisfied here - the toggle's conjunct is stated for uniformity with the split fire
+  \* but adds nothing (the under-promise window only opens when the Count read and the
+  \* Exchange are separate instructions, i.e. SplitCPathExchange).
   /\ Len(waiters) = 0
+  /\ (PeekGatedCPathLicense => Len(waiters) = 0)
   /\ ~hasSlot
   /\ executingItemVisible # NoItem
   /\ LET exec == executingItemVisible IN
        /\ activations' = [activations EXCEPT ![exec] = @ + 1]
        /\ activatedSlot' = exec  \* the C-path lock-block activation (Pipeline.cs:1281)
+       /\ liveActivation' = TRUE  \* ActivateHeadItem grants the turn
        /\ hasExecuting' = FALSE
        /\ hasExecutingVisible' = FALSE
        /\ executingItem' = NoItem
@@ -2419,6 +3653,109 @@ AdvancerCPath ==
   /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)  \* exit the lock, continue the do-body
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
                  loc, taskDone, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* SplitCPathExchange trio: the queue C-path lock block as its two real instructions. The code's
+\*   if (_waiters.Count <= 0 && Interlocked.Exchange(ref pending, false)) ActivateHeadItem(...)
+\* short-circuits Count-read THEN Exchange - separate instructions, and the thread can be
+\* preempted between them WHILE HOLDING the lock. The lock excludes only other lock-takers
+\* (the executor's dispatch lock block); the executor's commit-increment, its (pre-fix
+\* lock-free) wasEmpty self-activate, and its next dispatch's publish+pending all land outside
+\* the lock, so they walk straight through the armed window. The Exchange then consumes
+\* whatever publish exists AT FIRE TIME - possibly a publish that did not exist when the Count
+\* read vouched for an empty store. July 2026 witness trace (ConcurrentSyncAndAsync):
+\* holder [-10,-3,-5(c0d1),25(c1d1),1], orphan [-10,20(c1d2),1,-3].
+AdvancerCPathArm ==
+  /\ SplitCPathExchange
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ PassOnceDrain => qDrainPhase = (IF ModelCPathClear THEN "cpath_lock" ELSE "pass")
+  /\ (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)  \* the Count read - stale-able
+  \* PeekGatedCPathLicense at the ARM is inherently satisfied (the arm already reads
+  \* Len(waiters) = 0) and deliberately NOT the fix: the arm's reads can go stale while the
+  \* thread is preempted inside the lock - the witness's completed-unactivated head commits
+  \* AFTER the arm. The load-bearing residency peek is the FIRE's (fresh, under-lock).
+  /\ Len(waiters) = 0
+  /\ (PeekGatedCPathLicense => Len(waiters) = 0)
+  /\ ~hasSlot
+  /\ qDrainPhase' = "cpath_armed"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Fire: the Exchange + activate. NO re-read of count/waiters/slot - the arm's read is the only
+\* license, and it may be stale. Consumes the publish present NOW (executor steps may have
+\* interleaved since the arm).
+AdvancerCPathFire ==
+  /\ SplitCPathExchange
+  /\ advancing
+  /\ qDrainPhase = "cpath_armed"
+  \* Gated site (2), split form: the code reads _liveActivation under the lock AT FIRE TIME
+  \* (a fresh read, after the arm's possibly-stale Count read). Gate closed = the fire is
+  \* skipped and the publish/pending are LEFT (AdvancerCPathFireSkip below).
+  /\ GateOpen
+  \* PeekGatedCPathLicense: the residency half of the license, read FRESH at fire time
+  \* alongside the gate's under-lock _liveActivation read. The arm's Count read vouched for
+  \* an empty store, but a commit's enqueue precedes its increment (SplitCountCommit) and
+  \* both land lock-free - a completed-unactivated head can be RESIDENT here while the
+  \* count still reads 0. Firing past it activates the deferred-published item out of FIFO
+  \* order, seeding the same-flow double activation (Pipeline_GateDoubleActWitness.cfg).
+  \* Under the toggle the fire declines instead (AdvancerCPathFirePeekDecline below).
+  /\ (PeekGatedCPathLicense => Len(waiters) = 0)
+  /\ hasExecutingVisible
+  /\ executingItemVisible # NoItem
+  /\ LET exec == executingItemVisible IN
+       /\ activations' = [activations EXCEPT ![exec] = @ + 1]
+       /\ activatedSlot' = exec
+       /\ liveActivation' = TRUE
+       /\ hasExecuting' = FALSE
+       /\ hasExecutingVisible' = FALSE
+       /\ executingItem' = NoItem
+       /\ executingItemVisible' = NoItem
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Peek-decline (PeekGatedCPathLicense): the fire's fresh residency read found a resident
+\* queue entry - possibly one whose count increment has not landed - so the license is
+\* declined and the fire does NOT consume the publish. The pending flag and the publish are
+\* LEFT in place for the re-fire, exactly like the gate skip: the resident head is drained
+\* (or activated) in FIFO order by the pass's own loop, and the C-path re-arms once the
+\* store is empty by residency. Exits the lock phase back to the do-body so the armed
+\* window cannot deadlock the drainer; carries the fire family's fairness.
+AdvancerCPathFirePeekDecline ==
+  /\ SplitCPathExchange
+  /\ PeekGatedCPathLicense
+  /\ advancing
+  /\ qDrainPhase = "cpath_armed"
+  /\ Len(waiters) > 0
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Gate-skip (SingleActivationGate): the under-lock _liveActivation read found a live
+\* activation, so the fire does NOT consume the publish - the pending flag is LEFT in place
+\* (the code's short-circuit never reaches the Exchange) on the coverage claim "the live
+\* reader's retirement clears _liveActivation and this C-path re-fires in the same advancer
+\* pass". The lock phase exits back to the do-body; whether that claim always holds is
+\* exactly what EventuallyActivated adjudicates under SingleActivationGate = TRUE.
+AdvancerCPathFireSkip ==
+  /\ SplitCPathExchange
+  /\ SingleActivationGate
+  /\ advancing
+  /\ qDrainPhase = "cpath_armed"
+  /\ liveActivation
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* Miss: the Exchange found no publish (pending false). Exit the lock empty-handed.
+AdvancerCPathFireMiss ==
+  /\ SplitCPathExchange
+  /\ advancing
+  /\ qDrainPhase = "cpath_armed"
+  /\ ~hasExecutingVisible
+  /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
 
 \* The queue C-path lock block's clear-at-Count>0 arm (backlog #8, ModelCPathClear). The
 \* advancer reached the terminal C-path lock (the drain loop's while has exited - no ready
@@ -2477,11 +3814,111 @@ AdvancerCPathLockExit ==
   /\ advancing
   /\ drainPhase = "idle"
   /\ qDrainPhase = "cpath_lock"
-  \* Neither the activate arm (storeCount<=0 /\ Len=0 /\ ~hasSlot /\ publish) nor the clear
-  \* arm (storeCount>0 /\ publish) is enabled.
+  \* Neither the activate arm (storeCount<=0 /\ Len=0 /\ ~hasSlot /\ publish /\ gate open -
+  \* the GateOpen conjunct mirrors AdvancerCPath's guard: a gate-closed skip exits the lock
+  \* here, publish and pending LEFT, as the code's short-circuit does) nor the clear arm
+  \* (storeCount>0 /\ publish) is enabled.
   /\ ~( (IF SkewTolerantPartition THEN storeCount <= 0 ELSE storeCount = 0)
-        /\ Len(waiters) = 0 /\ ~hasSlot /\ hasExecutingVisible /\ executingItemVisible # NoItem )
+        /\ Len(waiters) = 0 /\ ~hasSlot /\ hasExecutingVisible /\ executingItemVisible # NoItem
+        /\ GateOpen )
   /\ ~( storeCount > 0 /\ hasExecutingVisible /\ executingItemVisible # NoItem )
+  /\ qDrainPhase' = "pass"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+(* ===========================================================================
+   Queue C-path pending pre-check (CPathPendingPreCheck). The proposed elision:
+   read the deferred-publish pending flag (hasExecutingVisible, a Volatile.Read)
+   OUTSIDE the lock, and enter the lock ("cpath_lock") only when it reads TRUE;
+   skip the whole lock phase (-> "pass") when it reads FALSE. The lock body is
+   unchanged when entered - the AdvancerCPath* trio re-reads pending/count under
+   the lock as before. AdvancerDrainHead's <=0 decrement routes to "cpath_pre"
+   instead of "cpath_lock" under the toggle.
+
+   FUSED (~SplitCPathPreCheck): the read + the enter/skip decision are one atomic
+   action, so a FALSE skip only fires when pending is genuinely FALSE now - it
+   coincides with the existing lock-exit-on-no-publish (green baseline).
+
+   SPLIT (SplitCPathPreCheck): the read captures the pending value into the drain
+   PC ("cpath_pre_t"/"cpath_pre_f"), other threads interleave, then the enter/skip
+   acts on the CAPTURED value with NO re-read. A stale FALSE (pending set by a
+   publisher between the read and the skip) still skips the lock, LEAVING the fresh
+   publish - the adjudication that matters. EventuallyActivated is the verdict.
+   =========================================================================== *)
+
+\* FUSED read-and-enter: pending reads TRUE atomically -> enter the lock body unchanged.
+AdvancerCPathPreEnter ==
+  /\ CPathPendingPreCheck
+  /\ ~SplitCPathPreCheck
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ qDrainPhase = "cpath_pre"
+  /\ hasExecutingVisible        \* the outside Volatile.Read, atomic with the decision
+  /\ qDrainPhase' = "cpath_lock"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* FUSED read-and-skip: pending reads FALSE atomically -> skip the lock (like LockExit's
+\* no-publish case; the publish, if any, is genuinely absent at this instant).
+AdvancerCPathPreSkip ==
+  /\ CPathPendingPreCheck
+  /\ ~SplitCPathPreCheck
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ qDrainPhase = "cpath_pre"
+  /\ ~hasExecutingVisible
+  /\ qDrainPhase' = "pass"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* SPLIT read, TRUE face: capture pending = TRUE into the PC. The enter is a following step;
+\* a captured TRUE only means "the lock will be entered" - the lock body re-reads pending
+\* fresh, so a captured-TRUE-then-vanished publish misses harmlessly (AdvancerCPathFireMiss).
+AdvancerCPathPreReadTrue ==
+  /\ CPathPendingPreCheck
+  /\ SplitCPathPreCheck
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ qDrainPhase = "cpath_pre"
+  /\ hasExecutingVisible
+  /\ qDrainPhase' = "cpath_pre_t"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* SPLIT read, FALSE face: capture pending = FALSE into the PC. The skip is a following step -
+\* between here and the skip a publisher can set pending TRUE, and the skip still fires on the
+\* STALE captured FALSE. This is the whole point of the split level.
+AdvancerCPathPreReadFalse ==
+  /\ CPathPendingPreCheck
+  /\ SplitCPathPreCheck
+  /\ advancing
+  /\ drainPhase = "idle"
+  /\ qDrainPhase = "cpath_pre"
+  /\ ~hasExecutingVisible
+  /\ qDrainPhase' = "cpath_pre_f"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* SPLIT enter: captured TRUE -> enter the lock body unchanged (fresh under-lock reads).
+AdvancerCPathPreEnterSplit ==
+  /\ CPathPendingPreCheck
+  /\ SplitCPathPreCheck
+  /\ advancing
+  /\ qDrainPhase = "cpath_pre_t"
+  /\ qDrainPhase' = "cpath_lock"
+  /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
+                 loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
+
+\* SPLIT skip: captured FALSE -> skip the lock phase back to the do-body, NO re-read. Fires
+\* even if hasExecutingVisible is TRUE by now: the publish landed after our stale read and is
+\* LEFT for the publisher's own rescue (its commit's wasEmpty self-activate at count 0, or the
+\* CommitTailWaiter reclaim at count > 0). If that rescue ever fails, EventuallyActivated
+\* reports the strand - THE finding.
+AdvancerCPathPreSkipSplit ==
+  /\ CPathPendingPreCheck
+  /\ SplitCPathPreCheck
+  /\ advancing
+  /\ qDrainPhase = "cpath_pre_f"
   /\ qDrainPhase' = "pass"
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters, qDrainedAny,
                  loc, taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
@@ -2798,7 +4235,10 @@ ExecItemFailure ==
     \* A sync throw out of ExecuteAuto releases any tenure the dispatch acquired (the
     \* builder's sync-faulted path round-trips TryGetVoidTask, clearing _started).
     /\ tenure' = IF tenure = i THEN NoItem ELSE tenure
-    /\ IF hasExecuting /\ executingItem = i  \* own-thread observation of the executor's publish
+    \* SplitRecoveryInlineAct: the throw does NOT touch the publish - the rollback is
+    \* ClearExecutingItem's, a LATER step (ExecFaultClearWon), racing the C-path's claim.
+    \* Fused (~toggle): the shipped executor-wins-only modeling.
+    /\ IF hasExecuting /\ executingItem = i /\ ~SplitRecoveryInlineAct
          THEN \* Deferred-published failed item: roll back the publish.
               /\ hasExecuting' = FALSE
               /\ hasExecutingVisible' = FALSE
@@ -2807,7 +4247,29 @@ ExecItemFailure ==
          ELSE UNCHANGED publish_vars
     /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                    taskDone, activations, callbackFired, esc_vars, drainer_vars,
-                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf>>
+                   drainPhase, drainItem, drainRemaining, pendingHeadActivation, assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, activatedSlot, slotStomped, recoveryOf, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
+
+\* SplitRecoveryInlineAct: the executor's ClearExecutingItem won-claim as its own step
+\* (Pipeline.cs 2230-2241): after the fault parked the item, the in-lock claim finds the
+\* pending flag still set (the advancer's C-path did not consume it) and tears the publish
+\* down. The LOST arm needs no action of its own - AdvancerCPathFire consuming the still-up
+\* publish IS the advancer winning (and, the fault being lock-invisible, IS the post-mortem
+\* grant when it lands after the park). Recovery (RecoverInstall*/RecoverRefuse) is gated on
+\* the claim having resolved either way - the code's program order: TryRecoverItemFailure
+\* runs strictly after ClearExecutingItem returned.
+ExecFaultClearWon ==
+  /\ SplitRecoveryInlineAct
+  /\ \E i \in Item :
+       /\ loc[i] = "Recovering"
+       /\ recoveryOf[i] = NoItem  \* first-level (the substitute's own fault stays fused)
+       /\ hasExecuting /\ executingItem = i  \* the publish still holds the parked item: claim won
+       /\ hasExecuting' = FALSE
+       /\ hasExecutingVisible' = FALSE
+       /\ executingItem' = NoItem
+       /\ executingItemVisible' = NoItem
+  /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters, loc,
+                 taskDone, activations, callbackFired, failed, esc_vars, drainer_vars>>
 
 \* RecoverItem wins-path: no prior waiter in flight (_waiters.Count is 0), inline-activate
 \* the substitute. Mirrors the post-fix code at the new RecoverItem in Pipeline.cs. The
@@ -2816,13 +4278,13 @@ RecoverItemWins ==
   /\ ~RecoverySplit  \* legacy identity-reuse; RecoverInstall* is the distinct-identity split
   /\ \E i \in Item :
     /\ loc[i] = "Recovering"
-    \* BUG-VERIFICATION TEMP: storeCount = 0 guard removed to model pre-fix code.
-    \* /\ storeCount = 0
+    /\ storeCount = 0  \* the shipped guard, restored (was TEMP-disabled for pre-fix bug repro)
     /\ ~hasTail
     /\ escPhase = "idle"
     /\ loc' = [loc EXCEPT ![i] = "Executing"]
     /\ activations' = [activations EXCEPT ![i] = @ + 1]
     /\ activatedSlot' = i  \* substitute takes over the slot
+    /\ liveActivation' = TRUE  \* recovery activation is NOT gated (the code doesn't)
     /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                    taskDone, callbackFired, failed, esc_vars, drainer_vars>>
 
@@ -2872,6 +4334,9 @@ RecoverInstallWins ==
   /\ \E i \in Item :
        /\ loc[i] = "Recovering"
        /\ recoveryOf[i] = NoItem  \* i is a first-level failure (Phase A)
+       \* SplitRecoveryInlineAct: recovery runs strictly after ClearExecutingItem resolved the
+       \* claim (won: ExecFaultClearWon consumed the publish; lost: the C-path fire did).
+       /\ (SplitRecoveryInlineAct => ~(hasExecuting /\ executingItem = i))
        /\ LET j == SubSlot IN     \* the reserved substitute identity
             /\ loc[j] = "Nowhere"
             /\ recoveryOf[j] = NoItem
@@ -2879,12 +4344,15 @@ RecoverInstallWins ==
             /\ loc' = [loc EXCEPT ![j] = "Executing"]
             /\ activations' = [activations EXCEPT ![j] = @ + 1]
             /\ activatedSlot' = j
+            /\ liveActivation' = TRUE  \* recovery activation is NOT gated
             /\ recoveryOf' = [recoveryOf EXCEPT ![j] = i]
             /\ tenure' = j
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
+  /\ ReadTurnMonitor  \* substitute activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Install, loses-path: a prior waiter is in flight (storeCount > 0), publish the substitute
 \* via the deferred handshake for the advancer C-path. Mirrors SourceYieldDeferred / the legacy
@@ -2897,6 +4365,9 @@ RecoverInstallLoses ==
   /\ \E i \in Item :
        /\ loc[i] = "Recovering"
        /\ recoveryOf[i] = NoItem
+       \* SplitRecoveryInlineAct: claim-resolved gate, as RecoverInstallWins - also protects
+       \* the republish below from clobbering a pending (unresolved) publish of i.
+       /\ (SplitRecoveryInlineAct => ~(hasExecuting /\ executingItem = i))
        /\ LET j == SubSlot IN
             /\ loc[j] = "Nowhere"
             /\ recoveryOf[j] = NoItem
@@ -2912,7 +4383,8 @@ RecoverInstallLoses ==
   /\ UNCHANGED <<tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure, activatedSlot,
-                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
+                 assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped, readTurnStomped, liveActivation>>
+  /\ UNCHANGED token_vars
 
 \* Install for a DRAIN-side park (RecoveringInline; Phase C/D's RecoverWaiter, Pipeline.cs
 \* ~1410-1443): the policy accepted, the substitute is activated UNCONDITIONALLY
@@ -2936,11 +4408,14 @@ RecoverInstallInline ==
             /\ loc' = [loc EXCEPT ![j] = "Executing"]
             /\ activations' = [activations EXCEPT ![j] = @ + 1]
             /\ activatedSlot' = j
+            /\ liveActivation' = TRUE  \* RecoverWaiter's unconditional ActivateHeadItem (~1418)
             /\ recoveryOf' = [recoveryOf EXCEPT ![j] = i]
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
+  /\ ReadTurnMonitor  \* substitute activation writes activatedSlot; witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* In-place completion of a drain-side substitute: its pipeline task settled and the recovery
 \* continuation runs CompleteRecoveryWaiter (Pipeline.cs ~1548/~1571) - the item completes at
@@ -2959,10 +4434,13 @@ RecoverInlineCompletes ==
        /\ j \notin failed
        /\ loc' = [loc EXCEPT ![j] = "Completed"]
        /\ activatedSlot' = DepthZeroClear({j})
+       /\ liveActivation' = FALSE  \* CompleteRecoveryWaiter -> CompleteWaiterDeferred's clear
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
+  /\ ReadTurnMonitor  \* writes activatedSlot (DepthZeroClear); witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* The binding discharge: the substitute reached "Completed" (its normal lifecycle), so the
 \* failed item it was bound to completes too (CompleteItem completes the bound failed flow with
@@ -2978,11 +4456,14 @@ BindingDischarge ==
             /\ loc[i] \in {"Recovering", "RecoveringInline"}
             /\ loc' = [loc EXCEPT ![i] = "Completed"]
             /\ activatedSlot' = DepthZeroClear({i})
+            /\ liveActivation' = FALSE  \* the discharge completes via CompleteWaiterDeferred
        /\ recoveryOf' = [recoveryOf EXCEPT ![j] = NoItem]
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
+  /\ ReadTurnMonitor  \* writes activatedSlot (DepthZeroClear); witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 (* ===========================================================================
    Recovery Phase B (June 2026): policy-refuse + recovery-on-recovery.
@@ -3001,6 +4482,10 @@ RecoverRefuse ==
   /\ \E i \in Item :
        /\ loc[i] \in {"Recovering", "RecoveringInline"}
        /\ recoveryOf[i] = NoItem  \* first-level
+       \* SplitRecoveryInlineAct: the refuse is the other face of the SAME TryRecoverItemFailure
+       \* call, so it carries the same claim-resolved ordering (executor-side park only; the
+       \* RecoveringInline park has no deferred-publish race).
+       /\ (SplitRecoveryInlineAct /\ loc[i] = "Recovering" => ~(hasExecuting /\ executingItem = i))
        \* Refuse and install are the two faces of ONE TryRecoverItemFailure call: once a
        \* substitute is bound to this park, the refuse face is spent. (Without this guard a
        \* post-install refuse double-resolves the park - completing the failed item while
@@ -3009,10 +4494,13 @@ RecoverRefuse ==
        /\ ~\E j \in Item : recoveryOf[j] = i
        /\ loc' = [loc EXCEPT ![i] = "Completed"]
        /\ activatedSlot' = DepthZeroClear({i})
+       /\ liveActivation' = FALSE  \* refuse completes directly via CompleteWaiterDeferred
   /\ UNCHANGED <<publish_vars, tail_vars, adv_vars, counters, slot_vars, waiters,
                  taskDone, activations, callbackFired, failed, esc_vars, drainer_vars, recoveryOf,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation, tenure,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
+  /\ ReadTurnMonitor  \* writes activatedSlot (DepthZeroClear); witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 \* Recovery-on-recovery: a SUBSTITUTE j (recoveryOf[j] = k) itself fails while Executing. The
 \* policy STRUCTURALLY refuses to recover a recovery item, so j completes
@@ -3031,6 +4519,7 @@ RecoverOnRecoveryFails ==
        /\ LET k == recoveryOf[j] IN
             /\ loc' = [loc EXCEPT ![j] = "Completed", ![k] = "Completed"]  \* both direct
             /\ activatedSlot' = DepthZeroClear({j, k})
+            /\ liveActivation' = FALSE  \* both complete directly via the retirement clear
        /\ recoveryOf' = [recoveryOf EXCEPT ![j] = NoItem]
        /\ tenure' = IF tenure = j THEN NoItem ELSE tenure
        \* Roll back j's publish if it was deferred (RecoverInstallLoses), mirroring ExecItemFailure.
@@ -3044,6 +4533,8 @@ RecoverOnRecoveryFails ==
                  taskDone, activations, callbackFired, esc_vars, drainer_vars,
                  drainPhase, drainItem, drainRemaining, pendingHeadActivation,
                  assertFailed, nullActivation, qDrainPhase, qDrainedAny, advancingPending, callbackSignaled, slotStomped>>
+  /\ ReadTurnMonitor  \* writes activatedSlot (DepthZeroClear); witness the read-turn stomp
+  /\ UNCHANGED token_vars
 
 (* ===========================================================================
    Next-state relation
@@ -3059,28 +4550,61 @@ CompleteTaskW(i) == CompleteTask(i) /\ UNCHANGED aux_vars
 CompleteTaskUnactivatedW(i) == CompleteTaskUnactivated(i) /\ UNCHANGED aux_vars
 SourceYieldDeferredW == SourceYieldDeferred /\ UNCHANGED aux_vars
 ExecSetTailW == ExecSetTail /\ UNCHANGED aux_vars
-RecoverItemWinsW == RecoverItemWins /\ UNCHANGED aux_vars_act  \* writes activatedSlot
+RecoverItemWinsW == RecoverItemWins /\ UNCHANGED aux_vars_act /\ ReadTurnMonitor  \* writes activatedSlot
 RecoverItemLosesW == RecoverItemLoses /\ UNCHANGED aux_vars
-ExecCommitQueueVisibleWinsW == ExecCommitQueueVisibleWins /\ UNCHANGED aux_vars
+ExecFaultClearWonW == ExecFaultClearWon /\ UNCHANGED aux_vars
+\* Queue token-WRITERS use the token-FREE aux0 variants (their bodies specify token_vars).
+ExecCommitQueueVisibleWinsW == ExecCommitQueueVisibleWins /\ UNCHANGED aux_vars0
 ExecCommitSlotCASWinsW == ExecCommitSlotCASWins /\ UNCHANGED aux_vars
 ExecCommitSlotCASLosesW == ExecCommitSlotCASLoses /\ UNCHANGED aux_vars
 ExecCommitSlotFieldsW == ExecCommitSlotFields /\ UNCHANGED aux_vars
-ExecCommitSlotCountWinsW == ExecCommitSlotCountWins /\ UNCHANGED aux_vars_act  \* writes activatedSlot
+ExecCommitSlotCountWinsW == ExecCommitSlotCountWins /\ UNCHANGED aux_vars_act /\ ReadTurnMonitor  \* writes activatedSlot
 ExecCommitSlotCountLosesW == ExecCommitSlotCountLoses /\ UNCHANGED aux_vars
 ExecCommitSlotWriteWinsW == ExecCommitSlotWriteWins /\ UNCHANGED aux_vars
 ExecCommitSlotWriteLosesW == ExecCommitSlotWriteLoses /\ UNCHANGED aux_vars
 ExecCommitSlotPublishW == ExecCommitSlotPublish /\ UNCHANGED aux_vars
 ExecEscalationCASSlotTriW == ExecEscalationCASSlotTri /\ UNCHANGED aux_vars
-ExecCommitQueueVisibleLosesW == ExecCommitQueueVisibleLoses /\ UNCHANGED aux_vars
-ExecCommitQueueCountWinsW == ExecCommitQueueCountWins /\ UNCHANGED aux_vars
-ExecCommitQueueCountLosesW == ExecCommitQueueCountLoses /\ UNCHANGED aux_vars
+ExecCommitQueueVisibleLosesW == ExecCommitQueueVisibleLoses /\ UNCHANGED aux_vars0
+\* Writes liveActivation (the gated wasEmpty self-activate) but not activatedSlot: the
+\* _act bundle (which carries neither) plus explicit UNCHANGED on the two it doesn't touch.
+ExecCommitQueueCountWinsW == ExecCommitQueueCountWins /\ UNCHANGED aux_vars_act
+  /\ UNCHANGED <<activatedSlot, readTurnStomped>>
+ExecCommitQueueCountLosesW == ExecCommitQueueCountLoses /\ UNCHANGED aux_vars0
+\* SplitCommitSelfActivate split arms. ARM/ActDone are plain PC steps (no activation) -> full
+\* aux_vars. ActFire writes liveActivation (queue: not activatedSlot; slot: activatedSlot +
+\* ReadTurnMonitor in the body), same bundle shape as their fused twins. Queue token-writers
+\* use aux_vars0/aux_vars_act0 (token-free); bodies specify token_vars.
+ExecCommitQueueCountArmW == ExecCommitQueueCountArm /\ UNCHANGED aux_vars0
+ExecCommitQueueCountActFireW == ExecCommitQueueCountActFire /\ UNCHANGED aux_vars_act0
+  /\ UNCHANGED <<activatedSlot, readTurnStomped>>
+ExecCommitQueueCountActDoneW == ExecCommitQueueCountActDone /\ UNCHANGED aux_vars0
+\* Slot self-act arms are token-NEUTRAL in this round (the conviction/restructure are modeled on
+\* the QUEUE self-act path - the escalated/queue commit the convicted stack came from); they carry
+\* UNCHANGED token_vars so SelfActLockFamily admits them fully specified.
+ExecCommitSlotCountArmW == ExecCommitSlotCountArm /\ UNCHANGED aux_vars /\ UNCHANGED token_vars
+ExecCommitSlotCountActFireW == ExecCommitSlotCountActFire /\ UNCHANGED aux_vars_act /\ UNCHANGED token_vars
+ExecCommitSlotCountActDoneW == ExecCommitSlotCountActDone /\ UNCHANGED aux_vars /\ UNCHANGED token_vars
+\* SplitCommitSelfActRecheck split arms. RECHECK is a plain PC step (no activation) -> aux_vars.
+\* FIRE/VERIFY write liveActivation (queue: not activatedSlot; slot: activatedSlot + ReadTurnMonitor),
+\* same bundle shape as the fused ActFire twins.
+ExecCommitQueueRecheckW == ExecCommitQueueRecheck /\ UNCHANGED aux_vars0
+ExecCommitQueueFireW == ExecCommitQueueFire /\ UNCHANGED aux_vars_act
+  /\ UNCHANGED <<activatedSlot, readTurnStomped>>
+ExecCommitQueueVerifyW == ExecCommitQueueVerify /\ UNCHANGED aux_vars_act0
+  /\ UNCHANGED <<activatedSlot, readTurnStomped>>
+ExecCommitSlotRecheckW == ExecCommitSlotRecheck /\ UNCHANGED aux_vars /\ UNCHANGED token_vars
+ExecCommitSlotFireW == ExecCommitSlotFire /\ UNCHANGED aux_vars_act /\ UNCHANGED token_vars
+ExecCommitSlotVerifyW == ExecCommitSlotVerify /\ UNCHANGED aux_vars_act /\ UNCHANGED token_vars
 ExecEscalationEnqueueTailW == ExecEscalationEnqueueTail /\ UNCHANGED aux_vars
-ExecEscalationCommitCountW == ExecEscalationCommitCount /\ UNCHANGED aux_vars_act  \* writes activatedSlot
+ExecEscalationCommitCountW == ExecEscalationCommitCount /\ UNCHANGED aux_vars_act /\ ReadTurnMonitor  \* writes activatedSlot
 ExecCommitTailPublishQueueExecutorWinsW == ExecCommitTailPublishQueueExecutorWins /\ UNCHANGED aux_vars
 ExecCommitTailPublishQueueExecutorLosesW == ExecCommitTailPublishQueueExecutorLoses /\ UNCHANGED aux_vars
 ExecEscalationCASSlotW == ExecEscalationCASSlot /\ UNCHANGED aux_vars
 ExecEscalationMoveSlotW == ExecEscalationMoveSlot /\ UNCHANGED aux_vars
-ExecEscalationEnqueueNewW == ExecEscalationEnqueueNew /\ UNCHANGED aux_vars
+\* Writes liveActivation (gated wasEmpty, fused escalation form) but not activatedSlot -
+\* same bundle shape as ExecCommitQueueCountWinsW.
+ExecEscalationEnqueueNewW == ExecEscalationEnqueueNew /\ UNCHANGED aux_vars_act
+  /\ UNCHANGED <<activatedSlot, readTurnStomped>>
 ExecutorRegistersCallbackW == ExecutorRegistersCallback /\ UNCHANGED aux_vars
 ExecutorInlineCallbackBecomesAdvancerW == ExecutorInlineCallbackBecomesAdvancer /\ UNCHANGED aux_nophase
   /\ qDrainPhase' = (IF PassOnceDrain THEN "pass" ELSE qDrainPhase)
@@ -3099,10 +4623,23 @@ CallbackBecomesAdvancerW == CallbackBecomesAdvancer /\ UNCHANGED aux_nophase
 \* Bails deposit the pending bit atomically with their failed acquire (the one-word property).
 CallbackBailsOutW == CallbackBailsOut /\ UNCHANGED aux_nopend
   /\ advancingPending' = (IF PendingWordLatch THEN TRUE ELSE advancingPending)
-AdvancerCPathW == AdvancerCPath /\ UNCHANGED aux_nophase_act  \* writes activatedSlot
+AdvancerCPathW == AdvancerCPath /\ UNCHANGED aux_nophase_act /\ ReadTurnMonitor  \* writes activatedSlot
+AdvancerCPathArmW == AdvancerCPathArm /\ UNCHANGED aux_nophase
+AdvancerCPathFireW == AdvancerCPathFire /\ UNCHANGED aux_nophase_act /\ ReadTurnMonitor  \* writes activatedSlot
+AdvancerCPathFireMissW == AdvancerCPathFireMiss /\ UNCHANGED aux_nophase
+AdvancerCPathFireSkipW == AdvancerCPathFireSkip /\ UNCHANGED aux_nophase
+AdvancerCPathFirePeekDeclineW == AdvancerCPathFirePeekDecline /\ UNCHANGED aux_nophase
 AdvancerCPathClearAtCountW == AdvancerCPathClearAtCount /\ UNCHANGED aux_nophase
 AdvancerCPathLeaveAtCountW == AdvancerCPathLeaveAtCount /\ UNCHANGED aux_nophase
 AdvancerCPathLockExitW == AdvancerCPathLockExit /\ UNCHANGED aux_nophase
+\* Queue C-path pending pre-check wrappers (CPathPendingPreCheck). Pure qDrainPhase steps,
+\* so aux_nophase (aux minus the queue-drain PC) covers the rest.
+AdvancerCPathPreEnterW == AdvancerCPathPreEnter /\ UNCHANGED aux_nophase
+AdvancerCPathPreSkipW == AdvancerCPathPreSkip /\ UNCHANGED aux_nophase
+AdvancerCPathPreReadTrueW == AdvancerCPathPreReadTrue /\ UNCHANGED aux_nophase
+AdvancerCPathPreReadFalseW == AdvancerCPathPreReadFalse /\ UNCHANGED aux_nophase
+AdvancerCPathPreEnterSplitW == AdvancerCPathPreEnterSplit /\ UNCHANGED aux_nophase
+AdvancerCPathPreSkipSplitW == AdvancerCPathPreSkipSplit /\ UNCHANGED aux_nophase
 AdvancerReleaseW == AdvancerRelease /\ UNCHANGED aux_vars
 AdvancerReclaimW == AdvancerReclaim /\ UNCHANGED aux_vars
 DrainerChainExitW == DrainerChainExit /\ UNCHANGED aux_vars
@@ -3126,13 +4663,41 @@ PropagateAdvancingW == PropagateAdvancing /\ UNCHANGED aux_vars
 PropagateHasExecutingW == PropagateHasExecuting /\ UNCHANGED aux_vars
 PropagateExecutingItemW == PropagateExecutingItem /\ UNCHANGED aux_vars
 
-Next ==
+\* The self-act lock hold (SplitCommitSelfActRecheck): RECHECK, FIRE and VERIFY act from this
+\* phase window, which models the single _activationLock hold (Pipeline.cs 1127-1144). Vacuous
+\* whenever SplitCommitSelfActRecheck = FALSE (the multi-step phases never persist).
+SelfActLockHeld ==
+  /\ SplitCommitSelfActRecheck
+  /\ escPhase \in {"q_selfact_fire", "q_selfact_dofire", "q_selfact_verify",
+                   "slot_selfact_fire", "slot_selfact_dofire", "slot_selfact_verify"}
+
+\* Mutual exclusion of _activationLock, encoded as a TRANSITION constraint: while the committer
+\* holds the lock (SelfActLockHeld) no OTHER thread may GRANT (drive liveActivation FALSE -> TRUE
+\* via an ActivateHeadItem - the commit gate for other items, the C-path license family, any
+\* gated / drain / recovery activation). The lock-FREE retirement clears (TRUE -> FALSE) and every
+\* non-granting action stay enabled; the self-act family itself is exempt (it IS the lock holder,
+\* re-admitted at Next's top level). Vacuous whenever SplitCommitSelfActRecheck = FALSE, so every
+\* prior config is bit-identical.
+NoForeignGrant == ~SelfActLockHeld \/ ~(liveActivation = FALSE /\ liveActivation' = TRUE)
+
+\* The lock-holder's own continuation - exempt from NoForeignGrant so FIRE may grant under the hold.
+SelfActLockFamily ==
+  \/ ExecCommitQueueCountArmW \/ ExecCommitQueueCountActFireW \/ ExecCommitQueueCountActDoneW
+  \/ ExecCommitQueueRecheckW  \/ ExecCommitQueueFireW         \/ ExecCommitQueueVerifyW
+  \/ ExecCommitSlotCountArmW  \/ ExecCommitSlotCountActFireW  \/ ExecCommitSlotCountActDoneW
+  \/ ExecCommitSlotRecheckW   \/ ExecCommitSlotFireW          \/ ExecCommitSlotVerifyW
+
+NextBody ==
   \/ \E i \in Item : CompleteTaskW(i)
   \/ \E i \in Item : CompleteTaskUnactivatedW(i)  \* possible, never obligated - no WF below
   \/ SourceYieldInline
   \/ SourceYieldDeferredW
+  \/ SourceYieldElide
+  \/ SourceYieldElideArm
+  \/ SourceYieldElideAct
   \/ ExecSetTailW
   \/ ExecItemFailure
+  \/ ExecFaultClearWonW
   \/ RecoverItemWinsW
   \/ RecoverItemLosesW
   \/ RecoverInstallWins
@@ -3149,11 +4714,17 @@ Next ==
   \/ ExecCommitQueueVisibleLosesW
   \/ ExecCommitQueueCountWinsW
   \/ ExecCommitQueueCountLosesW
+  \/ ExecCommitQueueCountArmW
+  \/ ExecCommitQueueCountActFireW
+  \/ ExecCommitQueueCountActDoneW
   \/ ExecCommitSlotCASWinsW
   \/ ExecCommitSlotCASLosesW
   \/ ExecCommitSlotFieldsW
   \/ ExecCommitSlotCountWinsW
   \/ ExecCommitSlotCountLosesW
+  \/ ExecCommitSlotCountArmW
+  \/ ExecCommitSlotCountActFireW
+  \/ ExecCommitSlotCountActDoneW
   \/ ExecCommitSlotWriteWinsW
   \/ ExecCommitSlotWriteLosesW
   \/ ExecCommitSlotPublishW
@@ -3195,6 +4766,10 @@ Next ==
   \/ SlotDrainHandoffReclaim
   \/ SlotDrainHandoffTrust
   \/ SlotDrainCompleteCPath
+  \/ SlotCPathPreReadTrue
+  \/ SlotCPathPreReadFalse
+  \/ SlotCPathPreActTrue
+  \/ SlotCPathPreSkipFalse
   \/ SlotHeadRecovers
   \/ ExecEscalationCompensate
   \/ SlotDrainerReclaim
@@ -3210,9 +4785,20 @@ Next ==
   \/ AdvancerDrainHead
   \/ DrainHeadRecovers
   \/ AdvancerCPathW
+  \/ AdvancerCPathArmW
+  \/ AdvancerCPathFireW
+  \/ AdvancerCPathFireMissW
+  \/ AdvancerCPathFireSkipW
+  \/ AdvancerCPathFirePeekDeclineW
   \/ AdvancerCPathClearAtCountW
   \/ AdvancerCPathLeaveAtCountW
   \/ AdvancerCPathLockExitW
+  \/ AdvancerCPathPreEnterW
+  \/ AdvancerCPathPreSkipW
+  \/ AdvancerCPathPreReadTrueW
+  \/ AdvancerCPathPreReadFalseW
+  \/ AdvancerCPathPreEnterSplitW
+  \/ AdvancerCPathPreSkipSplitW
   \/ AdvancerReleaseW
   \/ AdvancerReclaimW
   \/ QDrainReleaseStepW
@@ -3233,11 +4819,31 @@ Next ==
   \/ PropagateHasExecutingW
   \/ PropagateExecutingItemW
 
+\* The self-act lock family is re-admitted at top level (exempt from NoForeignGrant so FIRE may
+\* grant); every other action runs under NoForeignGrant (no foreign grant while the lock is held).
+\* When SplitCommitSelfActRecheck = FALSE, NoForeignGrant is vacuous and SelfActLockFamily is a
+\* subset of NextBody, so Next reduces EXACTLY to the prior NextBody disjunction.
+\* Consumable-token round: token_vars are folded into the aux bundles (so W-wrappers carry them
+\* in BOTH Next and the WF_vars fairness conjuncts) and into each raw action's UNCHANGED; the
+\* commit token-writers use token-free aux variants (aux_vars0 / aux_vars_act0) and specify
+\* token_vars in their bodies. So Next needs no token wrap - it reduces to the prior relation, and
+\* when the toggles are FALSE token_vars stay constant so the state count is preserved.
+Next ==
+  \/ SelfActLockFamily
+  \/ (NextBody /\ NoForeignGrant)
+
 Spec == Init /\ [][Next]_vars
         \* Fairness: assume the executor and advancer chain make progress.
         \* W-suffixed forms keep aux_vars constrained; liveness evaluates these actions
         \* independently of Next.
         /\ WF_vars(SourceYieldInline \/ SourceYieldDeferredW)
+        \* The elision act is the executor's unconditional next program step once armed
+        \* (the armed state disables every other dispatch action, so without this WF a
+        \* behavior could stutter armed forever and fake a strand). The ARM carries no
+        \* fairness - eliding is a possibility, never an obligation (the locked arm's WF
+        \* above covers dispatch progress); same for the fused elide. Vacuous when
+        \* LockFreeIdleDispatch = FALSE (the act is never enabled).
+        /\ WF_vars(SourceYieldElideAct)
         /\ WF_vars(ExecSetTailW)
         \* Recovery is reactive to failure (no WF on ExecItemFailure - failure is a
         \* possibility, not an obligation). Once Recovering, the substitute must eventually
@@ -3250,6 +4856,11 @@ Spec == Init /\ [][Next]_vars
         \* a substitute's own failure is a possibility, not an obligation (like ExecItemFailure).
         /\ WF_vars(RecoverInstallWins \/ RecoverInstallLoses \/ RecoverInstallInline
                    \/ RecoverRefuse)
+        \* SplitRecoveryInlineAct: the won-claim is the executor's unconditional program step
+        \* after the fault (ClearExecutingItem always runs before TryRecoverItemFailure);
+        \* without WF the claim could stutter unresolved forever and fake a recovery strand.
+        \* Vacuous when the toggle is FALSE (the action is never enabled).
+        /\ WF_vars(ExecFaultClearWonW)
         \* The drain-side substitute's completion is the recovery continuation running
         \* CompleteRecoveryWaiter - an obligation once its task settles (taskDone via the
         \* fair CompleteTask).
@@ -3265,6 +4876,19 @@ Spec == Init /\ [][Next]_vars
         \* The split commit's count step is the executor finishing TryEscalateOrEnqueue -
         \* an unconditional program step once the enqueue landed.
         /\ WF_vars(ExecCommitQueueCountWinsW \/ ExecCommitQueueCountLosesW)
+        \* SplitCommitSelfActivate arms: ARM then ACT are the executor's unconditional next
+        \* program steps once the enqueue landed (same fairness the fused count step carries).
+        \* SplitCommitSelfActRecheck adds RECHECK/FIRE/VERIFY as further unconditional in-lock
+        \* program steps; folded into the same per-arm WF disjunction so the commit always
+        \* progresses out of the self-act phase window back to idle.
+        /\ WF_vars(ExecCommitQueueCountArmW \/ ExecCommitQueueCountActFireW
+                     \/ ExecCommitQueueCountActDoneW
+                     \/ ExecCommitQueueRecheckW \/ ExecCommitQueueFireW
+                     \/ ExecCommitQueueVerifyW)
+        /\ WF_vars(ExecCommitSlotCountArmW \/ ExecCommitSlotCountActFireW
+                     \/ ExecCommitSlotCountActDoneW
+                     \/ ExecCommitSlotRecheckW \/ ExecCommitSlotFireW
+                     \/ ExecCommitSlotVerifyW)
         /\ WF_vars(ExecEscalationEnqueueTailW)
         /\ WF_vars(ExecEscalationCommitCountW)
         /\ WF_vars(ExecEscalationNudgeStepW)
@@ -3284,6 +4908,22 @@ Spec == Init /\ [][Next]_vars
         \* The leave arm (the fix) is a program step out of the lock, so it carries WF like
         \* the activate/exit - the drainer must progress out of "cpath_lock".
         /\ WF_vars(AdvancerCPathW \/ AdvancerCPathLockExitW \/ AdvancerCPathLeaveAtCountW)
+        \* The fire-skip is the gated fire's program-step alternative out of "cpath_armed"
+        \* (the code's short-circuit falls through and the pass continues) - it carries the
+        \* same fairness so the drainer exits the armed phase under a closed gate. The
+        \* peek-decline (PeekGatedCPathLicense) is the third program-step alternative:
+        \* fire / miss / gate-skip / peek-decline partition the armed states, so the
+        \* disjunction stays total and the drainer always exits "cpath_armed".
+        /\ WF_vars(AdvancerCPathArmW \/ AdvancerCPathFireW \/ AdvancerCPathFireMissW
+                   \/ AdvancerCPathFireSkipW \/ AdvancerCPathFirePeekDeclineW)
+        \* The queue C-path pending pre-check steps (CPathPendingPreCheck): the drainer's
+        \* straight-line program steps out of "cpath_pre" / "cpath_pre_t" / "cpath_pre_f".
+        \* The read faces partition on hasExecutingVisible, and enter/skip partition their
+        \* captured phases, so the disjunction is total - the drainer always exits the pre
+        \* phase (into "cpath_lock" or "pass"). Vacuous when CPathPendingPreCheck = FALSE.
+        /\ WF_vars(AdvancerCPathPreEnterW \/ AdvancerCPathPreSkipW
+                   \/ AdvancerCPathPreReadTrueW \/ AdvancerCPathPreReadFalseW
+                   \/ AdvancerCPathPreEnterSplitW \/ AdvancerCPathPreSkipSplitW)
         /\ WF_vars(AdvancerReleaseW)
         /\ WF_vars(AdvancerReclaimW)
         \* Pass-once drain steps: the drainer thread's straight-line program steps.
@@ -3337,6 +4977,12 @@ Spec == Init /\ [][Next]_vars
         \* per-variant. Same for the handoff resolution pair (the one-shot re-peek).
         /\ WF_vars(SlotDrainCompleteLegacy \/ SlotDrainCompleteChainSlot
                    \/ SlotDrainCompleteChainHandoff \/ SlotDrainCompleteCPath)
+        \* SPLIT slot C-path pre-check (CPathPendingPreCheck /\ SplitCPathPreCheck): the read
+        \* faces are the drain's step-3 entry when they intercept the "counted" <=0 case (they
+        \* partition on hasExecutingVisible, so one always fires); the act/skip are the
+        \* straight-line continuation out of "cnt_pt"/"cnt_pf". Vacuous when the toggles are off.
+        /\ WF_vars(SlotCPathPreReadTrue \/ SlotCPathPreReadFalse)
+        /\ WF_vars(SlotCPathPreActTrue \/ SlotCPathPreSkipFalse)
         /\ WF_vars(SlotDrainHandoffReclaim \/ SlotDrainHandoffTrust)
         /\ WF_vars(ExecEscalationCompensate)
         /\ WF_vars(SlotDrainerReclaim)
@@ -3375,15 +5021,23 @@ TypeOK ==
   /\ activations \in [Item -> 0..5]  \* bounded for TLC; recovery cycle adds up to 2 more
   /\ drainSignal \in BOOLEAN
   /\ qDrainPhase \in {"none", "pass", "recheck", "reclaim", "rhold", "rhit", "rmiss",
-                      "pendReacq", "cpath_lock"}
+                      "pendReacq", "cpath_lock", "cpath_armed",
+                      "cpath_pre", "cpath_pre_t", "cpath_pre_f"}
   /\ qDrainedAny \in BOOLEAN
   /\ advancingPending \in BOOLEAN
   /\ drainerActive \in BOOLEAN
   /\ failed \subseteq Item
   /\ drainPhase \in {"idle", "claimed", "completed", "counted", "handoff", "cl_acq", "cl_xchg", "cl_read",
-                     "cl_peeked", "cl_own", "cl_exit", "cl_pendReacq", "sl_serve"}
+                     "cl_peeked", "cl_own", "cl_exit", "cl_pendReacq", "sl_serve",
+                     "cnt_pt", "cnt_pf"}
   /\ activatedSlot \in Item \cup {NoItem}
   /\ slotStomped \in BOOLEAN
+  /\ readTurnStomped \in BOOLEAN
+  /\ liveActivation \in BOOLEAN
+  /\ tokenConsumed \subseteq Item
+  /\ staleTokenRead \in BOOLEAN
+  /\ commitWasCompleted \in BOOLEAN
+  /\ cbWiredPrePublish \in BOOLEAN
   /\ drainItem \in Item \cup {NoItem}
   \* -1 floor: the slot claim can consume a committed-but-uncounted pair under the split
   \* commit (the same single-producer skew bound as BoundedCountSkew; the code's
@@ -3446,8 +5100,11 @@ DrainConsistent ==
   \* Split from the fused <=> so the truthful claim's read phase fits: at "cl_read"
   \* drainItem holds whatever the read returned - the committed pair (forward direction
   \* must not require it) or NoItem (NoDefaultSlotClaim's subject, not this invariant's).
-  /\ (drainPhase \in {"claimed", "completed", "counted"}) => (drainItem # NoItem)
-  /\ (drainItem # NoItem) => (drainPhase \in {"claimed", "completed", "counted", "cl_read"})
+  \* cnt_pt / cnt_pf are the SPLIT slot C-path pre-check phases (CPathPendingPreCheck): a
+  \* continuation of "counted" that still owns drainItem and the captured drainRemaining while
+  \* the pending read/act interleaves - treated like "counted" throughout this invariant.
+  /\ (drainPhase \in {"claimed", "completed", "counted", "cnt_pt", "cnt_pf"}) => (drainItem # NoItem)
+  /\ (drainItem # NoItem) => (drainPhase \in {"claimed", "completed", "counted", "cl_read", "cnt_pt", "cnt_pf"})
   \* The recovery admission: a drain-side fault park (SlotHeadRecovers) re-locates the
   \* claimed item to RecoveringInline while the drain PC stays parked at "claimed", and the
   \* post-resolution rejoin runs the count/complete steps with the item already Completed
@@ -3456,7 +5113,7 @@ DrainConsistent ==
   \* Completed (SlotDrainCompleteClear ran first).
   /\ (drainItem # NoItem /\ drainPhase # "cl_read") =>
        \/ loc[drainItem] = "Draining"
-       \/ (drainPhase \in {"completed", "counted"} /\ loc[drainItem] = "Completed")
+       \/ (drainPhase \in {"completed", "counted", "cnt_pt", "cnt_pf"} /\ loc[drainItem] = "Completed")
        \/ (RecoverySplit /\ drainItem \in failed
            /\ loc[drainItem] \in {"RecoveringInline", "Completed"})
   /\ \A i \in Item : (loc[i] = "Draining") => (drainItem = i)
@@ -3464,7 +5121,7 @@ DrainConsistent ==
   \* (the obligation re-acquire windows: claim-fail exit and the main release's deposit serve).
   /\ drainPhase \notin {"idle", "cl_pendReacq", "sl_serve"} => (advancing /\ drainerActive)
   /\ drainPhase \in {"cl_pendReacq", "sl_serve"} => drainerActive
-  /\ drainPhase # "counted" => drainRemaining = 0
+  /\ drainPhase \notin {"counted", "cnt_pt", "cnt_pf"} => drainRemaining = 0
   \* The slot decrement's -1 floor (claimed-but-uncounted, BoundedCountSkew's bound) is
   \* reachable once the split commit lets a claim land before the increment.
   /\ drainRemaining >= -1
@@ -3502,7 +5159,11 @@ EscalationConsistent ==
   \* count-skew bug itself), so Completed is admitted.
   /\ (escTail # NoItem /\ escPhase \in {"publish_done", "cas_done", "move_done"})
        => (loc[escTail] = "InEscalation")
-  /\ (escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact"})
+  \* SplitCommitSelfActivate queue PCs: the increment landed at ARM, item is InWaitersPending
+  \* (counted now) or already drained to Completed in the ARM->ACT window.
+  /\ (escPhase \in {"esc_enqueued", "q_enq_act", "q_enq_noact",
+                    "q_selfact_fire", "q_selfact_done",
+                    "q_selfact_dofire", "q_selfact_verify"})  \* SplitCommitSelfActRecheck sub-phases
        => (loc[escTail] \in {"InWaitersPending", "Completed"})
   \* Slot-split commit phases: CAS landed, fields pending = InSlotPending (CAS-first form);
   \* fields landed, flag pending = InSlotPending (TriState write-first form); fields landed,
@@ -3512,7 +5173,11 @@ EscalationConsistent ==
   \* hijack claim's GetResult faulted and SlotHeadRecovers parked the mid-commit pair.
   /\ (escPhase \in {"slot_cas_act", "slot_cas_noact", "slot_w_act", "slot_w_noact"})
        => (loc[escTail] = "InSlotPending")
-  /\ (escPhase \in {"slot_f_act", "slot_f_noact"})
+  \* SplitCommitSelfActivate slot PCs join slot_f_*: increment landed at ARM, the slot occupant
+  \* is InSlot (counted) or claimed/completed by DrainSlotInline in the ARM->ACT window.
+  /\ (escPhase \in {"slot_f_act", "slot_f_noact",
+                    "slot_selfact_fire", "slot_selfact_done",
+                    "slot_selfact_dofire", "slot_selfact_verify"})  \* SplitCommitSelfActRecheck sub-phases
        => (loc[escTail] \in {"InSlot", "Draining", "Completed", "RecoveringInline"})
   /\ \A i \in Item : (loc[i] = "InEscalation") => (escTail = i)
 
@@ -3574,6 +5239,154 @@ ActivatedSlotConsistent ==
 \* a successor can have written activatedSlot = NEW and the unconditional clear
 \* stomps it; Slon's PgDecoder NRE on CurrentExecutionControl, June 2026).
 NoStompedActivation == ~slotStomped
+
+\* No stale-token read: no COMMIT-side action ever read a Consumed waiter task's state
+\* (ConsumableTaskTokens). The single-consumption ValueTask is readable only until a drain's
+\* GetResult consumes it; a stale post-publication read (Pipeline.cs 1136 out-of-lock IsCompleted,
+\* 1152 in-lock recheck, 1169 verify done-leg, 1185 callback-wiring IsCompleted - the convicted
+\* thrower) observes a recycled promise box and throws (Slon MRVTSC.GetStatus token-validation).
+\* EXPECTED FALSE under the shipped commit protocol (ConsumableTaskTokens=TRUE,
+\* CommitOwnershipRestructure=FALSE - Pipeline_CommitTokenWitness.cfg) and HOLD under the
+\* ownership restructure (both TRUE - Pipeline_CommitOwnershipFix.cfg), where every
+\* post-publication decision keys on the pre-publication capture + store words alone.
+NoStaleTokenRead == ~staleTokenRead
+
+\* Adjudication probe for the restructure's VERIFY trigger (Pipeline_CommitOwnershipFix.cfg and the
+\* store-words probe). Under the restructure the VERIFY cannot read task-done; it keys on
+\* storeCount = 0 /\ waiters = <<>> (count re-read + producer-side taken). CLAIM: that two-way
+\* store-word conjunction, at a restructure VERIFY pre-state, already implies the item is RETIRED
+\* (loc = "Completed") - so the dropped task-done leg (and the pre-publication wasCompleted capture)
+\* need NOT join it. HOLDS => store words suffice; VIOLATED => the capture/done must join = the
+\* finding. Rests on complete-before-decrement (CompleteBeforeCount): a zero count re-read after
+\* our own +1 proves the drain's clear (loc -> Completed) already landed. Meaningful only under
+\* CommitOwnershipRestructure; trivially TRUE otherwise (the restructure VERIFY phase is unreached).
+RestructureVerifyStoreWordsImplyRetired ==
+  ( /\ CommitOwnershipRestructure
+    /\ escPhase \in {"q_selfact_verify", "slot_selfact_verify"}
+    /\ storeCount = 0
+    /\ (IF escPhase = "q_selfact_verify" THEN waiters = <<>> ELSE slotItem # escTail) )
+  => loc[escTail] = "Completed"
+
+\* Non-vacuity probe for RestructureVerifyStoreWordsImplyRetired: CLAIMS the restructure VERIFY
+\* trip antecedent (a verify pre-state with storeCount = 0 /\ waiters = <<>>) is never reached.
+\* EXPECTED VIOLATED under the restructure = the store-word VERIFY trip genuinely fires (the drain
+\* retired our just-granted item between FIRE and VERIFY), so RestructureVerifyStoreWordsImplyRetired
+\* is a non-vacuous implication and the restructure's store-word verify does real work.
+RestructureVerifyTripUnreached ==
+  ~( /\ CommitOwnershipRestructure
+     /\ escPhase = "q_selfact_verify"
+     /\ storeCount = 0
+     /\ waiters = <<>> )
+
+\* Non-vacuity probe for the late-visible-deposit face (RestructureWireBeforePublish,
+\* Pipeline_CommitTokenLateVisible.cfg). CLAIMS the early-deposit window is NEVER entered - no
+\* reachable state where a pre-wired callback raised the drain signal before its item became
+\* visible (cbWiredPrePublish). EXPECTED VIOLATED under the face toggle: the violation is the
+\* coverage proof that TLC explored callback-before-visible interleavings, so the GREEN
+\* NoStaleTokenRead + liveness verdict on that config is not vacuous. Trivially TRUE when the
+\* toggle is FALSE (the window is never entered).
+LateVisibleWindowUnreached == ~cbWiredPrePublish
+
+\* Read-turn mutex: at most one flow holds the read turn at a time. NoStompedActivation catches
+\* a CLEAR wiping a live reader (the NoItem NRE face); this catches an ACTIVATION granting the
+\* turn to a second flow while the first still holds it. One root, several variations (none
+\* canonical): ReadState.ReadPromise's single-tenant TryStart throwing "async method already
+\* executing", the shared decoder re-armed under a live read, the slot stomped to NoItem - all
+\* closed by the _liveReaderActive single-reader gate (Pipeline.cs, June 2026). tenure is NOT this
+\* resource - it is activation-occupancy from the EXECUTOR's single dispatch, maintained only on
+\* the inline-dispatch and recovery-install paths; the slot-commit, queue-commit, C-path and
+\* wasEmpty self-activate paths bump activations / write activatedSlot without touching it, so the
+\* read turn as a cross-path shared resource was never modeled and a collision among THEM was
+\* invisible - the fidelity gap this witness fills.
+\* EXPECTED FALSE with SingleReaderLock = FALSE (the shipped pre-lock shape, all other fixes on -
+\* Pipeline_ReadTurnWitness.cfg) and HOLD with SingleReaderLock = TRUE.
+ReadTurnMutex == ~readTurnStomped
+
+\* Non-vacuity probe for CommitSelfActVerify (Pipeline_CommitSelfActVerifyProbe.cfg). CLAIMS the
+\* VERIFY self-clear branch never fires - i.e. no reachable state parks at a *_selfact_verify phase
+\* with the item ALREADY done (the exact pre-state of a VERIFY that clears a stuck grant). Expected
+\* to be VIOLATED under the verify fix: a violation proves the fix's trip branch is genuinely
+\* explored (the fix is doing real work), so the GREEN Pipeline_CommitSelfActVerifyFix.cfg run is
+\* not vacuously green. Meaningless (trivially TRUE) when CommitSelfActVerify = FALSE.
+VerifyTripBranchUnreached ==
+  ~(escPhase \in {"q_selfact_verify", "slot_selfact_verify"} /\ escTail \in taskDone)
+
+\* Non-vacuity probe for CommitSelfActVerifyOnTaken (Pipeline_CommitSelfActVerifyOnTakenProbe.cfg).
+\* CLAIMS the EARLY-trip branch never fires - no reachable VERIFY pre-state where the item is
+\* task-done AND taken (queue: producer-side emptiness; slot: the word no longer holds it) but NOT
+\* yet Completed - i.e. the drain is between its take and its CompleteWaiterDeferred clear. Expected
+\* VIOLATED under the OnTaken fix: a violation proves the early trigger genuinely fires in the
+\* window the retirement-keyed shape cannot observe. Trivially TRUE when the toggle is FALSE.
+VerifyOnTakenEarlyTripUnreached ==
+  ~( /\ escPhase \in {"q_selfact_verify", "slot_selfact_verify"}
+     /\ escTail \in taskDone
+     /\ loc[escTail] # "Completed"
+     /\ (IF escPhase = "q_selfact_verify" THEN waiters = <<>> ELSE slotItem # escTail) )
+
+\* Interleaving-coverage probe for the OnTaken variant's suspect window (the c-check,
+\* Pipeline_CommitSelfActOnTakenGrantProbe.cfg). CLAIMS TLC never reaches a state where a NEW grant
+\* is live (liveActivation TRUE for a not-done item j) while some done item i sits taken-but-not-
+\* retired (loc = "Draining": the drain's take landed, its CompleteWaiterDeferred clear still
+\* pending). Expected VIOLATED under the OnTaken fix: the violation is the existence proof that
+\* our-clear -> successor-grant -> (pending) drain-clear interleavings are explored, so the main
+\* run's verdict on that window is meaningful. Trivially TRUE when the toggle is FALSE only if
+\* unreachable there - run it ONLY against the OnTaken config.
+OnTakenSuccessorGrantWindowUnreached ==
+  ~( \E i, j \in Item :
+       /\ i # j
+       /\ loc[i] = "Draining" /\ i \in taskDone /\ activations[i] > 0
+       /\ loc[j] # "Completed" /\ j \notin taskDone /\ activations[j] > 0
+       /\ liveActivation )
+
+\* Port-observable adjudication (Pipeline_CommitSelfActCountZeroProbe.cfg). The OnTaken trigger is
+\* unsound because "taken" fires in the claimed/dequeued-but-not-yet-counted drain window, where the
+\* store still counts the item (CountConsistency's claimed-phase +1) - the restore then nulls the
+\* activated slot at depth >= 1. CLAIM: conjoining the committer's count re-read (Volatile, under
+\* the lock; the committer is the producer, so a zero count with our own commit's +1 landed means
+\* the drain consumed AND counted our item) restores soundness - at a VERIFY pre-state, task-done
+\* AND taken AND storeCount = 0 TOGETHER imply the item is genuinely RETIRED (loc = "Completed"):
+\* under CompleteBeforeCount the drain's Clear (loc -> Completed + the liveActivation release) runs
+\* BEFORE its DecrementCount, so a zero count proves the clear already landed. Expected to HOLD
+\* over the OnTaken variant's full state space - then "done /\ taken /\ count == 0" is the
+\* committer-observable retirement proxy the port must use.
+VerifyCountZeroImpliesRetired ==
+  ( /\ escPhase \in {"q_selfact_verify", "slot_selfact_verify"}
+    /\ escTail \in taskDone
+    /\ (IF escPhase = "q_selfact_verify" THEN waiters = <<>> ELSE slotItem # escTail)
+    /\ storeCount = 0 )
+  => loc[escTail] = "Completed"
+
+\* Diagnostic (activatedSlot-INDEPENDENT): count items that have been ACTIVATED and are still
+\* live, straight off the activations counter. A queued-but-not-yet-head waiter is activations=0
+\* (activation happens when it becomes the reader), so under a correct single-reader discipline
+\* this is <= 1 at all times - the read turn counted without the slot's last-writer-wins blur.
+\* Used to discriminate the two hypotheses for why ReadTurnMutex holds on the shipped model:
+\* (a) the turn genuinely stays single, vs (b) the two-reader race (site-20 C-path grants M while
+\* site-25 wasEmpty-commit would grant N) is simply not REACHED. If this also holds, the model
+\* never has two live activated items at once - the race is unreached, a fidelity gap, and the
+\* lock's necessity cannot yet be adjudicated here.
+LiveActivated == { i \in Item :
+      activations[i] > 0 /\ loc[i] \notin {"Completed", "Nowhere", "Recovering", "RecoveringInline"} }
+AtMostOneLiveActivated == Cardinality(LiveActivated) <= 1
+
+\* Reachability PROBE for the recovery inline-activate round
+\* (Pipeline_RecoveryPostMortemProbe.cfg). NOT a defect witness: recovery ALWAYS SUBSTITUTES -
+\* the substitute inherits the failed item's pipeline position INCLUDING its activation state,
+\* so a second ActivateHeadItem over a faulted predecessor's grant is the intended semantics
+\* (a naive "no two grants for one position without intervening retirement" invariant would
+\* flag intended behavior; any exemption wide enough to admit the sanctioned substitution also
+\* admits the audited interleaving - the two are state-indistinguishable at grant time). This
+\* action property CLAIMS no step ever grants an item already parked Recovering/RecoveringInline:
+\* the C-path's POST-MORTEM activation (its claim beat ClearExecutingItem's, the activate landed
+\* after the fault park - AdvancerCPathFire consuming the still-up publish of a faulted item,
+\* reachable only under SplitRecoveryInlineAct). Expected VIOLATED in the probe config - the
+\* violation is the COVERAGE PROOF that the audit's interleaving is explored, which is what makes
+\* the adjudication run's green verdict (ReadTurnMutex + AtMostOneLiveActivated + liveness over
+\* the same space) meaningful. Meaningful only under RecoverySplit: the legacy RecoverItemWins
+\* re-activates the Recovering identity by design (identity reuse), a false positive here.
+PostMortemGrantUnreached ==
+  [][ \A i \in Item : (activations'[i] > activations[i])
+        => loc[i] \notin {"Recovering", "RecoveringInline"} ]_vars
 
 \* Never null while live: once an activation has happened and the pipeline is not empty (some item
 \* not yet Completed - including not-yet-yielded items, which are enqueued/depth-counted), the slot
