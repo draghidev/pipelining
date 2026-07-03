@@ -772,23 +772,25 @@ public class PipelineRecoveryTests
     }
 
     /// The TESTABLE half of the executor/advancer asymmetry: the executor IS the task CompleteAsync
-    /// awaits, so a throw at an UNGUARDED seam (here the policy's TryRecoverItemFailure) is captured by the
-    /// loop's catch-all (Pipeline.cs:454) and surfaced through the execution task instead of killing the
-    /// pump. The advancer half (a bare-seam throw escaping onto a TP thread) is deliberately NOT tested -
-    /// it has no task to deliver to, so fail-fast is the design and asserting it means crashing the host.
+    /// awaits (observable live via Completion), so a throw at an UNGUARDED seam (here the policy's
+    /// TryRecoverItemFailure) is captured by the loop's catch-all and surfaced through the execution
+    /// task instead of killing the pump. The advancer half (a bare-seam throw escaping onto a TP
+    /// thread) is deliberately NOT tested. It has no task to deliver to, so fail-fast is the design
+    /// and asserting it means crashing the host.
     [TestMethod]
     public async Task ExecutorRecoveryPolicyThrows_FaultSurfacesThroughExecutionTask()
     {
         var policyEx = new InvalidOperationException("policy blew up");
         // The recovery factory itself throws => TryRecoverItemFailure throws, which is NOT one of
-        // RecoverItem's guarded seams (it runs before RecoverItem's try), so it propagates to 454.
+        // RecoverItem's guarded seams (it runs before RecoverItem's try), so it propagates to the
+        // loop's catch-all.
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => throw policyEx));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = new ApplicationException("original") };
         pipeline.Enqueue(item).Execute();
 
-        // CompleteAsync returns _executionTask, which 454->fault?.Throw() faulted with the captured root.
+        // CompleteAsync returns _executionTask, faulted with the captured root by the loop's catch-all.
         Exception? surfaced = null;
         try { await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception ex) { surfaced = ex; }
@@ -947,7 +949,7 @@ public class PipelineRecoveryTests
         pipeline.Enqueue(item).Execute();
 
         await recovery.WaitForCompleteAsync();
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
         Assert.IsFalse(item.IsCompleted, "Original was substituted, not independently completed.");
     }
 
@@ -1021,12 +1023,11 @@ public class PipelineRecoveryTests
         Assert.IsFalse(item.IsCompleted, "Original was substituted, not independently completed.");
     }
 
-    /// Audit reorder (a), June 2026: a slot drain that parks for recovery must leave the
+    /// Audit reorder (a): a slot drain that parks for recovery must leave the
     /// position's count credit in place until the rejoin. The old shape decremented BEFORE the
     /// fault decision, which opened the executor's Count==0 inline-activation gate mid-recovery
-    /// (successors activated against the live recovery item - a second active reader) and
+    /// (successors activated against the live recovery item, a second active reader) and
     /// double-decremented the position when the rejoin's AdvanceAndDrain ran its own decrement.
-    /// Model: Pipeline.tla SlotHeadRecovers parks at drainPhase "claimed", ahead of SlotDrainCount.
     [TestMethod]
     public async Task SlotRecoveryPark_SuccessorsCommitDuringRecovery_SingleActivationEach()
     {
@@ -1122,12 +1123,11 @@ public class PipelineRecoveryTests
         await pipeline.CompleteAsync();
     }
 
-    /// Audit reorder (b), June 2026: a tail whose pipeline task is already settled-and-faulted at
+    /// Audit reorder (b): a tail whose pipeline task is already settled-and-faulted at
     /// commit time recovers via RecoverCommittedTailWaiterAsync. With a PRIOR committed waiter
     /// still in flight, the recovery install must be count-gated (mirroring RecoverItem): the
     /// prior waiter is the active reader and the recovery defers, completing unactivated when its
-    /// work finishes first. The old shape activated unconditionally - a second active reader.
-    /// Model: Pipeline.tla ExecCommitTailRecovers resolving via RecoverInstallWins/Loses.
+    /// work finishes first. The old shape activated unconditionally, a second active reader.
     [TestMethod]
     public async Task CommittedTailFaultsAtCommit_PriorWaiterInFlight_RecoveryActivationGated()
     {

@@ -5,6 +5,8 @@
         <Nullable>enable</Nullable>
         <LangVersion>preview</LangVersion>
         <RootNamespace>Draghi.Pipelining.Tests</RootNamespace>
+        <!-- Tests exercise the experimental internal surface wholesale. -->
+        <NoWarn>$(NoWarn);DRAGHI001</NoWarn>
     </PropertyGroup>
 
     <ItemGroup>

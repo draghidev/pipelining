@@ -4,7 +4,6 @@ namespace Draghi.Pipelining.Tests;
 // QueuedPipeline<T,TPolicy>'s surface (Enqueue / Depth / CompleteAsync / WaitForEmptyAsync /
 // GetEnumerator) so the wait-path tests can build pipelines with the re-homed idle/yield hooks without
 // threading the source through their own code.
-#pragma warning disable DRAGHI001
 static class ObservablePipeline
 {
     public static ObservablePipeline<T, TPolicy> Create<T, TPolicy>(
@@ -49,4 +48,3 @@ sealed class ObservablePipeline<T, TPolicy>
     public Pipeline<T, TPolicy, TestObservableQueueSource<T>, TestObservableQueueSource<T>.Enumerator>.Enumerator GetEnumerator()
         => Pipeline.GetEnumerator();
 }
-#pragma warning restore DRAGHI001

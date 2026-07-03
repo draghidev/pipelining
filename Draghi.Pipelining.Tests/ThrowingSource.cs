@@ -10,7 +10,6 @@ namespace Draghi.Pipelining.Tests;
 //   - gateWait : the empty wait parks on a gate the test faults (TriggerWaitThrow), so a fault can
 //                land while a pre-loaded item is still in flight.
 //   - disposeThrow: DisposeAsync throws (the teardown-masking case).
-#pragma warning disable DRAGHI001
 sealed class ThrowingSourceState<T>
 {
     public readonly Queue<T> Items;
@@ -86,4 +85,3 @@ readonly struct ThrowingSource<T> : IPipelineSource<T, ThrowingSource<T>.Enumera
         }
     }
 }
-#pragma warning restore DRAGHI001

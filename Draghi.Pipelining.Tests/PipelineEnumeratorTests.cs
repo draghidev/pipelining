@@ -137,7 +137,7 @@ public class PipelineEnumeratorTests
             await item.WaitForCompleteAsync();
         }
 
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
 
         var observed = new List<TestPipelineItem>();
         foreach (var item in pipeline)

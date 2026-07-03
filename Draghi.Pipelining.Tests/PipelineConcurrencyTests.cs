@@ -42,7 +42,7 @@ public class PipelineConcurrencyTests
         for (var i = 0; i < allItems.Length; i++)
             await allItems[i].WaitForCompleteAsync();
 
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
         foreach (var item in allItems)
             Assert.IsNull(item.Exception);
     }
@@ -158,7 +158,7 @@ public class PipelineConcurrencyTests
 
         for (var i = 0; i < count; i++)
             Assert.IsNull(items[i].Exception, $"Item {i} should complete without exception.");
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     /// The flip side of the inline-completion test: the pipeline STALL an activation-gated item
@@ -229,7 +229,7 @@ public class PipelineConcurrencyTests
         Assert.IsNull(a.Exception);
         Assert.IsNull(b.Exception);
         Assert.IsNull(c.Exception);
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     [TestMethod]
@@ -306,7 +306,7 @@ public class PipelineConcurrencyTests
         second.CompletePipelineTask();
         await second.WaitForCompleteAsync();
 
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     [TestMethod]
@@ -324,7 +324,7 @@ public class PipelineConcurrencyTests
             Assert.IsNull(item.Exception);
         }
 
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     [TestMethod]
@@ -349,7 +349,7 @@ public class PipelineConcurrencyTests
             Assert.IsNull(items[i].Exception);
         }
 
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     /// Upper-bound regression guard for activation: every item must be activated at most once.
@@ -382,7 +382,248 @@ public class PipelineConcurrencyTests
         var doubled = items.Select((it, idx) => (it, idx)).Where(p => p.it.ActivationCount > 1).ToList();
         var detail = string.Join("; ", doubled.Select(p => $"{p.idx}({(p.it.CompleteAsync ? "async" : "sync")},count={p.it.ActivationCount})"));
         Assert.AreEqual(0, doubled.Count, $"{doubled.Count} items had multiple activations: {detail}");
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+    }
+
+    /// Cross-item single-reader guard - the invariant NoItemActivatedMoreThanOnceUnderLoad does NOT
+    /// cover. That test asserts no SINGLE item is activated twice; this asserts no TWO items are ever
+    /// in the activated-but-not-completed phase at once. Draghi's Complete(prev)-before-Activate(next)
+    /// ordering makes "one reader at a time" a hard invariant, but nothing asserted it - and a policy
+    /// with a shared per-connection reader resource (Slon's single read promise) CRASHES when two
+    /// items are activated concurrently ("The async method is already executing"). The guard is a
+    /// faithful mini-model of that shared baton: ActivateHeadItem takes it, CompleteItem releases it,
+    /// two live holders = the collision.
+    ///
+    /// Trips on the executor's dispatch-time inline-activate (Count is 0 -> activate) racing the
+    /// advancer's drain-time activation: the executor reads _waiters.Count is 0 the instant the
+    /// advancer has dequeued the last waiter but not yet activated it, so both strands activate the
+    /// head - two readers on one baton. A stress loop because the window is narrow per iteration.
+    [TestMethod, DoNotParallelize]
+    public async Task NoTwoItemsActivatedConcurrently_SingleReaderInvariant()
+    {
+        // Default sized for strand-hunting, not just the baton race: the one observed permanent
+        // strand (see the gauge-instrumented assert below) was a <=1/32k-iteration event, so a
+        // few hundred iterations are statistically silent. ~1ms/iter keeps even this default
+        // cheap; DRAGHI_STRESS_ITERATIONS overrides for dedicated hunts.
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 2500;
+
+        // DRAGHI_TP_PRESSURE=<K>: recreate the threadpool-starvation weather the iter-602 strand
+        // was observed under. At the time, FrameworkSlot's old holdRelease blocked ~60 TP workers
+        // in Sleep(1) loops CONCURRENTLY with this test (parallel suite) - starving completion
+        // Task.Runs and stretching every window. That accidental load generator was removed when
+        // the slow test was fixed, which is the leading explanation for the strand going quiet
+        // (environment deleted, not bug fixed). K saturator work items block-sleep for the whole
+        // run, forcing injection churn; 0/unset = off.
+        var pressure = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_TP_PRESSURE"), out var k) ? k : 0;
+        var pressureStop = false;
+        for (var p = 0; p < pressure; p++)
+        {
+            ThreadPool.UnsafeQueueUserWorkItem<object?>(_ =>
+            {
+                while (!Volatile.Read(ref pressureStop))
+                    Thread.Sleep(1);
+            }, null, preferLocal: false);
+        }
+
+        try
+        {
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            // Per-iteration tape: a strand dump then holds only this iteration's events.
+            DrainTrace.Reset();
+            var guard = new SingleReaderGuard();
+            var pipeline = Pipeline.Create<TestPipelineItem, SingleReaderGuardPolicy>(new(guard));
+            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+            const int count = 64;
+
+            var items = new TestPipelineItem[count];
+            for (var i = 0; i < count; i++)
+            {
+                // MIX: even = sync (default pipeline task -> executor sync-shortcut completion, no
+                // advancer), odd = async (pipeline task pending until ACTIVATED by the policy). Models
+                // Slon: sync flows complete at head inline; an async flow behind them can only complete
+                // if activation lands. A lost activation => the async item strands forever (the hang).
+                items[i] = new TestPipelineItem { Name = i.ToString(), CompleteAsync = i % 2 != 0 };
+                pipeline.Enqueue(items[i]).Execute();
+                // Third flavor (every fourth, a subset of the async half): the pipeline task settles
+                // immediately off-thread, racing execute and commit. Produces completed-before-commit
+                // heads and commit-window completions, the ingredient the peek-gated C-path license
+                // and the completed-head D-arm guards exist for. Drain-only when the race wins
+                // (completion without activation is legal), first-writer-wins when activation lands.
+                if (i % 4 == 3)
+                    ThreadPool.UnsafeQueueUserWorkItem(
+                        static it => ((TestPipelineItem)it!).CompletePipelineTask(), items[i], preferLocal: false);
+            }
+
+            var emptyReturned = true;
+            try { await pipeline.WaitForEmptyAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (TimeoutException) { emptyReturned = false; }
+
+            // Snapshot the instant empty fired: distinguishes backlog-gap (items not dispatched) from
+            // depth-undercount (Depth reads 0 while dispatched items are still in-flight/uncompleted).
+            var depthAtFire = pipeline.Depth;
+            var inflightAtFire = items.Count(it => it.IsExecuted && !it.IsCompleted);
+            var backlogAtFire = items.Count(it => !it.IsExecuted);
+
+            if (guard.Violation is { } v)
+                Assert.Fail($"iter {iter}: single-reader invariant violated - {v}\nBATON JOURNAL:\n{guard.DumpJournal()}\nTRACE:\n{DrainTrace.Dump()}");
+
+            // WaitForEmptyAsync can return while the advancer is still draining (depth reaches 0 before
+            // every CompleteItem runs). Poll for all items to complete to tell a PERMANENT strand
+            // (some item never completes) from a PREMATURE-EMPTY (all complete, just after the signal).
+            var settleSw = System.Diagnostics.Stopwatch.StartNew();
+            while (items.Any(it => !it.IsCompleted) && settleSw.Elapsed < TimeSpan.FromSeconds(15))
+                await Task.Delay(5);
+
+            var incomplete = items.Where(it => !it.IsCompleted).ToList();
+            if (incomplete.Count > 0)
+            {
+                // Snapshot the TP queue BEFORE the second-chance wait: thousands pending = the
+                // completion chain may be starved-but-queued; ~zero pending with c=0 = the
+                // obligation is not in the queue at all (genuine loss).
+                var tpPending = ThreadPool.PendingWorkItemCount;
+                var tpThreads = ThreadPool.ThreadCount;
+                var stuck = incomplete
+                    .Select(it => $"{it.Name}({(it.CompleteAsync ? "async" : "sync")},exec={it.IsExecuted},act={it.ActivationCount},task={(it.PipelineTaskCompleted ? 1 : 0)},c={guard.CompletionCount(it.Name!)})")
+                    .ToList();
+                // Delay-vs-loss discriminator: under TP pressure a starved (but queued) completion
+                // chain resolves once thread injection catches up; a lost obligation never does.
+                var lateSw = System.Diagnostics.Stopwatch.StartNew();
+                while (items.Any(it => !it.IsCompleted) && lateSw.Elapsed < TimeSpan.FromSeconds(30))
+                    await Task.Delay(50);
+                var resolvedLate = !items.Any(it => !it.IsCompleted);
+                // Under DELIBERATE pressure a resolved-late is the expected weather artifact
+                // (verified: iter-1771 stalled >15s at tpPending=1787 and resolved at +9s - the
+                // whole chain incl. the executor's wake continuation was TP-queued, nothing lost).
+                // Only a genuinely-stuck set fails a pressure run. Without pressure, a 15s stall
+                // is anomalous either way and still fails loudly below.
+                if (resolvedLate && pressure > 0)
+                    continue;
+                // Gauges discriminate the strand class: Backlog ~= stuck count => the executor never
+                // pulled them (parked / lost wake); Depth > 0 with Backlog low => pulled but never
+                // executed/completed (dispatch- or activation-side drop); both 0 => completion
+                // bookkeeping lost (test-side flags never set despite the pipeline draining).
+                Assert.Fail($"iter {iter}: PERMANENT STRAND - {stuck.Count} never completed after 15s " +
+                    $"(Depth={pipeline.Depth}, Backlog={pipeline.Backlog}, emptyReturned={emptyReturned}, " +
+                    $"tpPending={tpPending}, tpThreads={tpThreads}; " +
+                    $"{(resolvedLate ? $"RESOLVED LATE at +{lateSw.ElapsedMilliseconds}ms => starvation delay, not a loss" : "STILL STUCK after +30s => genuine lost obligation")}): " +
+                    $"{string.Join("; ", stuck)}\nTRACE:\n{DrainTrace.Dump()}");
+            }
+
+            var doubles = items.Where(it => guard.CompletionCount(it.Name!) != 1)
+                .Select(it => $"{it.Name}=c{guard.CompletionCount(it.Name!)}").ToList();
+            var prematureMs = !emptyReturned ? -1 : settleSw.ElapsedMilliseconds;
+            // Premature = the PIPELINE's gauges showed outstanding work at fire (undispatched
+            // backlog or live depth). A zero-gauge fire with a small settle is the documented
+            // contract: WaitForEmptyAsync fires from inside the final CompleteItem, so policy
+            // bookkeeping (the test-side IsCompleted flags) may still be unwinding when it
+            // returns. The 15s strand poll above already catches anything that never settles.
+            var genuinePremature = depthAtFire > 0 || backlogAtFire > 0;
+            if (doubles.Count > 0 || genuinePremature || !emptyReturned)
+                Assert.Fail($"iter {iter}: all completed but empty fired early. " +
+                    $"AT FIRE: Depth={depthAtFire}, inflight(exec,!done)={inflightAtFire}, backlog(!exec)={backlogAtFire}; " +
+                    $"drain lagged ~{prematureMs}ms; {doubles.Count} double/zero: {string.Join("; ", doubles)}");
+        }
+        }
+        finally
+        {
+            Volatile.Write(ref pressureStop, true);
+        }
+    }
+
+    /// Faithful mini-model of Slon's shared per-connection read promise: exactly one item may hold
+    /// the reader baton at a time. A second concurrent take is the shared-promise collision
+    /// (PromiseAsyncValueTaskMethodBuilder.Start throwing "already executing, multiple callers").
+    sealed class SingleReaderGuard
+    {
+        TestPipelineItem? _currentReader;
+        volatile string? _violation;
+        public string? Violation => _violation;
+
+        // Baton forensics: a small ring of take/release events so a violation names its own
+        // interleaving without DRAGHI_DRAIN_TRACE (whose per-event fences on every pipeline
+        // path can close the very window under investigation; this journal fences only the
+        // ~2 guard events per item that already do interlocked work).
+        const int JournalSize = 64;
+        readonly (string What, string? Item, string? Prev, int Thread)[] _journal = new (string, string?, string?, int)[JournalSize];
+        int _journalTicket = -1;
+
+        void Journal(string what, TestPipelineItem item, TestPipelineItem? prev)
+        {
+            var seq = Interlocked.Increment(ref _journalTicket);
+            _journal[seq & (JournalSize - 1)] = (what, item.Name, prev?.Name, Environment.CurrentManagedThreadId);
+        }
+
+        public string DumpJournal()
+        {
+            var ticket = Volatile.Read(ref _journalTicket);
+            var entries = new List<string>();
+            var start = Math.Max(0, ticket - (JournalSize - 1));
+            for (var seq = start; seq <= ticket; seq++)
+            {
+                var e = _journal[seq & (JournalSize - 1)];
+                entries.Add($"#{seq} t{e.Thread} {e.What} '{e.Item}'{(e.Prev is null ? "" : $" prev='{e.Prev}'")}");
+            }
+            return string.Join("\n", entries);
+        }
+
+        // Per-item CompleteItem call counter: a value != 1 exposes a drain mis-route (double-complete
+        // or skip). Keyed by item name so the report can line up with the activated/stuck lists.
+        readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _completions = new();
+        public void RecordCompletion(string name) => _completions.AddOrUpdate(name, 1, (_, c) => c + 1);
+        public int CompletionCount(string name) => _completions.TryGetValue(name, out var c) ? c : 0;
+
+        // Mirrors ExecutePipelined.Start's TryStart on the shared promise: take the baton, and if
+        // another item already holds it, record the collision. The brief spin gives a concurrent
+        // activation a realistic overlap window (Slon's async Start lands on the TP, not inline).
+        public void TakeBaton(TestPipelineItem item)
+        {
+            var prev = Interlocked.CompareExchange(ref _currentReader, item, null);
+            Journal(prev is null ? "take" : ReferenceEquals(prev, item) ? "take(re-entrant)" : "take(COLLISION)", item, prev);
+            if (prev is not null && !ReferenceEquals(prev, item))
+                _violation ??= $"'{prev.Name}' still the reader when '{item.Name}' was activated (two readers on one baton)";
+            Thread.SpinWait(64);
+        }
+
+        // Mirrors GetResult releasing _started when the read completes.
+        public void ReleaseBaton(TestPipelineItem item)
+        {
+            var released = Interlocked.CompareExchange(ref _currentReader, null, item);
+            Journal(ReferenceEquals(released, item) ? "release" : "release(MISS)", item, released);
+        }
+    }
+
+    struct SingleReaderGuardPolicy : IPipelinePolicy<TestPipelineItem>
+    {
+        readonly SingleReaderGuard _guard;
+        public SingleReaderGuardPolicy(SingleReaderGuard guard) => _guard = guard;
+
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        {
+            var task = item.GetExecuteTask();
+            item.SignalExecuted();
+            return task;
+        }
+
+        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true)
+        {
+            _guard.TakeBaton(item);
+            item.Activate();
+            // The read completes only AFTER activation (Slon's baton read). Async so it doesn't run
+            // under any advancer latch inline. No activation => this never fires => the item strands.
+            Task.Run(item.CompletePipelineTask);
+        }
+
+        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+        {
+            _guard.RecordCompletion(item.Name!);
+            _guard.ReleaseBaton(item);
+            item.Complete(exception);
+        }
+
+        public bool RunEnqueueAsynchronously => true;
     }
 
     /// Ordering regression guard: activations that do occur must be in pipeline-enqueue order.
@@ -483,10 +724,12 @@ public class PipelineConcurrencyTests
         {
             await items[i].WaitForCompleteAsync();
             Assert.IsNull(items[i].Exception);
-            items[i].WaitForActivation();
+            // No activation assert: an item whose completion beats the D-arm peek is drain-only
+            // (the completed-head guard skips it), so activation is legitimately absent here.
+            // Lost drains are what WaitForCompleteAsync above catches.
         }
 
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     /// Forces the executor through the deferred-activation branch (waiters present at dequeue
@@ -544,7 +787,7 @@ public class PipelineConcurrencyTests
             Assert.IsNull(item.Exception);
         }
 
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     /// Regression guard for the deferred-activation handoff. When the advancer claims the
@@ -730,7 +973,7 @@ public class PipelineConcurrencyTests
 
         Assert.IsNull(first.Exception);
         Assert.IsNull(second.Exception);
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     /// Three-way stress: producer enqueues, executor processes items with faulting pipeline
@@ -795,7 +1038,7 @@ public class PipelineConcurrencyTests
         }
 
         await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     sealed class ReentrantBox
@@ -1036,10 +1279,10 @@ public class PipelineConcurrencyTests
         Assert.IsTrue(idleTask.IsCompletedSuccessfully, "WaitForEmptyAsync caller must observe the drain.");
     }
 
-    /// In-proc stress runner for the scenario above (one observed field timeout, June 2026,
-    /// against the post-chain-activation tree; not yet reproduced in 40 contended suite runs).
-    /// Iterations via DRAGHI_STRESS_ITERATIONS (default 200, keeps suite cost ~sub-second);
-    /// on a hang it reports WHICH task was stuck - the localizing fact a WhenAll timeout hides.
+    /// In-proc stress runner for the scenario above (one observed field timeout, not yet
+    /// reproduced in 40 contended suite runs). Iterations via DRAGHI_STRESS_ITERATIONS (default
+    /// 200, keeps suite cost ~sub-second). On a hang it reports WHICH task was stuck, the
+    /// localizing fact a WhenAll timeout hides.
     [TestMethod, DoNotParallelize]
     public async Task WaitForEmptyAsync_RacingCompleteAsync_Stress()
     {
@@ -1137,8 +1380,8 @@ public class PipelineConcurrencyTests
     }
 
     /// In-proc stress runner for DeferredActivationUnderSustainedLoad (one observed field
-    /// timeout, June 2026: the tail item executed and its pipeline task was completed, but
-    /// item completion never fired; 25 isolated runs + 24 contended suite runs clean).
+    /// timeout: the tail item executed and its pipeline task was completed, but item
+    /// completion never fired. 25 isolated runs + 24 contended suite runs clean).
     /// Rolls the drain-vs-tail-enqueue race per iteration with a minimal pile so the tail's
     /// enqueue still sees waiters present (the deferred-activation branch). Iterations via
     /// DRAGHI_STRESS_ITERATIONS (default 200); on a hang it reports WHICH stage stuck plus
@@ -1227,6 +1470,7 @@ public class PipelineConcurrencyTests
     /// suspension. Test gates the executor inside OnExecutionIdleAsync so GC happens at the
     /// exact suspension point where pre-idle clears must have taken effect.
     [TestMethod]
+    [DoNotParallelize]
     public async Task ExecuteQueue_PreIdleClearsLocals_ItemNotRetainedAcrossIdle()
     {
         var idleEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1276,6 +1520,7 @@ public class PipelineConcurrencyTests
     /// the pipeline should pin the item. Without the line 508 `_tailWaiter = default!` clear, the
     /// completed item stays GC-rooted for the entire idle period.
     [TestMethod]
+    [DoNotParallelize]
     public async Task Idle_TailWaiterSlotDoesNotLeakCompletedItem()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1335,6 +1580,7 @@ public class PipelineConcurrencyTests
     /// must Exchange _executingItemActivationPending=false AND clear _executingItem when the executor wins the race.
     /// Without the clear, the completed item stays GC-rooted for the entire idle period.
     [TestMethod]
+    [DoNotParallelize]
     public async Task Idle_ExecutingItemSlotDoesNotLeakDeferredItem()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
@@ -1433,6 +1679,7 @@ public class PipelineConcurrencyTests
     /// `_waiterRecoveryItem` pointing at the now-completed item. For long-lived pipelines doing
     /// rare recoveries this is one stale strong reference, observable via WeakReference after GC.
     [TestMethod]
+    [DoNotParallelize]
     public async Task RecoverWaiter_ClearsWaiterRecoveryItemReferenceAfterSuccess()
     {
         WeakReference? recoveryRef = null;
@@ -1514,7 +1761,7 @@ public class PipelineConcurrencyTests
     }
 
     /// Stress test targeting the cancel-during-arm window in TestObservableQueueSource's
-    /// WaitForNextAsync (see verification/ObservableSourceWait.tla). The executor parks at
+    /// WaitForNextAsync. The executor parks at
     /// `await wakeSignal.Arm()` after _pending=TRUE has been set under the wake lock; if the
     /// source CancellationToken fires while the state machine is in the microsecond window
     /// between Arm() and the await machinery's OnCompleted call, the state machine can

@@ -157,14 +157,21 @@ public class ActivatedItemReductionTests
                 // would separate the two phases and never interleave them.) The assert site is the
                 // test's continuous framework-slot sampler.
                 _probe.Activate(item);
-                ThreadPool.UnsafeQueueUserWorkItem(static s =>
-                {
-                    var item = (SyntheticItem)s!;
-                    var spin = new SpinWait();
-                    for (var r = 0; r < 40; r++)
-                        spin.SpinOnce();
-                    item.PipelineTcs.TrySetResult();
-                }, item, preferLocal: false);
+                // Delay on the timer wheel, NOT by blocking a TP worker: the ms-scale hold is
+                // load-bearing (it keeps depth above 1 so completions interleave with later
+                // activations, and it dwarfs the retirement lag the sampler's tight re-confirm
+                // discriminates against - a us-scale hold lets depth touch 0 between items and
+                // false-positives the sampler). What was NOT load-bearing was occupying a
+                // thread for it: the old SpinWait's Sleep(1) escalation blocked dozens of TP
+                // workers at once (60 in-flight items), serializing the batch behind threadpool
+                // injection - ~11s for the 8x60 run. The timer keeps the hold and frees the pool.
+                // 1ms: activations are single-tenure serialized, so the hold multiplies DIRECTLY
+                // into wall time (items x batches x hold - 50ms made the test take ~24s). The
+                // sampler no longer discriminates by tight timing (see its comment), so the hold
+                // only needs to keep completions asynchronous and depth above 1.
+                _ = Task.Delay(1).ContinueWith(
+                    static (_, s) => ((SyntheticItem)s!).PipelineTcs.TrySetResult(), item,
+                    CancellationToken.None, TaskContinuationOptions.ExecuteSynchronously, TaskScheduler.Default);
                 return;
             }
             if (_activateOnTp && preferAsync)
@@ -408,19 +415,25 @@ public class ActivatedItemReductionTests
                     //   - HAZARD (stomp): a FOREIGN item's completion nulled the slot while this owner
                     //     is genuinely live; this owner stays mid-drain until its own (much later)
                     //     completion.
-                    // The owner's body delay (holdRelease) is far longer than the lag, so a TIGHT
-                    // re-confirm window separates them: the lag resolves within a few spins; a stomp
-                    // leaves the owner incomplete past the window. (A generous window would wait out the
-                    // owner's real completion and false-negative every stomp.)
+                    // TIME cannot robustly separate the safe lag from a transient stomp: the lag
+                    // (clear -> CompleteItem flag, a few instructions) stretches to preemption
+                    // scale (ms+) under parallel-suite load, and any window that exceeds preemption
+                    // forces a hold that makes the single-tenure-serialized test take tens of
+                    // seconds. The transient face is the model's job. The runtime sampler asserts
+                    // the crisp face only: after a suspect null the owner must COMPLETE within a
+                    // generous bound, since a stranded owner is the unfakeable production shape.
                     var tenure = owner.CurrentTenure;
+                    var deadline = System.Diagnostics.Stopwatch.StartNew();
                     var spin = new SpinWait();
                     var hazard = true;
-                    for (var r = 0; r < 8 && hazard; r++)
+                    while (deadline.ElapsedMilliseconds < 1000)
                     {
                         if (tenure.Completed)
+                        {
                             hazard = false;
-                        else
-                            spin.SpinOnce();
+                            break;
+                        }
+                        spin.SpinOnce();
                     }
                     if (hazard)
                         Interlocked.Increment(ref violations);

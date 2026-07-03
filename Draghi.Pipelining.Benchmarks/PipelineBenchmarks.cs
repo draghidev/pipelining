@@ -81,6 +81,46 @@ public class PipelineBenchmarks
         last.Wait();
     }
 
+    QueuedPipeline<BareWaiterItem, BareWaiterPolicy> _waiterPipeline = null!;
+    BareWaiterItem _waiterItem = null!;
+
+    [GlobalSetup(Target = nameof(EnqueueCompleteEscalated))]
+    public void SetupEscalated()
+    {
+        _waiterPipeline = Pipeline.Create<BareWaiterItem, BareWaiterPolicy>(new BareWaiterPolicy(), runContinuationsAsynchronously: RunAsync);
+        // Force escalation once (it is sticky): two overlapping waiter commits move the store to
+        // the queue tier and allocate the activation lock, the regime a long-lived pipeline runs
+        // in permanently.
+        var a = new BareWaiterItem();
+        var b = new BareWaiterItem();
+        _waiterPipeline.Enqueue(a).Execute();
+        _waiterPipeline.Enqueue(b).Execute();
+        a.CompletePipelineTask();
+        b.CompletePipelineTask();
+        a.Wait();
+        b.Wait();
+        _waiterItem = new BareWaiterItem();
+    }
+
+    [GlobalCleanup(Target = nameof(EnqueueCompleteEscalated))]
+    public void CleanupEscalated()
+        => _waiterPipeline.CompleteAsync().AsTask().GetAwaiter().GetResult();
+
+    /// Escalated sequential per-item cost: the item takes the waiter path (its pipeline task is
+    /// pending at commit, completing afterwards like a wire round-trip) on an escalated store.
+    /// This is the shape that pays the dispatch, commit, and drain coordination per item, which
+    /// EnqueueComplete's inline-completing items never reach.
+    [Benchmark]
+    public void EnqueueCompleteEscalated()
+    {
+        var item = _waiterItem;
+        item.Reset();
+        _waiterPipeline.Enqueue(item).Execute();
+        item.WaitExecuted();
+        item.CompletePipelineTask();
+        item.Wait();
+    }
+
     QueuedPipeline<BareItemHandle, BareHandlePolicy> _structPipeline = null!;
 
     [GlobalSetup(Target = nameof(EnqueueCompleteStructT))]
@@ -139,6 +179,70 @@ sealed class BareItem
     public void Wait() => _completed.Wait();
 
     public void Reset() => _completed.Reset();
+}
+
+/// Waiter-path item: its pipeline task is pending at commit and completes afterwards.
+/// Reusable through the versioned source, zero alloc per op.
+sealed class BareWaiterItem : System.Threading.Tasks.Sources.IValueTaskSource
+{
+    // RunContinuationsAsynchronously stays false (the default), and it is load-bearing: the
+    // pipeline's commit registers its completion callback on this task, so false runs the drain
+    // inline on the thread that calls CompletePipelineTask. True would dispatch the drain through
+    // the thread pool, poisoning any bench comparing dispatch backends.
+    System.Threading.Tasks.Sources.ManualResetValueTaskSourceCore<bool> _source;
+    ManualResetEventSlim _completed = new(false);
+    ManualResetEventSlim _executed = new(false);
+
+    public ValueTask PipelineTask => new(this, _source.Version);
+
+    public void SignalExecuted() => _executed.Set();
+
+    // The drain thread is part of what these benches measure. Waiting for dispatch before
+    // completing keeps the commit-vs-complete race from routing the drain onto the executor's
+    // thread on some iterations (the commit fires the callback inline when the task is already
+    // completed at commit time), so every iteration drains on this caller's thread.
+    public void WaitExecuted() => _executed.Wait();
+
+    public void CompletePipelineTask() => _source.SetResult(true);
+
+    public void SignalComplete() => _completed.Set();
+
+    public void Wait() => _completed.Wait();
+
+    public void Reset()
+    {
+        _completed.Reset();
+        _executed.Reset();
+        _source.Reset();
+    }
+
+    void System.Threading.Tasks.Sources.IValueTaskSource.GetResult(short token) => _source.GetResult(token);
+
+    System.Threading.Tasks.Sources.ValueTaskSourceStatus System.Threading.Tasks.Sources.IValueTaskSource.GetStatus(short token)
+        => _source.GetStatus(token);
+
+    void System.Threading.Tasks.Sources.IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token, System.Threading.Tasks.Sources.ValueTaskSourceOnCompletedFlags flags)
+        => _source.OnCompleted(continuation, state, token, flags);
+}
+
+struct BareWaiterPolicy : IPipelinePolicy<BareWaiterItem>
+{
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareWaiterItem item, bool waiterExecution, CancellationToken cancellationToken)
+    {
+        item.SignalExecuted();
+        return new(new PipelineItemResult(item.PipelineTask));
+    }
+
+    public void ActivateHeadItem(BareWaiterItem item, bool preferAsync = true) { }
+
+    public void CompleteItem(BareWaiterItem item, int remainingDepth, Exception? exception)
+        => item.SignalComplete();
+
+    public bool TryRecoverItemFailure(PipelineItemFailureContext context, BareWaiterItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareWaiterItem? recoveryItem)
+    {
+        recoveryItem = null;
+        return false;
+    }
 }
 
 /// <summary>

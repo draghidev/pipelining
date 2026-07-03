@@ -1,8 +1,6 @@
 using Draghi.Pipelining.Internal;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 
-#pragma warning disable DRAGHI001
-
 namespace Draghi.Pipelining.Tests;
 
 /// <summary>
@@ -16,8 +14,8 @@ public class WakeSignalConcurrencyTests
 {
     /// <summary>
     /// Races Complete() against an in-flight consumer that's mid-arm: AcquireLock, peek (empty),
-    /// Arm, await. The hypothesis under test is the TLA-modeled corruption shape
-    /// (verification/ObservableSourceWait.tla): cancellation lands while the consumer's state
+    /// Arm, await. The hypothesis under test is the corruption shape where
+    /// cancellation lands while the consumer's state
     /// machine is between Arm and OnCompleted, leaving _pending = TRUE with _waitContinuation
     /// null. A subsequent SignalCore claim dispatches a null continuation (NRE).
     ///

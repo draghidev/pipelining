@@ -2,10 +2,10 @@ using Draghi.Pipelining;
 
 namespace Draghi.Pipelining.Tests;
 
-/// Targeted regression guard for the slot field/flag tear (backlog #7). The tear was a claim
+/// Targeted regression guard for the slot field/flag tear. The tear was a claim
 /// winning between a commit's flag publish and its field writes, reading a stale/default or torn
-/// pair. The tri-state word fixed it (data-then-license commit, peek-gated claim); these races
-/// hammer exactly that window at the WaiterStore boundary - a far tighter loop than the full
+/// pair. The tri-state word fixed it (data-then-license commit, peek-gated claim). These races
+/// hammer exactly that window at the WaiterStore boundary, a far tighter loop than the full
 /// pipeline stress, so a reintroduced tear surfaces fast as a default(0) or a lost/duplicated
 /// marker. DRAGHI_STRESS_ITERATIONS overrides the iteration count.
 [TestClass, DoNotParallelize]
@@ -70,9 +70,9 @@ public class WaiterStoreConcurrencyTests
     /// release-store of Occupied, so any reader sees empty or a COMPLETE pair, never torn), the claim
     /// and escalation each pivot on one Interlocked CAS against Occupied. So EVERY observable outcome is
     /// reachable by ORDERING the calls; the spin only sampled these probabilistically. We drive each
-    /// interleaving explicitly and assert no torn/default/lost/duplicated marker. (Weak-memory ordering
-    /// - the actual concurrency hazard - is covered by WeakMemory.tla + the WaiterStore ordering units,
-    /// not by this brute-force sampler.)
+    /// interleaving explicitly and assert no torn/default/lost/duplicated marker. (Weak-memory
+    /// ordering, the actual concurrency hazard, is covered by the WaiterStore ordering units, not
+    /// by this brute-force sampler.)
     [TestMethod]
     public void SlotEscalation_AllInterleavings_NoLostOrTornMarkers()
     {
@@ -148,6 +148,64 @@ public class WaiterStoreConcurrencyTests
         Assert.IsFalse(drained[marker], $"Duplicate drain of marker {marker}.");
         drained[marker] = true;
     }
+
+    /// Segment-boundary soak for the queue consumer's hop guard: a slow-path segment hop must
+    /// never advance past resident entries. Fresh small queues keep every iteration inside the
+    /// initial segment's wrap and first growths, where the hop windows live, and the consumer
+    /// runs the drain loop's peek-then-dequeue shape with jittered pacing on both sides so the
+    /// catch-up points land at random offsets. Every marker must arrive exactly once, in order.
+    /// The escape timeout converts a marooning into a loud failure instead of a hang.
+    [TestMethod]
+    public void QueueSegmentBoundaryHop_ManyCrossings_NoMarooningNoReorder()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 400;
+        const int markers = 100;
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            var queue = new Internal.SingleProducerSingleConsumerQueue<int>();
+            var producerSeed = 12345 + iter;
+            var producer = new Thread(() =>
+            {
+                var rnd = new Random(producerSeed);
+                for (var m = 0; m < markers; m++)
+                {
+                    queue.Enqueue(m);
+                    if ((m & 7) == 7)
+                        Thread.SpinWait(rnd.Next(128));
+                }
+            })
+            { IsBackground = true };
+            producer.Start();
+
+            var consumerRnd = new Random(54321 + iter);
+            var expected = 0;
+            var escape = System.Diagnostics.Stopwatch.StartNew();
+            var spin = new SpinWait();
+            while (expected < markers)
+            {
+                if (queue.TryPeek(out var peeked))
+                {
+                    Assert.AreEqual(expected, peeked, $"iter {iter}: peek out of order, entries marooned or reordered");
+                    Assert.IsTrue(queue.TryDequeue(out var dequeued), $"iter {iter}: dequeue failed after a successful peek");
+                    Assert.AreEqual(expected, dequeued, $"iter {iter}: dequeue disagreed with peek");
+                    expected++;
+                    if ((expected & 15) == 0)
+                        Thread.SpinWait(consumerRnd.Next(64));
+                    spin = new SpinWait();
+                }
+                else
+                {
+                    if (escape.Elapsed > TimeSpan.FromSeconds(10))
+                        Assert.Fail($"iter {iter}: consumer starved at marker {expected}/{markers}, entries marooned behind a wrong segment hop");
+                    spin.SpinOnce();
+                }
+            }
+            Assert.IsFalse(queue.TryPeek(out _), $"iter {iter}: queue not empty after all markers consumed");
+            producer.Join();
+        }
+    }
 }
 
 /// Boxes the WaiterStore struct so racing threads share one instance (the producer commits, the
@@ -159,7 +217,7 @@ sealed class WaiterStoreBox<T>
     public int TryEscalateOrEnqueue(T item, ValueTask task, out bool isSlot, out bool slotWasMoved)
         => _store.TryEscalateOrEnqueue(item, task, out isSlot, out slotWasMoved);
     public bool TryClaimSlotForDrain(out T item, out ValueTask task) => _store.TryClaimSlotForDrain(out item, out task);
-    public void TakeMovedSlotPair(out T item, out ValueTask task) => _store.TakeMovedSlotPair(out item, out task);
+    public void TakeMovedSlotPair(out T item, out bool wasCompletedAtMove) => _store.TakeMovedSlotPair(out item, out wasCompletedAtMove);
     public bool TryDequeue(out (T Waiter, ValueTask WaiterTask) entry) => _store.TryDequeue(out entry);
-    public int DecrementCount() => _store.DecrementCount();
+    public bool DecrementCount() => _store.DecrementCount();
 }

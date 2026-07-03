@@ -2,11 +2,11 @@ using Draghi.Pipelining;
 
 namespace Draghi.Pipelining.Tests;
 
-/// Tri-state slot word contract (backlog #7 fix, verified Pipeline.tla TriStateSlotClaim). The
+/// Tri-state slot word contract. The
 /// fields and the occupancy flag tore under the old two-state word: a claim that won between a
 /// commit's flag publish and its field writes read a stale/default or torn pair. These tests pin
-/// the three behaviors the tri-state introduced - the data-then-license commit, the live-task
-/// peek bail, and the licensed (never-default) claim - plus the quiescent escalation handoff.
+/// the three behaviors the tri-state introduced (the data-then-license commit, the live-task
+/// peek bail, and the licensed never-default claim) plus the quiescent escalation handoff.
 [TestClass]
 public class WaiterStoreTests
 {

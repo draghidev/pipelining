@@ -279,7 +279,7 @@ public class PipelineBehavioralTests
 
         Assert.IsNull(first.Exception);
         Assert.IsNull(follower.Exception);
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
     /// Reentrant Enqueue from OnExecutionIdleAsync. The "refill a batch" pattern: idle hook
@@ -314,7 +314,7 @@ public class PipelineBehavioralTests
             await item.WaitForCompleteAsync();
 
         Assert.AreEqual(refills.Length, refillIdx);
-        Assert.AreEqual(0, pipeline.Depth);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
         foreach (var item in refills)
             Assert.IsNull(item.Exception);
     }

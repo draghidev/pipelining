@@ -123,7 +123,12 @@ public class PipelineTests
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
         item.WaitForComplete();
-        Assert.AreEqual(0, pipeline.Depth);
+        // Depth may transiently over-read by one while the executor is mid-pull (the speculative
+        // dispatch count, see the Depth doc); it never under-reads. Assert eventual-zero: the
+        // executor's post-completion loop-around (commit -> speculative increment -> miss ->
+        // rollback -> park) settles within its own straight-line code.
+        Assert.IsTrue(SpinWait.SpinUntil(() => pipeline.Depth == 0, TimeSpan.FromSeconds(10)),
+            $"Depth did not settle to 0 (read {pipeline.Depth}).");
     }
 
     [TestMethod]

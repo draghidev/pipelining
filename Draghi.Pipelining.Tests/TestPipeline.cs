@@ -1,5 +1,17 @@
 namespace Draghi.Pipelining.Tests;
 
+static class PipelineTestAsserts
+{
+    /// Depth may transiently over-read by one while the executor is mid-pull (the speculative
+    /// dispatch count taken before the source pull, rolled back on a miss - it never
+    /// under-reads; see Pipeline.Depth). Exact-equality checks taken after item-completion
+    /// waits race the executor's post-completion loop-around (commit -> speculative increment
+    /// -> miss -> rollback -> park), so depth assertions assert eventual-zero instead.
+    public static void AssertDepthSettlesToZero(Func<int> depth)
+        => Assert.IsTrue(SpinWait.SpinUntil(() => depth() == 0, TimeSpan.FromSeconds(10)),
+            $"Depth did not settle to 0 (read {depth()}).");
+}
+
 sealed class TestPipelineItem
 {
     // Bumped from 2s to 10s for parallel-test resilience: under method-level parallelism a busy
@@ -21,6 +33,8 @@ sealed class TestPipelineItem
     }
 
     public string? Name { get; init; }
+    // DrainTrace dumps print items via ToString.
+    public override string ToString() => Name ?? base.ToString()!;
     // TCS-backed signals (was ManualResetEventSlim). Async waits now await the Task with timeout
     // - no Task.Run + MRES.Wait + TP-blocked-worker hop. The sync waits use Task.Wait(timeout)
     // on the caller's thread; the stress runners' TryWait* return bool the same way MRES did.
@@ -34,6 +48,10 @@ sealed class TestPipelineItem
     public Exception? Exception { get; private set; }
     public bool IsCompleted { get; private set; }
     public bool IsExecuted => _executedTcs.Task.IsCompletedSuccessfully;
+    // Strand-diagnosis probe: whether the pipeline task (the store's waiter task) ever settled.
+    // Discriminates a lost DRAIN (task settled, CompleteItem never ran - advancer/deposit side)
+    // from a lost COMPLETION (task never settled - policy/TP side).
+    public bool PipelineTaskCompleted => _pipelineTaskTcs.Task.IsCompleted;
 
     // Non-asserting waits for stress runners that own their timeout/diagnosis/suspend handling.
     public bool TryWaitForExecuted(TimeSpan timeout) => _executedTcs.Task.Wait(timeout);

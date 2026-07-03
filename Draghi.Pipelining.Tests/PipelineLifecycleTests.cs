@@ -388,22 +388,55 @@ public class PipelineLifecycleTests
         Assert.AreSame(idleEx, ex);
     }
 
-    /// A source pull surfacing OCE that carries the enumerator's own CompletionToken is the idiomatic
-    /// IAsyncEnumerator shutdown signal: identity-matched and swallowed, so the run completes cleanly
-    /// rather than faulting. Pins the narrowed catch (identity, not just IsCancellationRequested).
+    /// A source pull surfacing OCE that carries the enumerator's own CompletionToken AND observed it
+    /// fired is the idiomatic IAsyncEnumerator shutdown signal: swallowed, so the run completes cleanly
+    /// rather than faulting. Pins both halves of the catch filter (token identity + actually fired).
     [TestMethod]
-    public async Task SourcePull_OceWithCompletionToken_TreatedAsCleanShutdown()
+    public async Task SourcePull_OceWithFiredCompletionToken_TreatedAsCleanShutdown()
     {
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(), onIdle: token => throw new OperationCanceledException(token));
+            new(), onIdle: token => { token.ThrowIfCancellationRequested(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Execute();
         await item.WaitForCompleteAsync();
-        // onIdle fires on the next wait and throws OCE carrying CompletionToken; the executor swallows
-        // it as sanctioned shutdown, so CompleteAsync must complete rather than fault.
+        // CompleteAsync fires the token; the next wait's onIdle observes it and throws the properly
+        // tokened OCE, which the executor swallows as sanctioned shutdown - clean completion.
         await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5));
+    }
+
+    /// An OCE carrying the CompletionToken while it has NOT fired is a mistranslated cancellation, not
+    /// the shutdown idiom (the legitimate signal only ever throws after observing cancellation).
+    /// Swallowing it walks the executor out of a live loop: the teardown then faults on the mid-flight
+    /// state before the enumerator dispose, and the source wedges open, silently accepting enqueues
+    /// nothing will ever pull. It must fault loudly with the origin exception instead.
+    [TestMethod]
+    public async Task SourcePull_OceWithUnfiredCompletionToken_Faults()
+    {
+        // The catch filter reads the token at CATCH time, so the test must not fire the token
+        // (CompleteAsync does) while the throw is mid-unwind - that would legitimize the OCE and
+        // it gets swallowed as clean shutdown. Sequencing without a race: the fault teardown
+        // disposes the enumerator, which cancels the completion token, and teardown runs strictly
+        // after the filter evaluated. Registering on the token before throwing therefore yields a
+        // signal that fires only once the fault is fully latched; CompleteAsync afterward must
+        // surface it.
+        var settled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(), onIdle: token =>
+            {
+                token.Register(() => settled.TrySetResult());
+                throw new OperationCanceledException(token);
+            });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var item = new TestPipelineItem();
+        pipeline.Enqueue(item).Execute();
+        await item.WaitForCompleteAsync();
+        await settled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        await Assert.ThrowsExactlyAsync<OperationCanceledException>(
+            async () => await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
     }
 
     /// A source pull surfacing OCE carrying a FOREIGN token is not the sanctioned signal - it must
@@ -433,10 +466,8 @@ public class PipelineLifecycleTests
     {
         var rootEx = new InvalidOperationException("root: source WaitForNextAsync");
         var teardownEx = new InvalidOperationException("teardown: DisposeAsync");
-#pragma warning disable DRAGHI001
         var source = ThrowingSource<TestPipelineItem>.Create(waitThrow: rootEx, disposeThrow: teardownEx);
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy, ThrowingSource<TestPipelineItem>, ThrowingSource<TestPipelineItem>.Enumerator>(new(), source);
-#pragma warning restore DRAGHI001
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var ex = await Assert.ThrowsExactlyAsync<AggregateException>(
@@ -453,10 +484,8 @@ public class PipelineLifecycleTests
     {
         var rootEx = new InvalidOperationException("root: source fault while item in flight");
         var item = new TestPipelineItem { CompleteAsync = true }; // pending pipeline task => in flight
-#pragma warning disable DRAGHI001
         var source = ThrowingSource<TestPipelineItem>.Create(items: new[] { item }, gateWait: true);
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy, ThrowingSource<TestPipelineItem>, ThrowingSource<TestPipelineItem>.Enumerator>(new(), source);
-#pragma warning restore DRAGHI001
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         await item.WaitForExecutedAsync();   // dispatched, pipeline task pending, executor parked on the gated wait

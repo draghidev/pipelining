@@ -61,13 +61,24 @@ public class ValueTPipelineTests
             pipeline.Enqueue(new ValueItem(ids[i])).Execute();
         }
 
-        // Wait for executor to settle so the tail is committed to _waiters with the Volatile.Write
-        // publish fence observed. Enumerator gets a consistent view.
+        // The first idle can fire between enqueues (the executor's wake races the enqueue loop
+        // when this thread is preempted mid-loop), so idle alone does not mean settled. Await it
+        // as the earliest settle point, then poll the enumerator until every item is observable:
+        // the executor is quiescing toward exactly that state, so this converges, and the
+        // count/order asserts below keep their full strength.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var observed = new List<int>();
-        foreach (var item in pipeline)
-            observed.Add(item.Id);
+        var escape = System.Diagnostics.Stopwatch.StartNew();
+        while (true)
+        {
+            observed.Clear();
+            foreach (var item in pipeline)
+                observed.Add(item.Id);
+            if (observed.Count >= count || escape.Elapsed > TimeSpan.FromSeconds(5))
+                break;
+            await Task.Delay(5);
+        }
 
         Assert.AreEqual(count, observed.Count, "Enumerator should yield every in-flight item.");
         for (var i = 0; i < count; i++)
