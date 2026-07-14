@@ -86,7 +86,8 @@ public class PipelineLifecycleTests
         for (var i = 0; i < items.Length; i++)
         {
             Assert.IsTrue(items[i].IsCompleted, $"Item {i} should be completed.");
-            Assert.AreSame(ex, items[i].Exception, $"Item {i} should carry the drain exception.");
+            Assert.IsInstanceOfType<OperationCanceledException>(items[i].Exception,
+                $"Item {i} settles via the shutdown token (flow-side escalation), not the drain exception.");
         }
     }
 
@@ -124,12 +125,14 @@ public class PipelineLifecycleTests
         foreach (var item in waitersItems)
         {
             Assert.IsTrue(item.IsCompleted, "Waiter-bucket item should be completed.");
-            Assert.AreSame(ex, item.Exception, "Waiter-bucket item should carry the drain exception.");
+            Assert.IsInstanceOfType<OperationCanceledException>(item.Exception,
+                "Waiter-bucket item settles via the shutdown token (flow-side escalation).");
         }
         foreach (var item in queueItems)
         {
             Assert.IsTrue(item.IsCompleted, "Queue-bucket item should be completed.");
-            Assert.AreSame(ex, item.Exception, "Queue-bucket item should carry the drain exception.");
+            Assert.IsInstanceOfType<OperationCanceledException>(item.Exception,
+                "Queue-bucket item settles via the shutdown token (flow-side escalation).");
         }
     }
 
@@ -273,7 +276,10 @@ public class PipelineLifecycleTests
         await secondTask.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.IsTrue(item.IsCompleted);
-        Assert.AreSame(first, item.Exception, "First caller's exception should propagate to drained items.");
+        // First-writer-wins is about the completion latch, not exception propagation: the
+        // pipeline drains gracefully only, and the item settles via the shutdown token
+        // (flow-side escalation). The retired forceful sweep propagated _completionException.
+        Assert.IsInstanceOfType<OperationCanceledException>(item.Exception);
     }
 
     /// CompleteAsync fires while the executor is awaiting an item's trailing execution task.
@@ -315,7 +321,9 @@ public class PipelineLifecycleTests
         await pipeline.CompleteAsync(ex).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.IsTrue(item.IsCompleted, "Pending tail waiter should be completed by drain.");
-        Assert.AreSame(ex, item.Exception);
+        // Graceful-only drain: the committed tail settles via the shutdown token (flow-side
+        // escalation), not via _completionException (retired forceful-sweep contract).
+        Assert.IsInstanceOfType<OperationCanceledException>(item.Exception);
     }
 
     /// OnExecutionIdleAsync throwing must propagate: executor catches, calls CompleteAsync(ex),

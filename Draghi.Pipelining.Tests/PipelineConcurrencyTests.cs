@@ -868,8 +868,11 @@ public class PipelineConcurrencyTests
     }
 
     /// Concurrent CompleteAsync calls from multiple threads: Interlocked.Exchange on _completing
-    /// ensures exactly one wins and sets _completionException, others observe the same execution task.
-    /// Drained item sees the winning exception (any one of them under race).
+    /// ensures exactly one wins, others observe the same execution task, and all callers'
+    /// tasks complete. The pipeline drains gracefully only - the pending item settles itself
+    /// via the shutdown token (the flow-side escalation contract), so the drained item sees
+    /// the cancellation, not a CompleteAsync-supplied exception (that propagation was the
+    /// retired forceful-sweep contract).
     [TestMethod]
     public async Task CompleteAsync_ConcurrentFromMultipleThreads_FirstWriterWins()
     {
@@ -895,7 +898,8 @@ public class PipelineConcurrencyTests
 
         Assert.IsTrue(item.IsCompleted);
         Assert.IsNotNull(item.Exception);
-        CollectionAssert.Contains(exceptions, item.Exception, "Drained item should see one of the supplied exceptions.");
+        Assert.IsInstanceOfType<OperationCanceledException>(item.Exception,
+            "Drained item settles via the shutdown token (flow-side escalation), not a CompleteAsync-supplied exception.");
     }
 
     /// WaitForEmptyAsync caller is suspended when CompleteAsync fires concurrently. The drain must
@@ -918,6 +922,55 @@ public class PipelineConcurrencyTests
 
         await Task.WhenAll(idleTask, completeTask).WaitAsync(TimeSpan.FromSeconds(5));
         Assert.IsTrue(idleTask.IsCompletedSuccessfully, "WaitForEmptyAsync caller must observe the drain.");
+    }
+
+    /// In-proc stress runner for the scenario above (one observed field timeout, June 2026,
+    /// against the post-chain-activation tree; not yet reproduced in 40 contended suite runs).
+    /// Iterations via DRAGHI_STRESS_ITERATIONS (default 200, keeps suite cost ~sub-second);
+    /// on a hang it reports WHICH task was stuck - the localizing fact a WhenAll timeout hides.
+    [TestMethod]
+    public async Task WaitForEmptyAsync_RacingCompleteAsync_Stress()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 200;
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+            var item = new TestPipelineItem { CompleteAsync = true };
+            pipeline.Enqueue(item).Execute();
+            await item.WaitForExecutedAsync();
+
+            var idleTask = pipeline.WaitForEmptyAsync().AsTask();
+            var completeTask = pipeline.CompleteAsync().AsTask();
+
+            try
+            {
+                await Task.WhenAll(idleTask, completeTask).WaitAsync(TimeSpan.FromSeconds(10));
+            }
+            catch (TimeoutException)
+            {
+                var diagnosis = $"iter {iter}: hang - idleTask={idleTask.Status}, completeTask={completeTask.Status}, " +
+                    $"item completed={item.IsCompleted}, depth={pipeline.Depth}";
+                // Park instead of failing when a debugger/dump harness wants the live state
+                // (DRAGHI_STRESS_PARK_ON_HANG=1): the hang's async graph is the evidence and
+                // Assert.Fail would tear it down.
+                if (Environment.GetEnvironmentVariable("DRAGHI_STRESS_PARK_ON_HANG") == "1")
+                {
+                    // Shed the accumulated per-iteration garbage so a dump of the parked
+                    // process contains only the hang's live object graph (a full heap of
+                    // dead pipelines makes dumpasync's walk take tens of minutes).
+                    GC.Collect(2, GCCollectionMode.Forced);
+                    GC.WaitForPendingFinalizers();
+                    GC.Collect(2, GCCollectionMode.Forced);
+                    Console.WriteLine($"PARKED: {diagnosis}");
+                    await Task.Delay(Timeout.Infinite);
+                }
+                Assert.Fail(diagnosis);
+            }
+
+            Assert.IsTrue(idleTask.IsCompletedSuccessfully, $"iter {iter}: idleTask={idleTask.Status}");
+        }
     }
 
     /// Regression guard for the executor's pre-idle local clears. ExecuteQueue promotes

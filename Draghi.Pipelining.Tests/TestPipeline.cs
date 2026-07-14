@@ -116,13 +116,21 @@ sealed class TestPipelineItem
         });
     }
 
+    // TrySet: an explicit completion can race the shutdown-token settlement (see
+    // TryCancelPipelineTask) - first writer wins, matching the escalation design where a
+    // flow's natural completion and its abort escalation are inherently racing settlers.
     public void CompletePipelineTask()
     {
         if (PipelineTaskException is not null)
-            _pipelineTaskTcs.SetException(PipelineTaskException);
+            _pipelineTaskTcs.TrySetException(PipelineTaskException);
         else
-            _pipelineTaskTcs.SetResult();
+            _pipelineTaskTcs.TrySetResult();
     }
+
+    /// Shutdown-escalation settle (see TestPipelinePolicy.ExecuteItemAsync). Races benignly
+    /// with an explicit CompletePipelineTask; TrySet semantics, first writer wins.
+    public void TryCancelPipelineTask(CancellationToken token)
+        => _pipelineTaskTcs.TrySetException(new OperationCanceledException(token));
 
     public void CompleteExecuteTask()
     {
@@ -181,6 +189,15 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
     {
         if (item.ThrowOnExecute is { } ex)
             throw ex;
+
+        // The flow-side escalation half of the shutdown design: the pipeline only drains
+        // gracefully, and items are responsible for settling their own parked sources when
+        // the shutdown signal fires (the real protocol does this via the heartbeat abort
+        // walk; the pipeline's signal to items is this token). Without it a pending item
+        // legitimately blocks CompleteAsync forever.
+        if (item.CompleteAsync && cancellationToken.CanBeCanceled)
+            cancellationToken.UnsafeRegister(
+                static (state, token) => ((TestPipelineItem)state!).TryCancelPipelineTask(token), item);
 
         var task = item.GetExecuteTask();
         item.SignalExecuted();

@@ -72,15 +72,30 @@ struct WaiterStore<T>
             if (slotWasMoved)
             {
                 queue.Enqueue((_slotItem, _slotTask));
-                if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                    _slotItem = default!;
-                _slotTask = default;
+                // Fields deliberately NOT cleared here: the caller pulls its copy of the moved
+                // pair via TakeMovedSlotPair (compensation check needs the identity, and the
+                // executor may not TryPeek - it is the SPSC producer). Safe to linger: every
+                // other reader is gated on _hasSlot == 1 (now 0) or discards on IsEscalated
+                // (now true), and post-escalation nothing writes the slot fields again.
                 // Count carries through: slot's 1 → queue's 1.
             }
         }
         queue.Enqueue((item, task));
         isSlot = false;
         return Interlocked.Increment(ref _count);
+    }
+
+    /// Executor-only, immediately after a slotWasMoved = true return from
+    /// <see cref="TryEscalateOrEnqueue"/>: hands over the moved pair (for the chain-arm
+    /// compensation check) and clears the slot fields. Must be called exactly once per
+    /// slotWasMoved so a cached-but-idle shell doesn't pin the moved references.
+    public void TakeMovedSlotPair(out T item, out ValueTask task)
+    {
+        item = _slotItem;
+        task = _slotTask;
+        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            _slotItem = default!;
+        _slotTask = default;
     }
 
     /// Try to take ownership of the slot for draining. Returns true if the caller now owns the
@@ -106,6 +121,29 @@ struct WaiterStore<T>
     /// Decrement the combined count. Returns the new value.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public int DecrementCount() => Interlocked.Decrement(ref _count);
+
+    /// Advancer-latch-holder-only peek of the slot occupant for chain activation
+    /// (DrainSlotInline's count > 0 arm). Only valid after the caller's DecrementCount
+    /// returned > 0: the occupant's commit wrote the slot fields before its count increment,
+    /// and the caller's atomic decrement observed that increment, so the fields are fully
+    /// published to the caller. Returns false when a first escalation raced in and owns (or
+    /// owned) the contents - the occupant is, or is about to be, the queue head. The queue
+    /// is published before the escalation's slot claim, so an escalation clear that raced
+    /// the field reads here is always caught by the post-barrier queue check.
+    public bool TryPeekSlotForActivation(out T item, out ValueTask task)
+    {
+        item = _slotItem;
+        task = _slotTask;
+        Interlocked.MemoryBarrier();
+        if (Volatile.Read(ref _queue) is not null)
+        {
+            if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+                item = default!;
+            task = default;
+            return false;
+        }
+        return true;
+    }
 
     /// Peek the queue head. Returns false (and default entry) when the store has not escalated.
     public bool TryPeek(out (T Waiter, ValueTask WaiterTask) entry)

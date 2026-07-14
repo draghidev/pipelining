@@ -733,4 +733,71 @@ public class PipelineRecoveryTests
         Assert.IsFalse(item.IsCompleted, "Original was substituted, not independently completed.");
     }
 
+    /// Recovery-of-recovery does not exist: a committed recovery's own late fault completes the
+    /// recovery directly with the REAL exception (the framework's marker is unwrapped, never
+    /// observable), and the policy is NOT consulted a second time. This variant pins the
+    /// committed-tail recovery path (RecoverCommittedTailWaiterAsync): the original item's
+    /// pipeline task is already faulted at commit time, which routes the recovery through the
+    /// guarded commit deterministically.
+    [TestMethod]
+    public async Task CommittedTailRecovery_PipelineTaskFaultsLate_CompletedDirectly_PolicyNotConsulted()
+    {
+        var recoveryFault = new ApplicationException("recovery drain died");
+        var recovery = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = recoveryFault };
+        var factoryCalls = 0;
+        var consults = new System.Collections.Concurrent.ConcurrentQueue<string>();
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, ctx =>
+        {
+            Interlocked.Increment(ref factoryCalls);
+            consults.Enqueue($"{ctx.Kind}:{ctx.Exception.GetType().Name}:{ctx.Exception.Message}");
+            return recovery;
+        }));
+
+        // Fault the original's pipeline task BEFORE enqueue: CommitTailWaiter observes a
+        // completed+faulted task and takes the committed-tail recovery path.
+        var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("original") };
+        item.CompletePipelineTask();
+        pipeline.Enqueue(item).Execute();
+
+        // The recovery is committed with a pending pipeline task; fault it late.
+        await recovery.WaitForExecutedAsync();
+        recovery.CompletePipelineTask();
+
+        await recovery.WaitForCompleteAsync();
+        Assert.AreSame(recoveryFault, recovery.Exception,
+            "The recovery's real fault must surface unwrapped (no framework marker visible).");
+        Assert.AreEqual(1, Volatile.Read(ref factoryCalls),
+            $"The policy must never be consulted about an item it returned as a recovery. Consults: {string.Join(" | ", consults)}");
+        Assert.IsFalse(item.IsCompleted, "Original was substituted, not independently completed.");
+    }
+
+    /// Same contract for the executor-substitute recovery path (RecoverItem after an
+    /// ExecuteItemAsync throw): the substitute re-enters the normal lifecycle and commits as an
+    /// ordinary tail waiter, and its late fault must still complete directly without a second
+    /// policy consult.
+    [TestMethod]
+    public async Task ExecutorSubstituteRecovery_PipelineTaskFaultsLate_CompletedDirectly_PolicyNotConsulted()
+    {
+        var recoveryFault = new ApplicationException("recovery drain died");
+        var recovery = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = recoveryFault };
+        var factoryCalls = 0;
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, ctx =>
+        {
+            Interlocked.Increment(ref factoryCalls);
+            return recovery;
+        }));
+
+        var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
+        pipeline.Enqueue(item).Execute();
+
+        await recovery.WaitForExecutedAsync();
+        recovery.CompletePipelineTask();
+
+        await recovery.WaitForCompleteAsync();
+        Assert.AreSame(recoveryFault, recovery.Exception,
+            "The recovery's real fault must surface unwrapped (no framework marker visible).");
+        Assert.AreEqual(1, Volatile.Read(ref factoryCalls),
+            "The policy must never be consulted about an item it returned as a recovery.");
+        Assert.IsFalse(item.IsCompleted, "Original was substituted, not independently completed.");
+    }
 }
