@@ -1,0 +1,10 @@
+# id	module	model	root	impact
+pipeline	Pipeline	pipeline/Pipeline.tla	pipeline	pipeline,pipeline-source,activation-gate,in-flight-store,item-tenure,recovery,weak-memory
+activation-gate	ActivationGate	components/activation-gate/ActivationGate.tla	components/activation-gate	activation-gate,weak-memory
+in-flight-store	InFlightStore	components/in-flight-store/InFlightStore.tla	components/in-flight-store	in-flight-store
+item-tenure	ItemTenure	components/item-tenure/ItemTenure.tla	components/item-tenure	item-tenure,weak-memory
+item-task-gates	ItemTaskGates	components/item-task-gates/ItemTaskGates.tla	components/item-task-gates	item-task-gates,recovery
+depth-drain	DepthDrain	mechanisms/depth-drain/DepthDrain.tla	mechanisms/depth-drain	depth,shutdown,wake
+queue-drain-obligation	QueueDrainObligation	mechanisms/queue-drain-obligation/QueueDrainObligation.tla	mechanisms/queue-drain-obligation	in-flight-store,queue,retirement
+store-escalation	StoreEscalation	mechanisms/store-escalation/StoreEscalation.tla	mechanisms/store-escalation	in-flight-store,queue
+wake-handshake	WakeHandshake	mechanisms/wake-handshake/WakeHandshake.tla	mechanisms/wake-handshake	wake,shutdown,weak-memory

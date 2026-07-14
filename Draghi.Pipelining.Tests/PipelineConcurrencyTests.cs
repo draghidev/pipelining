@@ -47,6 +47,86 @@ public class PipelineConcurrencyTests
             Assert.IsNull(item.Exception);
     }
 
+    // ROOT-CAUSE REPRO (2026-07-11, EXPECTED RED until the fix - see the
+    // draghi_advance_retire_dispatch_race memory): retirement-before-activation violated at its
+    // premise. Waiter-task completion is TWO-PHASE - (1) publish completed, (2) read the
+    // (continuation, state) pair and dispatch - and phase 2 runs unlicensed on the completer's
+    // thread. The done-arm judges retire-eligibility from phase 1 alone (TryClaimCompletedHead ->
+    // IsCompleted), so a committer arm claims the head, GetResult-consumes it (resetting the
+    // tenure, nulling the pair), and activates the successor while the predecessor's completion
+    // dispatch is still in flight. The completer's phase-2 state read then yields null, and the
+    // BCL ValueTaskAwaiter known callback throws the production "unexpected state object"
+    // ArgumentOutOfRangeException.
+    //
+    // The two-phase window is owned entirely by the TEST source (TwoPhaseValueTaskSource) - no
+    // pipeline hooks: the pipeline's own RegisterAdvanceFire performs the real BCL registration
+    // and the real Advance performs the racing GetResult. Deterministic, no stress.
+    //
+    // ASSERTS THE INVARIANT (the fix's acceptance): while a claimed-completed head's dispatch is
+    // in flight, the done-arm must not retire it nor activate the successor (deposit instead -
+    // the fire is guaranteed to arrive and serve it); the released completer must dispatch
+    // cleanly, and only then does the walk retire A and activate B.
+    [TestMethod]
+    public async Task Advance_SuccessorActivationWaitsForPredecessorCompletionDispatch()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var sourceA = new TwoPhaseValueTaskSource();
+        var itemA = new TestPipelineItem { Name = "A", PipelineTaskSource = sourceA };
+        var itemB = new TestPipelineItem { Name = "B", CompleteAsync = true };
+        var completer = Task.FromResult((Exception?)null);
+        try
+        {
+            // A commits edge-owned at the empty edge; RegisterAdvanceFire lands the BCL pairing
+            // (s_invokeActionDelegate, _onAdvanceFire) on sourceA - the registration under threat.
+            pipeline.Enqueue(itemA).Execute();
+            await itemA.WaitForExecutedAsync();
+            Assert.IsTrue(sourceA.WaitForRegistration(TimeSpan.FromSeconds(10)), "advance-fire registration on A's task");
+
+            // The completer publishes phase 1 and parks mid-dispatch, between its continuation-read
+            // and its state-read - the live capture's thread-106 position.
+            completer = Task.Run(() =>
+            {
+                try { sourceA.SetResult(); return (Exception?)null; }
+                catch (Exception ex) { return ex; }
+            });
+            Assert.IsTrue(sourceA.WindowReached.Wait(TimeSpan.FromSeconds(10)), "completer parked in the dispatch window");
+
+            // B's mid-chain commit arm wins the free license and advances. On the broken build it
+            // claims A (phase 1 is out), GetResult-consumes it (the tear), retires it, and
+            // activates B - synchronously on the executor strand, microseconds after B executes -
+            // all while A's completion dispatch is provably parked. The invariant forbids all of it.
+            pipeline.Enqueue(itemB).Execute();
+            await itemB.WaitForExecutedAsync();
+            var bActivatedDuringDispatch = SpinWait.SpinUntil(() => itemB.ActivationCount > 0, TimeSpan.FromSeconds(1));
+            Assert.IsFalse(bActivatedDuringDispatch,
+                "B activated while A's completion dispatch was in flight - the successor activated INSIDE the predecessor's completion (retire-before-activate broken at its premise).");
+            Assert.IsFalse(itemA.IsCompleted,
+                "A retired while its completion dispatch was in flight - its waiter tenure was consumed under the dispatcher.");
+
+            // Release the completer: phase 2 dispatches the advance-fire cleanly, and only then
+            // does the walk retire A and activate B, in order.
+            sourceA.WindowRelease.Set();
+            var completerException = await completer;
+            Assert.IsNull(completerException, $"the completer's dispatch tore: {completerException}");
+            await itemA.WaitForCompleteAsync();
+            await itemB.WaitForActivationAsync();
+
+            itemB.CompletePipelineTask();
+            await itemB.WaitForCompleteAsync();
+            PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+        }
+        finally
+        {
+            // On a red run the window is still held and B is still pending: release the parked
+            // completer (its AOORE lands in the captured task, observed or not) and settle B so
+            // the pipeline can drain instead of wedging suite teardown.
+            sourceA.WindowRelease.Set();
+            itemB.CompletePipelineTask();
+        }
+    }
+
     [TestMethod]
     public async Task EnqueueDuringExecution()
     {
@@ -107,12 +187,13 @@ public class PipelineConcurrencyTests
             Assert.IsTrue(items[i].IsCompleted);
     }
 
-    /// Mixed sync/async stream. Sync items (CompleteAsync=false) are driven to completion inline in
-    /// the executor's main-loop sync shortcut (both pipeline and trailing tasks already successful at
-    /// dispatch) before the executor advances to the next item. Async items (CompleteAsync=true) fall
-    /// through to the tail-waiter path, get committed to the waiter store by CommitTailWaiter with a
-    /// completion callback registered, and are drained by the advancer in FIFO. Verifies every item
-    /// completes regardless of which path it took, and that the sync item completes inline at head.
+    /// Mixed sync/async stream. A sync item (CompleteAsync=false) at the TRUE head (empty ROB) is
+    /// driven to completion inline before the executor advances. A sync item with a pending async
+    /// predecessor buffered in the store is head-gated through the ROB instead: its retirement
+    /// defers until the predecessor completes, keeping retirement strictly FIFO (an inline complete
+    /// there would jump the ROB and clear the head word out from under the live reader - the baton
+    /// wedge). Async items (CompleteAsync=true) commit via CommitTailWaiter and drain in FIFO.
+    /// Verifies both behaviors and that every item completes.
     [TestMethod]
     public async Task MixedSyncAsyncPipelineTasks_AllItemsComplete()
     {
@@ -131,20 +212,24 @@ public class PipelineConcurrencyTests
             pipeline.Enqueue(items[i]).Execute();
         }
 
-        // Per-boundary synchrony check: a sync item at head must complete inline BEFORE the executor
-        // advances to the next item. The barrier keys off the NEXT item's SignalExecuted (the
-        // executor dispatching item i+1), NOT completion - the executor loop is sequential, so it
-        // cannot have executed item i+1 until item i's inline CompleteWaiter has already run. The bare
-        // IsCompleted read below therefore still distinguishes inline completion from a deferred async
-        // drain: had the sync item been parked instead of completed inline, its completion would not
-        // yet be visible at this point and the assert would fail.
+        // Per-boundary check, keyed off the NEXT item's SignalExecuted (the executor dispatching
+        // item i+1; the executor loop is sequential). Item 0 is at the true head with an empty ROB:
+        // it must complete inline before the executor advances. Every later sync item has a pending
+        // async predecessor buffered in the store, so the head gate must DEFER its retirement (the
+        // IsFalse is deterministic: the predecessor's pipeline task is only completed in the release
+        // phase below, so nothing can have retired the sync item yet - observing it completed here
+        // would be an out-of-FIFO inline retire, the baton-wedge defect).
         for (var i = 0; i < count; i++)
         {
             if (i % 2 == 0)
             {
                 await items[i + 1].WaitForExecutedAsync();
-                Assert.IsTrue(items[i].IsCompleted,
-                    $"Sync item {i} should have been driven to idle inline before the executor advanced to item {i + 1}.");
+                if (i == 0)
+                    Assert.IsTrue(items[i].IsCompleted,
+                        $"Sync item {i} at the empty-ROB head should have been driven to idle inline before the executor advanced to item {i + 1}.");
+                else
+                    Assert.IsFalse(items[i].IsCompleted,
+                        $"Sync item {i} has a pending async predecessor; the head gate must defer its retirement through the ROB, not complete it inline out of FIFO order.");
             }
         }
 
@@ -431,8 +516,6 @@ public class PipelineConcurrencyTests
         {
         for (var iter = 0; iter < iterations; iter++)
         {
-            // Per-iteration tape: a strand dump then holds only this iteration's events.
-            DrainTrace.Reset();
             var guard = new SingleReaderGuard();
             var pipeline = Pipeline.Create<TestPipelineItem, SingleReaderGuardPolicy>(new(guard));
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
@@ -467,15 +550,19 @@ public class PipelineConcurrencyTests
             var inflightAtFire = items.Count(it => it.IsExecuted && !it.IsCompleted);
             var backlogAtFire = items.Count(it => !it.IsExecuted);
 
-            if (guard.Violation is { } v)
-                Assert.Fail($"iter {iter}: single-reader invariant violated - {v}\nBATON JOURNAL:\n{guard.DumpJournal()}\nTRACE:\n{DrainTrace.Dump()}");
-
             // WaitForEmptyAsync can return while the advancer is still draining (depth reaches 0 before
             // every CompleteItem runs). Poll for all items to complete to tell a PERMANENT strand
             // (some item never completes) from a PREMATURE-EMPTY (all complete, just after the signal).
             var settleSw = System.Diagnostics.Stopwatch.StartNew();
             while (items.Any(it => !it.IsCompleted) && settleSw.Elapsed < TimeSpan.FromSeconds(15))
                 await Task.Delay(5);
+
+            // Checked after the settle poll so the forensics read final counts: a completion that was
+            // merely late must not classify as lost. DescribeViolation's completion/activation counts
+            // for the stuck holder discriminate complete-then-activate / double-activation (the take
+            // that never releases) from activation-without-drain (the strand family).
+            if (guard.Violation is { } v)
+                Assert.Fail($"iter {iter}: single-reader invariant violated - {v}\nFORENSICS:\n{guard.DescribeViolation()}\nBATON JOURNAL:\n{guard.DumpJournal()}");
 
             var incomplete = items.Where(it => !it.IsCompleted).ToList();
             if (incomplete.Count > 0)
@@ -507,9 +594,10 @@ public class PipelineConcurrencyTests
                 // bookkeeping lost (test-side flags never set despite the pipeline draining).
                 Assert.Fail($"iter {iter}: PERMANENT STRAND - {stuck.Count} never completed after 15s " +
                     $"(Depth={pipeline.Depth}, Backlog={pipeline.Backlog}, emptyReturned={emptyReturned}, " +
+                    $"words=[{pipeline.Pipeline.DebugWordStates()}], " +
                     $"tpPending={tpPending}, tpThreads={tpThreads}; " +
                     $"{(resolvedLate ? $"RESOLVED LATE at +{lateSw.ElapsedMilliseconds}ms => starvation delay, not a loss" : "STILL STUCK after +30s => genuine lost obligation")}): " +
-                    $"{string.Join("; ", stuck)}\nTRACE:\n{DrainTrace.Dump()}");
+                    $"{string.Join("; ", stuck)}");
             }
 
             var doubles = items.Where(it => guard.CompletionCount(it.Name!) != 1)
@@ -533,6 +621,165 @@ public class PipelineConcurrencyTests
         }
     }
 
+    /// Recovery is a TOTAL, transparent substitution (see Slon's ResyncRecoveryFlow): when item X's
+    /// trailing task faults after X was already activated (elided at count-0), RecoverTrailingFailure
+    /// activates the recovery substitute R directly - the only channel by which R can learn it holds
+    /// the turn, since there is no other way to notify it. R eclipses X: R (not X) is what
+    /// ultimately completes. Deterministic (no stress loop needed): X is the sole item in an
+    /// otherwise-empty pipeline, so it takes the trivial elision path (activated=true) with
+    /// certainty. The single-reader guard must recognize this second ActivateHeadItem as a
+    /// legitimate transfer (R supersedes X, recorded via TryRecoverItemFailure), not a collision -
+    /// unlike an unrelated double-activation, which the main stress test already guards against.
+    [TestMethod]
+    public async Task RecoveryFromTrailingFailure_EclipsesOriginal_SingleReaderInvariant()
+    {
+        var guard = new SingleReaderGuard();
+        TestPipelineItem? recovery = null;
+        var pipeline = Pipeline.Create<TestPipelineItem, SingleReaderGuardPolicy>(new(guard,
+            ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery = new TestPipelineItem { Name = "R" } : null));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var item = new TestPipelineItem
+        {
+            Name = "X",
+            HasTrailingTask = true,
+            TrailingTaskException = new InvalidOperationException("trailing failed"),
+        };
+        pipeline.Enqueue(item).Execute();
+
+        await item.WaitForExecutedAsync();
+        Assert.AreEqual(1, item.ActivationCount, "X must have been elided (activated) before its trailing task faults - the scenario under test.");
+        item.CompleteTrailingTask();
+
+        // The trailing TCS runs its continuation asynchronously (RunContinuationsAsynchronously), so
+        // RecoverTrailingFailure fires on a threadpool hop, not inline with CompleteTrailingTask.
+        Assert.IsTrue(SpinWait.SpinUntil(() => Volatile.Read(ref recovery) is not null, TimeSpan.FromSeconds(10)),
+            "Recovery factory should have been invoked for the trailing failure.");
+        await recovery!.WaitForCompleteAsync();
+
+        Assert.AreEqual(1, recovery.ActivationCount, "R must have been activated exactly once - it eclipses X, it doesn't queue behind it.");
+        Assert.AreEqual(0, guard.CompletionCount("X"), "X is never separately completed - it is eclipsed by R, matching Slon's ResyncRecoveryFlow semantics.");
+        Assert.AreEqual(1, guard.CompletionCount("R"), "R is the identity that ultimately completes.");
+        if (guard.Violation is { } v)
+            Assert.Fail($"single-reader invariant violated - {v}\nFORENSICS:\n{guard.DescribeViolation()}\nBATON JOURNAL:\n{guard.DumpJournal()}");
+    }
+
+    /// Standing concurrency coverage for recovery: before this test, recovery paths (RecoverItem,
+    /// RecoverTrailingFailure, RecoverCommittedTailWaiterAsync) were entirely unexercised by the
+    /// concurrency stress suite - the main NoTwoItemsActivatedConcurrently_SingleReaderInvariant
+    /// loop never triggers a recovery factory. One in eight items faults its trailing task and gets
+    /// eclipsed by a fresh substitute, mixed into the same sync/async concurrent load as the main
+    /// stress test, so recovery's activation/completion machinery gets hammered against the same
+    /// elision/census/tail-waiter interleavings the rest of the suite already covers.
+    ///
+    /// FIXED (2026-07-10): RunIdleCensus peeks the deferred item's value (capturing X) before winning
+    /// its claim+consume CAS, and calls ActivateHeadItem(captured, ...) only after releasing the edge
+    /// lock. When RecoverTrailingFailure's/RecoverItem's own consume lost that CAS race to a genuine
+    /// census grant, the code used to activate/complete its substitute immediately, assuming the
+    /// census's grant was "vacuous" - it wasn't; both could fire, unordered. The fix doesn't touch the
+    /// census (eliminating it breaks a genuine liveness case - a stuck backpressure write needs
+    /// something to grant it activation once the store drains) or the eclipse contract (R activating
+    /// while X's activation is live is correct by design). It keys a wait to a dedicated
+    /// per-grant stamp (WaiterStore.RecordCensusResolved/IsCensusResolved, written right after the
+    /// census's ActivateHeadItem call returns) so a losing recovery waits for that exact grant's
+    /// activation to have returned before proceeding - turning an unordered race into a clean,
+    /// sequential eclipse transfer. See census_recovery_fix_spec.md for the full design history
+    /// (five independent reviews) and the rejected alternatives.
+    [TestMethod, DoNotParallelize]
+    public async Task RecoveryEclipse_UnderConcurrentLoad_SingleReaderInvariant()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_RECOVERY_STRESS_ITERATIONS"), out var n) ? n : 500;
+
+        for (var iter = 0; iter < iterations; iter++)
+        {
+            var guard = new SingleReaderGuard();
+            var substitutes = new System.Collections.Concurrent.ConcurrentBag<TestPipelineItem>();
+            var substituteCounter = 0;
+            var pipeline = Pipeline.Create<TestPipelineItem, SingleReaderGuardPolicy>(new(guard, ctx =>
+            {
+                // Decline recovery for ExecuteItemTask failures (exercises RecoverItem's no-recovery-
+                // decline path, which inline-completes the failed item directly - the site identified
+                // as needing the same census-resolution wait as the inherit-and-activate arms) while
+                // still offering a substitute for TrailingExecutionTask failures (the eclipse path).
+                if (ctx.Kind is PipelineItemFailureKind.ExecuteItemTask)
+                    return null;
+                var r = new TestPipelineItem { Name = $"R{Interlocked.Increment(ref substituteCounter)}" };
+                substitutes.Add(r);
+                return r;
+            }));
+            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+            const int count = 64;
+
+            var items = new TestPipelineItem[count];
+            var recoveryTriggering = new HashSet<int>();
+            var declinedFailing = new HashSet<int>();
+            for (var i = 0; i < count; i++)
+            {
+                // Every eighth item (all odd, i.e. the async half - a synchronously-completing
+                // pipeline task never reaches the tail-waiter path a trailing fault needs) faults its
+                // trailing task and is eclipsed by a recovery substitute.
+                var triggersRecovery = i % 8 == 7;
+                // A disjoint residue (i % 16 == 5 - avoids both i%8==7 and i%4==3) throws synchronously
+                // from ExecuteItemAsync instead - routes through RecoverItem with no recovery offered,
+                // so the item completes directly with its own exception (no substitute).
+                var declinesRecovery = i % 16 == 5;
+                if (triggersRecovery)
+                    recoveryTriggering.Add(i);
+                if (declinesRecovery)
+                    declinedFailing.Add(i);
+                items[i] = new TestPipelineItem
+                {
+                    Name = i.ToString(),
+                    CompleteAsync = i % 2 != 0,
+                    HasTrailingTask = triggersRecovery,
+                    TrailingTaskException = triggersRecovery ? new InvalidOperationException($"trailing failed {i}") : null,
+                    ThrowOnExecute = declinesRecovery ? new InvalidOperationException($"execute failed {i}") : null,
+                };
+                pipeline.Enqueue(items[i]).Execute();
+                if (triggersRecovery)
+                    ThreadPool.UnsafeQueueUserWorkItem(
+                        static it => ((TestPipelineItem)it!).CompleteTrailingTask(), items[i], preferLocal: false);
+                else if (i % 4 == 3)
+                    ThreadPool.UnsafeQueueUserWorkItem(
+                        static it => ((TestPipelineItem)it!).CompletePipelineTask(), items[i], preferLocal: false);
+            }
+
+            var emptyReturned = true;
+            try { await pipeline.WaitForEmptyAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(10)); }
+            catch (TimeoutException) { emptyReturned = false; }
+
+            var settleSw = System.Diagnostics.Stopwatch.StartNew();
+            while ((items.Where((it, idx) => !recoveryTriggering.Contains(idx) && !it.IsCompleted).Any()
+                    || substitutes.Count < recoveryTriggering.Count
+                    || substitutes.Any(s => !s.IsCompleted))
+                   && settleSw.Elapsed < TimeSpan.FromSeconds(15))
+                await Task.Delay(5);
+
+            if (guard.Violation is { } v)
+                Assert.Fail($"iter {iter}: single-reader invariant violated - {v}\nFORENSICS:\n{guard.DescribeViolation()}\nBATON JOURNAL:\n{guard.DumpJournal()}");
+
+            var nonRecoveryIncomplete = items.Where((it, idx) => !recoveryTriggering.Contains(idx) && !it.IsCompleted).ToList();
+            var missingSubstitutes = recoveryTriggering.Count - substitutes.Count;
+            var incompleteSubstitutes = substitutes.Count(s => !s.IsCompleted);
+            if (nonRecoveryIncomplete.Count > 0 || missingSubstitutes > 0 || incompleteSubstitutes > 0)
+                Assert.Fail($"iter {iter}: PERMANENT STRAND - {nonRecoveryIncomplete.Count} non-recovery items, " +
+                    $"{missingSubstitutes} missing substitutes, {incompleteSubstitutes} incomplete substitutes " +
+                    $"(Depth={pipeline.Depth}, Backlog={pipeline.Backlog}, emptyReturned={emptyReturned})");
+
+            foreach (var idx in recoveryTriggering)
+                Assert.AreEqual(0, guard.CompletionCount(items[idx].Name!), $"iter {iter}: X (item {idx}) must never separately complete - it is eclipsed by its substitute.");
+
+            foreach (var idx in declinedFailing)
+            {
+                Assert.AreEqual(1, guard.CompletionCount(items[idx].Name!), $"iter {iter}: item {idx} (recovery declined) must complete exactly once, directly, with its own exception.");
+                Assert.IsNotNull(items[idx].Exception, $"iter {iter}: item {idx} should have completed with its ThrowOnExecute exception.");
+            }
+
+            PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+        }
+    }
+
     /// Faithful mini-model of Slon's shared per-connection read promise: exactly one item may hold
     /// the reader baton at a time. A second concurrent take is the shared-promise collision
     /// (PromiseAsyncValueTaskMethodBuilder.Start throwing "already executing, multiple callers").
@@ -541,12 +788,26 @@ public class PipelineConcurrencyTests
         TestPipelineItem? _currentReader;
         volatile string? _violation;
         public string? Violation => _violation;
+        // Captured at collision time so the failure dump can self-classify (see DescribeViolation).
+        volatile TestPipelineItem? _violationHolder;
+        volatile TestPipelineItem? _violationTaker;
+
+        // Recovery-eclipse map (R -> X), recorded by TryRecoverItemFailure at the moment the real
+        // framework constructs a substitute. Mirrors Slon's ResyncRecoveryFlow: the framework
+        // activates the recovery item unconditionally (that's the ONLY channel by which an item
+        // learns it holds the turn - there is no other way for R to know it may proceed), even
+        // while X's own activation is still live. Slon's actual safety comes from the substitute
+        // sequencing behind X's OutstandingPhaseTask before touching shared state, not from the
+        // framework serializing the two ActivateHeadItem calls. So a second TakeBaton is a
+        // legitimate TRANSFER, not a collision, precisely when it's a recorded eclipse of the
+        // current holder - anything else is still a genuine double-activation.
+        readonly System.Collections.Concurrent.ConcurrentDictionary<TestPipelineItem, TestPipelineItem> _eclipses = new();
+        public void RecordEclipse(TestPipelineItem recoveryItem, TestPipelineItem failedItem) => _eclipses[recoveryItem] = failedItem;
 
         // Baton forensics: a small ring of take/release events so a violation names its own
-        // interleaving without DRAGHI_DRAIN_TRACE (whose per-event fences on every pipeline
-        // path can close the very window under investigation; this journal fences only the
-        // ~2 guard events per item that already do interlocked work).
-        const int JournalSize = 64;
+        // interleaving. It records only the roughly two guard events per item that already do
+        // interlocked work, keeping the diagnostic narrowly scoped to the guarded invariant.
+        const int JournalSize = 256;
         readonly (string What, string? Item, string? Prev, int Thread)[] _journal = new (string, string?, string?, int)[JournalSize];
         int _journalTicket = -1;
 
@@ -580,11 +841,65 @@ public class PipelineConcurrencyTests
         // activation a realistic overlap window (Slon's async Start lands on the TP, not inline).
         public void TakeBaton(TestPipelineItem item)
         {
+            // Wedge-instant assert: catch activation-AFTER-completion at the take that enacts it. The
+            // same item's CompleteItem already ran (CompletionCount >= 1), so this activation is a stale
+            // arm firing on a retiree - the baton it takes is never released, so the downstream symptom
+            // is the next item's collision. Pinning it here names the wedge rather than its aftermath.
+            // Distinct from a re-entrant double-activation (that shows in ActivationCount).
+            if (CompletionCount(item.Name!) >= 1 && _violation is null)
+            {
+                _violationHolder = item;
+                _violationTaker = item;
+                _violation = $"'{item.Name}' was activated AFTER its own completion (baton wedge: activation-after-retirement)";
+            }
             var prev = Interlocked.CompareExchange(ref _currentReader, item, null);
+            if (prev is not null && !ReferenceEquals(prev, item)
+                && _eclipses.TryGetValue(item, out var eclipsed) && ReferenceEquals(eclipsed, prev))
+            {
+                // Legitimate recovery transfer: item (R) eclipses prev (X). CAS from prev to item -
+                // a plain write would race a genuinely concurrent unrelated take.
+                var transferred = Interlocked.CompareExchange(ref _currentReader, item, prev) == prev;
+                Journal(transferred ? "take(transfer)" : "take(COLLISION)", item, prev);
+                if (!transferred && _violation is null)
+                {
+                    _violationHolder = prev;
+                    _violationTaker = item;
+                    _violation = $"'{prev.Name}' still the reader when '{item.Name}' was activated (transfer raced an unrelated take)";
+                }
+                Thread.SpinWait(64);
+                return;
+            }
             Journal(prev is null ? "take" : ReferenceEquals(prev, item) ? "take(re-entrant)" : "take(COLLISION)", item, prev);
-            if (prev is not null && !ReferenceEquals(prev, item))
-                _violation ??= $"'{prev.Name}' still the reader when '{item.Name}' was activated (two readers on one baton)";
+            if (prev is not null && !ReferenceEquals(prev, item) && _violation is null)
+            {
+                _violationHolder = prev;
+                _violationTaker = item;
+                _violation = $"'{prev.Name}' still the reader when '{item.Name}' was activated (two readers on one baton)";
+            }
             Thread.SpinWait(64);
+        }
+
+        // Self-classifying forensics, evaluated at dump time (after the settle poll): the stuck
+        // holder's completion count is the discriminator between the two shapes a leaked baton
+        // can have. CompletionCount==0 => activation-without-drain (lost completion, the strand
+        // family). CompletionCount>=1 with the take never released => the holder's CompleteItem
+        // ran BEFORE (or without) a matching activation - complete-then-activate or a second
+        // activation after retirement (double-activation shows in ActivationCount).
+        public string DescribeViolation()
+        {
+            static string Flavor(TestPipelineItem it)
+                => int.TryParse(it.Name, out var i)
+                    ? (i % 2 == 0 ? "sync" : i % 4 == 3 ? "async+early-complete" : "async")
+                    : "?";
+            var parts = new List<string>();
+            foreach (var (role, it) in new[] { ("holder", _violationHolder), ("taker", _violationTaker) })
+            {
+                if (it is null)
+                    continue;
+                parts.Add($"{role} '{it.Name}' [{Flavor(it)}]: completions={CompletionCount(it.Name!)}, " +
+                          $"activations={it.ActivationCount}, isCompleted={it.IsCompleted}");
+            }
+            return string.Join("\n", parts);
         }
 
         // Mirrors GetResult releasing _started when the read completes.
@@ -598,10 +913,18 @@ public class PipelineConcurrencyTests
     struct SingleReaderGuardPolicy : IPipelinePolicy<TestPipelineItem>
     {
         readonly SingleReaderGuard _guard;
-        public SingleReaderGuardPolicy(SingleReaderGuard guard) => _guard = guard;
+        readonly Func<PipelineItemFailureContext, TestPipelineItem?>? _recoveryFactory;
+        public SingleReaderGuardPolicy(SingleReaderGuard guard) : this(guard, null) { }
+        public SingleReaderGuardPolicy(SingleReaderGuard guard, Func<PipelineItemFailureContext, TestPipelineItem?>? recoveryFactory)
+        {
+            _guard = guard;
+            _recoveryFactory = recoveryFactory;
+        }
 
         public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
         {
+            if (item.ThrowOnExecute is { } ex)
+                throw ex;
             var task = item.GetExecuteTask();
             item.SignalExecuted();
             return task;
@@ -621,6 +944,14 @@ public class PipelineConcurrencyTests
             _guard.RecordCompletion(item.Name!);
             _guard.ReleaseBaton(item);
             item.Complete(exception);
+        }
+
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        {
+            recoveryItem = _recoveryFactory?.Invoke(context);
+            if (recoveryItem is not null)
+                _guard.RecordEclipse(recoveryItem, failedItem);
+            return recoveryItem is not null;
         }
 
         public bool RunEnqueueAsynchronously => true;
@@ -786,6 +1117,87 @@ public class PipelineConcurrencyTests
             await item.WaitForCompleteAsync();
             Assert.IsNull(item.Exception);
         }
+
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+    }
+
+    /// THE invariant (fixed 2026-07-08): every activation the executor's own dispatch issues -
+    /// inline elision or a self-resolved deferral - must pass preferAsync:false. It precedes
+    /// ExecuteItemAsync on the very next line of the same dispatch, so nothing has suspended yet
+    /// and there is no continuation to defer; only an advancer grant legitimately passes true.
+    /// The regression fed a downstream bug where the advancer runs a synchronous item's body
+    /// inline while another thread spins waiting on it.
+    ///
+    /// Executor-ness is certified by construction, not inference: the pipeline is built with
+    /// runContinuationsAsynchronously:false, so enqueueing into a parked executor runs the whole
+    /// drive inline within the test's own bracketed Enqueue().Execute() call - any item pushed
+    /// into a synchronously-driven source is by definition dispatched on the driving thread.
+    /// BeforeExecute splits the dispatch activation (asserted) from the post-execute commit walk
+    /// within the same drive (a legitimate true). The self-resolved-deferral case needs the sole
+    /// waiter's retirement to land inside the dispatch's publish-to-recheck window; the spin
+    /// rendezvous puts both racers within nanoseconds of each other, which is what makes that
+    /// window reachable at all from an inline drive (a bare Task.Run's µs-scale start latency
+    /// never lands in it) - validated by flipping the self-act call site to true: 8/8 runs failed.
+    [TestMethod]
+    public async Task InlineActivation_NeverPrefersAsync()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true), runContinuationsAsynchronously: false);
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        static void EnqueueUnderExecutorDrive(QueuedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TestPipelineItem item)
+        {
+            TestPipelineItem.ExecutorDriveActive = true;
+            try { pipeline.Enqueue(item).Execute(); }
+            finally { TestPipelineItem.ExecutorDriveActive = false; }
+        }
+
+        const int rounds = 1000;
+        var allItems = new List<TestPipelineItem>();
+
+        for (var r = 0; r < rounds; r++)
+        {
+            var waiter = new TestPipelineItem { CompleteAsync = true };
+            EnqueueUnderExecutorDrive(pipeline, waiter);
+            allItems.Add(waiter);
+            await waiter.WaitForExecutedAsync();
+
+            var ready = 0;
+            var go = 0;
+            var drainTask = Task.Run(() =>
+            {
+                Volatile.Write(ref ready, 1);
+                while (Volatile.Read(ref go) == 0)
+                    Thread.SpinWait(1);
+                waiter.CompletePipelineTask();
+            });
+            while (Volatile.Read(ref ready) == 0)
+                Thread.SpinWait(1);
+            Volatile.Write(ref go, 1);
+
+            var tail = new TestPipelineItem { CompleteAsync = true };
+            EnqueueUnderExecutorDrive(pipeline, tail);
+            allItems.Add(tail);
+            await tail.WaitForExecutedAsync();
+            tail.CompletePipelineTask();
+
+            await drainTask;
+            await tail.WaitForCompleteAsync();
+            await waiter.WaitForCompleteAsync();
+        }
+
+        var executorDispatchActivations = 0;
+        foreach (var item in allItems)
+        {
+            if (item is { FirstActivationUnderExecutorDrive: true, FirstActivationBeforeExecute: true })
+            {
+                executorDispatchActivations++;
+                Assert.IsFalse(item.FirstActivationPreferAsync,
+                    $"{item}: activated by the executor's own dispatch (inside the test's drive, before the item's execute) - no continuation exists to defer, preferAsync must be false.");
+            }
+        }
+
+        Assert.IsTrue(executorDispatchActivations > 0,
+            "No executor-dispatch activation was observed - the assertion above ran vacuously.");
 
         PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }

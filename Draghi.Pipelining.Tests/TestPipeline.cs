@@ -33,7 +33,6 @@ sealed class TestPipelineItem
     }
 
     public string? Name { get; init; }
-    // DrainTrace dumps print items via ToString.
     public override string ToString() => Name ?? base.ToString()!;
     // TCS-backed signals (was ManualResetEventSlim). Async waits now await the Task with timeout
     // - no Task.Run + MRES.Wait + TP-blocked-worker hop. The sync waits use Task.Wait(timeout)
@@ -41,7 +40,11 @@ sealed class TestPipelineItem
     readonly TaskCompletionSource _completedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly TaskCompletionSource _activatedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly TaskCompletionSource _executedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-    readonly TaskCompletionSource _pipelineTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+
+    // The pipeline-facing waiter task is always StrictValueTaskSource-backed: it empirically
+    // enforces the two production waiter contracts (single OnCompleted per tenure; no member call
+    // after GetResult) that a TCS-backed task would silently tolerate.
+    readonly StrictValueTaskSource<bool> _pipelineTaskStrict = new();
     readonly TaskCompletionSource<PipelineItemResult> _executeTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
     readonly TaskCompletionSource _trailingTaskTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
 
@@ -51,7 +54,7 @@ sealed class TestPipelineItem
     // Strand-diagnosis probe: whether the pipeline task (the store's waiter task) ever settled.
     // Discriminates a lost DRAIN (task settled, CompleteItem never ran - advancer/deposit side)
     // from a lost COMPLETION (task never settled - policy/TP side).
-    public bool PipelineTaskCompleted => _pipelineTaskTcs.Task.IsCompleted;
+    public bool PipelineTaskCompleted => _pipelineTaskStrict.IsSettled;
 
     // Non-asserting waits for stress runners that own their timeout/diagnosis/suspend handling.
     public bool TryWaitForExecuted(TimeSpan timeout) => _executedTcs.Task.Wait(timeout);
@@ -80,6 +83,10 @@ sealed class TestPipelineItem
     // Lets tests observe the executor's trailing await registration - the only deterministic
     // suspension between the tail transition and the next iteration's CommitTailWaiter.
     public System.Threading.Tasks.Sources.IValueTaskSource? TrailingTaskSource { get; init; }
+    // Custom pipeline-task backing source (takes precedence over CompleteAsync's strict source).
+    // Lets a test own the waiter task's completion protocol itself - e.g. the two-phase window
+    // of TwoPhaseValueTaskSource (the retire-vs-dispatch race repro).
+    public System.Threading.Tasks.Sources.IValueTaskSource? PipelineTaskSource { get; init; }
     public Action? OnComplete { get; init; }
 
     // The shutdown-settle registration (TestPipelinePolicy.ExecuteItemAsync) parks this item in
@@ -115,8 +122,48 @@ sealed class TestPipelineItem
     int _activationCount;
     public int ActivationCount => Volatile.Read(ref _activationCount);
 
-    public void Activate()
+    // First-activation observability, purely external (recorded at the policy's ActivateHeadItem
+    // callback - no pipeline-internal hooks). Two markers classify the caller:
+    //  - UnderExecutorDrive: a POSITIVE test-level bracket. A test that builds its pipeline with
+    //    runContinuationsAsynchronously:false and enqueues into a PARKED executor runs the whole
+    //    drive - pull, dispatch, activation, ExecuteItemAsync, commit - inline inside its own
+    //    Enqueue().Execute() call, so bracketing that call with this [ThreadStatic] positively
+    //    certifies "this activation ran on the executor" by construction: any item pushed into a
+    //    synchronously-driven source is by definition dispatched on the driving thread, and nothing
+    //    escapes the bracket without unwinding past the test's finally.
+    //  - BeforeExecute: this item's own ExecuteItemAsync had not yet started. Within an executor
+    //    drive this splits the dispatch activation (elision or a self-resolved deferral - always
+    //    precedes it, must be preferAsync:false: nothing has suspended yet, no continuation exists
+    //    to defer) from the post-execute commit's walk (a legitimate preferAsync:true).
+    // See InlineActivation_NeverPrefersAsync.
+    public bool? FirstActivationPreferAsync { get; private set; }
+    public bool FirstActivationUnderExecutorDrive { get; private set; }
+    public bool FirstActivationBeforeExecute { get; private set; }
+    // Set by the policy at ExecuteItemAsync entry. Plain bool: the only reader whose value matters
+    // (the executor's own dispatch activation) runs earlier on the same thread; bracketed readers
+    // record it but are classified by the bracket alone.
+    public bool ExecuteStarted;
+
+    [ThreadStatic] static bool _executorDriveActive;
+
+    /// The test-level executor-drive bracket (see FirstActivationUnderExecutorDrive). Set around a
+    /// synchronous Enqueue().Execute() drive, cleared in the caller's finally.
+    public static bool ExecutorDriveActive
     {
+        get => _executorDriveActive;
+        set => _executorDriveActive = value;
+    }
+
+    public void Activate() => Activate(preferAsync: true);
+
+    public void Activate(bool preferAsync)
+    {
+        if (FirstActivationPreferAsync is null)
+        {
+            FirstActivationPreferAsync = preferAsync;
+            FirstActivationUnderExecutorDrive = _executorDriveActive;
+            FirstActivationBeforeExecute = !ExecuteStarted;
+        }
         Interlocked.Increment(ref _activationCount);
         _activatedTcs.TrySetResult();
     }
@@ -150,15 +197,15 @@ sealed class TestPipelineItem
     public void CompletePipelineTask()
     {
         if (PipelineTaskException is not null)
-            _pipelineTaskTcs.TrySetException(PipelineTaskException);
+            _pipelineTaskStrict.TrySetException(PipelineTaskException);
         else
-            _pipelineTaskTcs.TrySetResult();
+            _pipelineTaskStrict.TrySetResult(default);
     }
 
     /// Shutdown-escalation settle (see TestPipelinePolicy.ExecuteItemAsync). Races benignly
     /// with an explicit CompletePipelineTask; TrySet semantics, first writer wins.
     public void TryCancelPipelineTask(CancellationToken token)
-        => _pipelineTaskTcs.TrySetException(new OperationCanceledException(token));
+        => _pipelineTaskStrict.TrySetException(new OperationCanceledException(token));
 
     public void CompleteExecuteTask()
     {
@@ -175,9 +222,13 @@ sealed class TestPipelineItem
 
     public ValueTask GetPipelineTask()
     {
+        if (PipelineTaskSource is { } pipelineTaskSource)
+            return new ValueTask(pipelineTaskSource, 0);
         if (!CompleteAsync)
             return PipelineTaskException is { } ex ? new(Task.FromException(ex)) : default;
-        return new(_pipelineTaskTcs.Task);
+        // IValueTaskSource-backed: the pipeline must register on it once and consume it once,
+        // exactly like the production waiter task.
+        return new ValueTask(_pipelineTaskStrict, _pipelineTaskStrict.Version);
     }
 
     public ValueTask<PipelineItemResult> GetExecuteTask()
@@ -218,6 +269,10 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
 
     public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
     {
+        // Before anything else, including the throw below: the executor's own dispatch activation
+        // strictly precedes this call, so BeforeExecute classification needs the flag up first.
+        item.ExecuteStarted = true;
+
         if (item.ThrowOnExecute is { } ex)
             throw ex;
 
@@ -234,7 +289,7 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
         return task;
     }
 
-    public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
+    public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate(preferAsync);
 
     public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
     {

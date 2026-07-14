@@ -1,0 +1,159 @@
+#!/bin/sh
+set -eu
+
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+REGISTRY="$ROOT/models.tsv"
+
+usage() {
+    printf '%s\n' \
+        'usage: ./verify list [--kind KIND] [--impact TAG]' \
+        '       ./verify check' \
+        '       ./verify run CONFIG'
+}
+
+list_configs() {
+    kind=""
+    impact=""
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --kind) kind=$2; shift 2 ;;
+            --impact) impact=$2; shift 2 ;;
+            *) usage; exit 2 ;;
+        esac
+    done
+
+    while IFS="	" read -r model_id module model_path model_root impacts; do
+        case "$model_id" in ''|'#'*) continue ;; esac
+        if [ -n "$impact" ]; then
+            case ",$impacts," in *",$impact,"*) ;; *) continue ;; esac
+        fi
+        find "$ROOT/$model_root" -type f -name '*.cfg' | sort | while IFS= read -r cfg; do
+            config=${cfg#"$ROOT/"}
+            relative=${cfg#"$ROOT/$model_root/"}
+            case "$relative" in
+                "$module.cfg") config_kind=shipped ;;
+                configs/*/*.cfg) config_kind=${relative#configs/}; config_kind=${config_kind%%/*} ;;
+                *) continue ;;
+            esac
+            expectation=$(sed -n 's/^\\\* EXPECT: //p' "$cfg" | head -n 1)
+            [ -z "$kind" ] || [ "$config_kind" = "$kind" ] || continue
+            printf '%-88s %-10s %s\n' "$config" "$config_kind" "$expectation"
+        done
+    done < "$REGISTRY"
+}
+
+check_registry() {
+    errors=0
+    seen=$(mktemp "${TMPDIR:-/tmp}/draghi-verification.XXXXXX")
+    trap 'rm -f "$seen"' EXIT HUP INT TERM
+
+    while IFS="	" read -r model_id module model_path model_root impacts; do
+        case "$model_id" in ''|'#'*) continue ;; esac
+        model="$ROOT/$model_path"
+        if [ ! -f "$model" ]; then
+            printf 'missing model: %s\n' "$model_path" >&2
+            errors=$((errors + 1))
+            continue
+        fi
+        if ! head -n 1 "$model" | grep -q "MODULE $module "; then
+            printf 'module/file mismatch: %s should declare %s\n' "$model_path" "$module" >&2
+            errors=$((errors + 1))
+        fi
+        shipped=0
+        while IFS= read -r cfg; do
+            config=${cfg#"$ROOT/"}
+            relative=${cfg#"$ROOT/$model_root/"}
+            case "$relative" in
+                "$module.cfg") kind=shipped ;;
+                configs/*/*.cfg) kind=${relative#configs/}; kind=${kind%%/*} ;;
+                *) printf 'unknown config location: %s\n' "$config" >&2; errors=$((errors + 1)); kind=unknown ;;
+            esac
+            expectation=$(sed -n 's/^\\\* EXPECT: //p' "$cfg" | head -n 1)
+            case "$kind" in
+                shipped|probes) ;;
+                *) printf 'unknown config category: %s\n' "$config" >&2; errors=$((errors + 1)) ;;
+            esac
+            case "$expectation" in
+                PASS|FAIL) ;;
+                *) printf 'missing or invalid EXPECT metadata: %s\n' "$config" >&2; errors=$((errors + 1)) ;;
+            esac
+            if grep -Fxq "$config" "$seen"; then
+                printf 'duplicate config path: %s\n' "$config" >&2
+                errors=$((errors + 1))
+            fi
+            printf '%s\n' "$config" >> "$seen"
+            [ "$kind" != shipped ] || shipped=$((shipped + 1))
+        done <<EOF
+$(find "$ROOT/$model_root" -type f -name '*.cfg' | sort)
+EOF
+        if [ "$shipped" -ne 1 ]; then
+            printf '%s has %s shipped configs; expected exactly one\n' "$model_id" "$shipped" >&2
+            errors=$((errors + 1))
+        fi
+    done < "$REGISTRY"
+
+    flat=$(find "$ROOT" -maxdepth 1 \( -name '*.cfg' -o -name '*.tla' \) -print)
+    if [ -n "$flat" ]; then
+        printf 'unclassified root files:\n%s\n' "$flat" >&2
+        errors=$((errors + 1))
+    fi
+    total=$(find "$ROOT" -type f -name '*.cfg' | wc -l | tr -d ' ')
+    registered=$(wc -l < "$seen" | tr -d ' ')
+    if [ "$total" -ne "$registered" ]; then
+        printf 'registered %s of %s configs\n' "$registered" "$total" >&2
+        errors=$((errors + 1))
+    fi
+    [ "$errors" -eq 0 ] || exit 1
+    printf 'verification registry is coherent: %s models, %s configurations\n' \
+        "$(grep -vc '^#' "$REGISTRY")" "$registered"
+}
+
+run_config() {
+    [ "$#" -eq 1 ] || { usage; exit 2; }
+    wanted=$1
+    jar=${TLA2TOOLS_JAR:-"$HOME/tla2tools.jar"}
+    workers=${TLC_WORKERS:-auto}
+    if [ -z "$jar" ] || [ ! -f "$jar" ]; then
+        printf 'set TLA2TOOLS_JAR to a tla2tools.jar path (default: ~/tla2tools.jar)\n' >&2
+        exit 2
+    fi
+
+    while IFS="	" read -r model_id module model_path model_root impacts; do
+        case "$model_id" in ''|'#'*) continue ;; esac
+        while IFS= read -r cfg; do
+            config=${cfg#"$ROOT/"}
+            [ "$config" = "$wanted" ] || continue
+            expectation=$(sed -n 's/^\\\* EXPECT: //p' "$cfg" | head -n 1)
+            printf 'running %s (expected %s)\n' "$config" "$expectation"
+            output=$(mktemp "${TMPDIR:-/tmp}/draghi-tlc.XXXXXX")
+            set +e
+            java -XX:+UseParallelGC "-DTLA-Library=$ROOT/lib:$ROOT/components/pipeline-source" -cp "$jar" tlc2.TLC \
+                -workers "$workers" -config "$cfg" "$ROOT/$model_path" >"$output" 2>&1
+            status=$?
+            set -e
+            cat "$output"
+            rm -f "$output"
+            case "$expectation:$status" in
+                PASS:0|FAIL:12) exit 0 ;;
+                *)
+                    printf 'unexpected TLC outcome: expected %s, exit status %s\n' \
+                        "$expectation" "$status" >&2
+                    exit 1
+                    ;;
+            esac
+        done <<EOF
+$(find "$ROOT/$model_root" -type f -name '*.cfg' | sort)
+EOF
+    done < "$REGISTRY"
+    printf 'unknown config: %s\n' "$wanted" >&2
+    exit 2
+}
+
+command=${1:-}
+[ "$#" -eq 0 ] || shift
+case "$command" in
+    list) list_configs "$@" ;;
+    check) [ "$#" -eq 0 ] || { usage; exit 2; }; check_registry ;;
+    run) run_config "$@" ;;
+    *) usage; exit 2 ;;
+esac

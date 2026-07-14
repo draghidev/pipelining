@@ -111,15 +111,25 @@ public class ValueTPipelineTests
     ///
     /// Enable manually to verify, or use as the template for a future snapshot-via-CAS publishing
     /// pattern that would close both races.
+    ///
+    /// RE-VERIFIED (2026-07-10): confirmed genuine, not a stale/inaccurate dismissal - at the
+    /// original 1000-item workload this reproduced inconsistently on this machine (0/18 runs), which
+    /// could easily read as "fixed" if taken at face value. At 200_000 items it reproduces reliably
+    /// (~80% of runs) - the original workload was just too small to reliably hit the narrow
+    /// cross-cycle window here, not evidence the race is gone. Left `[Ignore]`d: this remains a
+    /// deliberate, accepted trade-off for large value-T, not a regression to chase.
     [TestMethod]
-    [Ignore("Cross-cycle Enumerator tearing on _tailWaiter for large value-T. Enable to reproduce.")]
+    [Ignore("Cross-cycle Enumerator tearing on _tailWaiter for large value-T - confirmed still real " +
+        "2026-07-10 at a larger workload (200_000 items; the original 1000-item load was too small to " +
+        "reliably reproduce it here). Enable manually to verify, or use as the template for a future " +
+        "snapshot-via-CAS publishing fix.")]
     public async Task LargeValueTypeT_EnumeratorTailWaiterCrossCycleTearing()
     {
         var pool = new ValueItemPool();
         var pipeline = Pipeline.Create<LargeValueItem, LargeValueItemPolicy>(new(pool));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        const int producerItems = 1000;
+        const int producerItems = 200_000;
         var producerDone = false;
         var producer = Task.Run(() =>
         {

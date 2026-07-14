@@ -49,7 +49,7 @@ public class WaiterStoreConcurrencyTests
 
         for (var marker = 1; marker <= n; marker++)
         {
-            box.TryEscalateOrEnqueue(marker, default, out var isSlot, out _);
+            box.TryEscalateOrEnqueue(marker, default, out var isSlot);
             Assert.IsTrue(isSlot, "Handshake must keep every commit slot-tier (no escalation).");
             while (box.Count != 0 && failure is null)
                 Thread.SpinWait(1);
@@ -79,46 +79,47 @@ public class WaiterStoreConcurrencyTests
         // Case 1: claim takes the slot BEFORE escalation (claimer wins the slot).
         {
             var box = new WaiterStoreBox<int>();
-            box.TryEscalateOrEnqueue(1, default, out var isSlot, out _);
+            box.TryEscalateOrEnqueue(1, default, out var isSlot);
             Assert.IsTrue(isSlot, "marker 1 must land in the slot on a fresh box.");
             Assert.IsTrue(box.TryClaimSlotForDrain(out var claimed, out _), "occupied slot must be claimable.");
             Assert.AreEqual(1, claimed, "claim must read the committed pair, never default/torn.");
             box.DecrementCount();
             // Slot now empty; further commits go to the queue (still pre-escalation slot path first).
-            box.TryEscalateOrEnqueue(2, default, out var isSlot2, out _);
+            box.TryEscalateOrEnqueue(2, default, out var isSlot2);
             Assert.IsTrue(isSlot2, "after the slot drained, marker 2 re-occupies the (empty) slot.");
             Assert.IsTrue(box.TryClaimSlotForDrain(out var c2, out _)); Assert.AreEqual(2, c2); box.DecrementCount();
             Assert.AreEqual(0, box.Count);
         }
 
-        // Case 2: escalation MOVES an occupied slot (escalation wins). marker1 -> slot; marker2's commit
-        // sees the slot occupied, escalates, CAS-moves marker1 to the queue head (slotWasMoved). A
-        // subsequent claim finds the slot empty; both drain from the queue in FIFO order.
+        // Case 2: LEAVE-HEAD escalation. marker1 -> slot; marker2's commit sees the slot occupied,
+        // escalates, and enqueues ONLY marker2 - marker1 STAYS in the slot (never moved). The head
+        // retires from the slot tier first, then the queue overflow, in FIFO order.
         {
             var box = new WaiterStoreBox<int>();
-            box.TryEscalateOrEnqueue(1, default, out var s1, out _);
+            box.TryEscalateOrEnqueue(1, default, out var s1);
             Assert.IsTrue(s1);
-            box.TryEscalateOrEnqueue(2, default, out var s2, out var moved2);
+            box.TryEscalateOrEnqueue(2, default, out var s2);
             Assert.IsFalse(s2, "marker 2 escalates to the queue.");
-            Assert.IsTrue(moved2, "the occupied slot's marker 1 must be moved to the queue head.");
-            box.TakeMovedSlotPair(out var movedItem, out _);
-            Assert.AreEqual(1, movedItem, "moved pair must be marker 1, never default/torn.");
-            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "post-escalation the slot is empty: no claim.");
-            Assert.IsTrue(box.TryDequeue(out var q1)); Assert.AreEqual(1, q1.Waiter); box.DecrementCount();
-            Assert.IsTrue(box.TryDequeue(out var q2)); Assert.AreEqual(2, q2.Waiter); box.DecrementCount();
+            Assert.IsTrue(box.IsEscalated);
+            Assert.IsTrue(box.TrySnapshotSlot(out var resident), "marker 1 must stay resident in the slot.");
+            Assert.AreEqual(1, resident, "leave-head: the pre-escalation occupant is the slot-resident head.");
+            // Unified head API: slot head first, then queue head.
+            Assert.IsTrue(box.TryClaimCompletedHead(out var h1, out _)); Assert.AreEqual(1, h1); box.DecrementCount();
+            Assert.IsTrue(box.TryClaimCompletedHead(out var h2, out _)); Assert.AreEqual(2, h2); box.DecrementCount();
             Assert.AreEqual(0, box.Count);
         }
 
-        // Case 3: claim on an EMPTY slot and on an ESCALATED (slot-empty) box returns false, never a
-        // torn/default success.
+        // Case 3: claim on an EMPTY slot returns false; on an ESCALATED box the slot occupant is
+        // still resident (leave-head), so the slot claim SUCCEEDS for the head. Never a torn/default.
         {
             var box = new WaiterStoreBox<int>();
             Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "empty box: claim returns false.");
-            box.TryEscalateOrEnqueue(1, default, out _, out _);
-            box.TryEscalateOrEnqueue(2, default, out _, out var moved); // escalates, slot now empty
-            Assert.IsTrue(moved);
-            box.TakeMovedSlotPair(out _, out _);
-            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "escalated box: slot empty, claim returns false.");
+            box.TryEscalateOrEnqueue(1, default, out _);
+            box.TryEscalateOrEnqueue(2, default, out _); // escalates; marker 1 stays in the slot
+            Assert.IsTrue(box.TryClaimSlotForDrain(out var slotHead, out _), "escalated box: slot occupant still claimable (leave-head).");
+            Assert.AreEqual(1, slotHead);
+            box.DecrementCount();
+            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "slot now drained: claim returns false.");
             while (box.TryDequeue(out _)) box.DecrementCount();
             Assert.AreEqual(0, box.Count);
         }
@@ -132,10 +133,9 @@ public class WaiterStoreConcurrencyTests
             var box = new WaiterStoreBox<int>();
             var drained = new bool[perBox + 1];
             for (var marker = 1; marker <= perBox; marker++)
-                box.TryEscalateOrEnqueue(marker, default, out _, out var moved);
-            // Drain: the slot first (if still occupied), then the queue.
-            if (box.TryClaimSlotForDrain(out var slotItem, out _)) { Record(drained, slotItem); box.DecrementCount(); }
-            while (box.TryDequeue(out var entry)) { Record(drained, entry.Waiter); box.DecrementCount(); }
+                box.TryEscalateOrEnqueue(marker, default, out _);
+            // Drain via the unified head API: slot head first (leave-head resident), then the queue.
+            while (box.TryClaimCompletedHead(out var head, out _)) { Record(drained, head); box.DecrementCount(); }
             for (var marker = 1; marker <= perBox; marker++)
                 Assert.IsTrue(drained[marker], $"box {b}: marker {marker} lost or duplicated. finalCount={box.Count}");
             Assert.AreEqual(0, box.Count);
@@ -212,12 +212,23 @@ public class WaiterStoreConcurrencyTests
 /// consumer claims/dequeues against the same storage).
 sealed class WaiterStoreBox<T>
 {
-    WaiterStore<T> _store;
+    // WaiterStore<T> is a struct with a custom parameterless constructor (allocates the edge lock);
+    // a bare field declaration zero-inits instead of calling it (the 2026-07-08 struct-ctor trap:
+    // then the count bias, now the lock).
+    WaiterStore<T> _store = new();
     public int Count => _store.Count;
-    public int TryEscalateOrEnqueue(T item, ValueTask task, out bool isSlot, out bool slotWasMoved)
-        => _store.TryEscalateOrEnqueue(item, task, out isSlot, out slotWasMoved);
+    public bool IsEscalated => _store.IsEscalated;
+    public int TryEscalateOrEnqueue(T item, ValueTask task, out bool isSlot)
+    {
+        // Increment-first commit pair (what CommitWaiter does around its edge/mid routing). Returns
+        // the new count to keep this harness's callers' arithmetic unchanged.
+        var prev = _store.IncrementCommitCount();
+        _store.PublishCommitted(item, task, out isSlot);
+        return prev + 1;
+    }
     public bool TryClaimSlotForDrain(out T item, out ValueTask task) => _store.TryClaimSlotForDrain(out item, out task);
-    public void TakeMovedSlotPair(out T item, out bool wasCompletedAtMove) => _store.TakeMovedSlotPair(out item, out wasCompletedAtMove);
+    public bool TryClaimCompletedHead(out T item, out ValueTask task) => _store.TryClaimCompletedHead(out item, out task);
+    public bool TrySnapshotSlot(out T item) => _store.TrySnapshotSlot(out item);
     public bool TryDequeue(out (T Waiter, ValueTask WaiterTask) entry) => _store.TryDequeue(out entry);
     public bool DecrementCount() => _store.DecrementCount();
 }

@@ -58,20 +58,18 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     T _tailWaiter = default!;
     bool _hasTailWaiter;
     ValueTask _tailWaiterTask;
-    // Published by the execution loop for deferred activation. The bool flag is the handshake:
-    // set (true) by the executor, claimed (false) under _activationLock. Claims are lock-serialized
-    // (plain reads/writes inside the lock); the executor's publishes are lock-free release stores
-    // (item written before the flag), so the cross-strand claimants (the advancer C-path family)
-    // acquire-read the flag to order their _executingItem load after the flag observation - the
-    // acquire half of the historical Interlocked.Exchange, kept as the only fence in the protocol.
-    // Executor-strand claimants (CommitTailWaiter, ClearExecutingItem, the recovery reclaim) read
-    // plain: the sole lock-free publisher is their own strand.
+    // Published by the execution loop for the enumerator/heartbeat surface. NOTE: the deferral's
+    // grant identity does NOT ride this field - it rides WaiterStore._execDeferredItem, pinned to
+    // the versioned _execWord, so the census grants exactly the consumed deferral's item (capture-
+    // before-take off this field was unsound: a suspended census could read a stale _executingItem
+    // while consuming a recycled deferral). The executor places the deferral (with its item) on the
+    // versioned word; the census version-pin-consumes-and-grants, the executor race-back / reclaim
+    // plain-consumes its own. See WaiterStore's exec-word section.
     T _executingItem = default!;
-    bool _executingItemActivationPending;
     // Seqlock generation for the public ExecutingItem getter under value-type T (see PublishSlot /
     // ReadSlot). Unused for reference T (single-word atomic). _executingItem has a sole writer (the
-    // executor strand; recovery is awaited inline, the advancer only reads it under _activationLock),
-    // so the seqlock's single-writer assumption holds.
+    // executor strand; recovery is awaited inline on that same strand), so the seqlock's single-writer
+    // assumption holds.
     uint _executingItemGen;
 
     /// <summary>
@@ -118,37 +116,37 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // Visibility-only flag for GetEnumerator. Set on dispatch in both branches (waiters=0 and
     // waiters>0) so heartbeat-style consumers can act on the in-flight item before it transitions
     // to a tail-waiter slot. Cleared on every transition that gives the enumerator another channel
-    // to see the item (sync completion, tail-waiter committal, recovery). Kept separate from
-    // _executingItemActivationPending so the advancer C-path's claim semantics on that flag stay unchanged.
+    // to see the item (sync completion, tail-waiter committal, recovery). Kept separate from the
+    // exec-word deferral so the advancer C-path's claim semantics on that carrier stay unchanged.
     bool _hasInFlightItem;
-    // The chain-arm-to-escalator activation handoff. Set (true) by the slot drainer when its
-    // chain obligation meets an in-flight first escalation (the head is being relocated to the
-    // queue and cannot be named); claimed (false) via Interlocked.Exchange by whichever side
-    // gets there first: the drainer's one-shot re-peek or the escalating commit's compensation
-    // check. Self-clearing per dance; no per-run reset needed.
-    bool _pendingHeadActivation;
 
     // Cross-thread atomics, touched by the executor, advancer, enqueuer, and completion callbacks.
     // The store has a single inline slot (zero alloc) for the common one-pending-waiter case. The
     // SPSC queue inside it is lazy-allocated only on true overlap (a second waiter arrives while
     // the first is still pending). See WaiterStore<T>.
     WaiterStore<T> _waiters;
-    // Completions-since-pass-start dirty flag. Callbacks that bail set it (plain write, published by
-    // their TryAcquire's full fence). Drain passes consume it with an Interlocked.Exchange at pass
-    // start, and the post-release recheck closes the lost-wake window - the clear/fence/recheck gate.
-    bool _drainSignal;
 
-    Latch _advancing; // Held while a thread is currently the advancer. See Latch.cs for semantics.
     T _waiterRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
-    TaskCompletionSource? _drainWakeupTcs; // Set by DrainOnCompletionAsync while waiting for the advancer chain to release and _waiters to empty. Signaled by callbacks at end-of-cycle so drain can re-check both conditions.
+    long _waiterRecoverySeq;          // The recovery position's claim ordinal - the turn identity its completion releases.
+    bool _tailWaiterActivated;        // The tail item was activated on the executor strand (elision/race-back): its turn is TurnExec.
+    long _tailWaiterGen;              // The tail item's deferral grant gen (0 if elision/never deferred): its census-grant identity for the commit inherit + owned-turn release.
+    TaskCompletionSource? _drainWakeupTcs; // Set by DrainOnCompletionAsync while waiting for the advance chain to drain _waiters. Signaled by the advancer's count-0 exit (and recovery bailout) so teardown can re-check.
 
-    // Activation.
-    readonly Action _onWaiterTaskCompletedAction;
+    // The single fixed head-continuation trampoline (the advance-fire). Registered on the current head's
+    // task by the granting advancer/arm; its fire re-enters the advance. Replaces the eager per-item
+    // completion callback: only the current head ever carries a continuation (single-continuation
+    // invariant), so the runtime's own continuation slot is the lossless completion-side wake arbiter -
+    // no latch, no drain signal, no deposit/serve machinery.
+    readonly Action _onAdvanceFire;
+
 
     internal Pipeline(TPolicy policy, TSource source)
     {
         // Delegate references bind to `this` and don't change.
-        _onWaiterTaskCompletedAction = OnWaiterTaskCompleted;
+        _onAdvanceFire = OnAdvanceFire;
+        // Explicit store construction: the count word is biased (+1) and a default-initialized
+        // struct would read count -1 (see WaiterStore's ctor).
+        _waiters = new();
         Initialize(policy, source);
     }
 
@@ -166,7 +164,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         _shutdownSlot = null;
 
         // Depth is counted at DISPATCH (the executor's single-consumer pull), not at enqueue, so the
-        // source no longer needs a depth-increment hook. Pipeline doesn't pass a CT here: source owns
+        // source needs no depth-increment hook. Pipeline doesn't pass a CT here: source owns
         // its own cancellation lifecycle (caller-configured at source construction).
         _enumerator = _source.GetAsyncEnumerator();
         _executionTask = ExecuteSource();
@@ -175,11 +173,13 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // previous run's ExecuteSource-exit cleanup.
     }
 
-    // Off the hot path (advancer/recovery handoff), so OS handoff on contention is preferable.
-    // Lazy-allocated alongside _waiters at first escalation. Stays null while no advancer can
-    // exist (advancers require waiters), and the few lock sites that may run pre-escalation
-    // null-guard.
-    Lock? _activationLock;
+#if DEBUG
+    // Executor-strand tripwire for the recovery swap (RecoverTrailingFailure). Recovery runs on the
+    // executor's logical strand, so no two recovery swaps overlap; this fails loud if a future
+    // multi-strand recovery restructure breaks that premise. NOT a lock - the unpublish-first exec-word
+    // ordering protects the swap against the lock-free claimants. Debug-only.
+    int _recoverySwapGuard;
+#endif
 
 
     /// <summary>Current in-flight count: items dispatched by the executor but not yet completed.
@@ -188,6 +188,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// outstanding. Lock-free read, may be stale by the time the caller observes it. Use
     /// <see cref="WaitForEmptyAsync"/> to await empty (both halves zero).</summary>
     public int Depth => _depthState.Depth;
+
+    /// Diagnostic readout of the store's two activation word cells, for test forensics.
+    internal string DebugWordStates() => _waiters.DebugWordStates();
 
     /// <summary>Completion of the current run: completes when the run has fully torn down, faults
     /// when the run breaks, the same task <see cref="CompleteAsync"/> returns. Unlike CompleteAsync
@@ -342,6 +345,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                         item = default!;
                     itemResult = default;
+                    // Same reasoning as the clear above, for WaiterStore's deferred-item field: no
+                    // consume site clears it (see ClearStaleExecDeferredItem's doc), so a stale
+                    // reference from an already-resolved deferral would otherwise sit GC-rooted for
+                    // the whole idle period. Safe here specifically because this is the sole writer
+                    // strand, about to suspend.
+                    _waiters.ClearStaleExecDeferredItem();
 
                     // Drain-empty fire. The backlog half of "empty" (enqueued - dispatched == 0) is
                     // only observable to the single consumer, and only at the moment it commits to a
@@ -377,71 +386,50 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 Volatile.Write(ref _hasInFlightItem, true);
 
                 var activated = false;
-                if (_activationLock is not { } dispatchLock)
+                // The grant generation for THIS item (its deferral's gen, or a freshly-minted gen
+                // for the inline elision). It is the item's turn identity (-execGen) for the whole
+                // dispatch: self-act, census grant, commit-convert, and completion-release all key
+                // off it, so a committing item only ever inherits its own grant.
+                long execGen = 0;
+                // Idle-regime elision. At count 0 with no deferral published there is no concurrent
+                // activation decider: the C-path needs the deferral (executor-owned, absent here); a
+                // advancer exists only while retiring resident waiters (count > 0), so count 0 excludes a
+                // mid-chain advancer; and a advancer at its idle-edge exit touches no activation state unless
+                // it is granting the deferral, which the deferral check screens. Also covers the
+                // pre-first-commit case (no advancer has ever run). A stale-nonzero count read only
+                // declines, the conservative direction.
+                if (_waiters.Count is 0 && !_waiters.ExecDeferredVisible)
                 {
-                    // No waiter has ever been committed (_activationLock is created at first commit,
-                    // executor strand). With no queue there is no advancer, so the Count read races
-                    // nobody: the historical lock-free inline-activate / deferred-publish fork is safe.
-                    if (_waiters.Count is 0)
+                    // Inline self-activation elision (no deferral). FAIL-IF-LIVE TurnExec claim: the
+                    // gate excludes a resident, but a census may have granted a non-resident (turn
+                    // live at count 0), so the turn - not the stale gate - is the authority. On a win
+                    // activate inline; on a loss (census grant live) defer, and a later stop covers it.
+                    var elideGen = _waiters.NextGrantGen();
+                    if (_waiters.TryClaimTurnGrant(elideGen))
                     {
+                        execGen = elideGen;
                         ActivateHeadItem(item, preferAsync: false);
                         activated = true;
                     }
                     else
                     {
-                        // Plain: null _activationLock means no advancer has ever existed; the flag is
-                        // executor-private until first escalation allocates the lock.
-                        _executingItemActivationPending = true;
+                        execGen = _waiters.PlaceExecDeferred(item);
                     }
                 }
                 else
                 {
-                    // Idle-regime elision. At count 0 with the latch free and no pending publish
-                    // there is no concurrent activation decider: the C-path needs the pending flag
-                    // (executor-owned, false here), the D-path and callbacks need resident waiters,
-                    // and any drain crossing count 0 with a live activation holds the latch end to
-                    // end, so the latch read screens it. The elision publishes nothing, so no remote
-                    // checker depends on a store from this arm and the volatile guard loads need no
-                    // further ordering. A stale-held latch read only declines, the conservative
-                    // direction.
-                    if (_waiters.Count is 0 && !_advancing.IsHeld && !_executingItemActivationPending)
+                    // An advancer may be draining concurrently. Publish the deferral (its gen is the
+                    // grant identity a census stamps and this item inherits at commit), full-fence
+                    // StoreLoad, then the CLAIM-FIRST race-back (matches the census's own claim-then-
+                    // consume order exactly - see TryReclaimExecDeferred's doc for why the opposite
+                    // order double-bails and strands the item). A claim loss (a census granting this
+                    // same gen) declines outright; this item routes as a resident for a later stop.
+                    execGen = _waiters.PlaceExecDeferred(item);
+                    Interlocked.MemoryBarrier();
+                    if (_waiters.Count is 0 && _waiters.TryReclaimExecDeferred(execGen))
                     {
-                        // preferAsync: true matching the locked arm. The elision changes the
-                        // serialization only, never the dispatch mode.
-                        ActivateHeadItem(item, preferAsync: true);
+                        ActivateHeadItem(item, preferAsync: false);
                         activated = true;
-                    }
-                    else
-                    {
-                        // An advancer may be draining concurrently. The dispatch-time "Count is 0 -> activate
-                        // the head" decision must serialize against the advancer's drain-time activation
-                        // through the same lock + _executingItemActivationPending claim the advancer's
-                        // count<=0 branch uses. Otherwise the executor reads Count is 0 in the window after
-                        // the advancer dequeued the last waiter but before it activated the deferred head,
-                        // and both strands activate it (two items in the post-activation phase, which a
-                        // policy with a single read channel cannot serve) or neither does (lost activation,
-                        // count skew). Publish the claim first, then re-read Count and Exchange under the
-                        // lock: exactly one of {executor, advancer} wins the flag and activates _executingItem.
-                        // The claim+activate stays inside the lock so the executor's own ClearExecutingItem
-                        // fence-acquire blocks until this ActivateHeadItem finishes (the advancer's TOCTOU close).
-                        lock (dispatchLock)
-                        {
-                            // Pending is plain lock-protected state (no atomics): every claimant - this
-                            // block, the advancer's C-path, CommitTailWaiter's reclaim - runs under
-                            // _activationLock, so publish and claim are ordinary reads/writes here.
-                            _executingItemActivationPending = true;
-                            if (_waiters.Count is 0)
-                            {
-                                _executingItemActivationPending = false;
-                                // preferAsync: true, matching the advancer's count<=0 branch. false would
-                                // run an async flow's body inline UNDER the lock (the deferral exists to
-                                // avoid exactly that - arbitrary continuations under _activationLock deadlock
-                                // the advancer). preferAsync only defers async flows; a sync flow still
-                                // activates inline, the same as the advancer already does here safely.
-                                ActivateHeadItem(item, preferAsync: true);
-                                activated = true;
-                            }
-                        }
                     }
                 }
 
@@ -451,8 +439,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 }
                 catch (Exception ex)
                 {
-                    ClearExecutingItem(activated);
-                    await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), _enumerator.CompletionToken).ConfigureAwait(false);
+                    var owned = ClearExecutingItem(activated);
+                    var failedTurn = ExecOwnedTurn(activated, owned, execGen);
+                    await RecoverItem(item, activated, new PipelineItemFailureContext(PipelineItemFailureKind.ExecuteItemTask, ex), failedTurn, _enumerator.CompletionToken).ConfigureAwait(false);
                     continue;
                 }
 
@@ -472,9 +461,22 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 if (_waiters.Count is 0
                     && itemResult.PipelineTask.IsCompletedSuccessfully && itemResult.TrailingExecutionTask.IsCompletedSuccessfully)
                 {
-                    itemResult.PipelineTask.GetAwaiter().GetResult();
-                    ClearExecutingItem(activated);
-                    CompleteWaiter(item, null);
+                    if (ClearExecutingItem(activated))
+                    {
+                        // Owned completion: activated on this strand, or the reclaim won (no grant
+                        // exists or ever can). The token and the turn are ours.
+                        itemResult.PipelineTask.GetAwaiter().GetResult();
+                        CompleteWaiter(item, null, ownedTurn: ExecOwnedTurn(activated, owned: true, execGen));
+                    }
+                    else
+                    {
+                        // Reclaim LOST: a census grant is mid-flight or landed. NEVER inline-complete a
+                        // lost item - route it through the store: the census advancer acts under the
+                        // license, and the advance's claim needs that same license, so the activation is
+                        // ordered before the retire (the deleted observe-rendezvous's happens-before,
+                        // carried by license ordering instead of a spin).
+                        CommitWaiter(item, sentinelHeld: true, own: false, grantGen: execGen, itemResult.PipelineTask);
+                    }
                 }
                 else if (itemResult.PipelineTask.IsCompleted && !itemResult.PipelineTask.IsCompletedSuccessfully)
                 {
@@ -486,7 +488,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // running trailing flush on the writer. Pass the ValueTask directly (no
                     // AsTask conversion): the recovery is the sole awaiter, single-consume
                     // is preserved by construction.
-                    ClearExecutingItem(activated);
+                    var ownedFault = ClearExecutingItem(activated);
+                    var faultedTurn = ExecOwnedTurn(activated, ownedFault, execGen);
                     var outstandingTrailing = itemResult.TrailingExecutionTask;
                     try
                     {
@@ -494,7 +497,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     }
                     catch (Exception ex)
                     {
-                        await RecoverItem(item, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex, outstandingTrailing), _enumerator.CompletionToken).ConfigureAwait(false);
+                        await RecoverItem(item, activated, new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, ex, outstandingTrailing), faultedTurn, _enumerator.CompletionToken).ConfigureAwait(false);
                         continue;
                     }
                 }
@@ -509,10 +512,12 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // never sees both true at once - the reverse order would let a heartbeat-style
                     // enumerator yield the same item twice (phase 0 and phase 4) and fire the consumer's
                     // per-tick callback twice. _executingItem stays populated for the advancer C-path
-                    // when waiters>0; CommitTailWaiter clears it under the lock.
+                    // when waiters>0; CommitTailWaiter clears it after its reclaim.
                     Volatile.Write(ref _hasInFlightItem, false);
                     _tailWaiter = item;
                     _tailWaiterTask = itemResult.PipelineTask;
+                    _tailWaiterActivated = activated;
+                    _tailWaiterGen = execGen;
                     Volatile.Write(ref _hasTailWaiter, true);
                 }
 
@@ -526,7 +531,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     {
                         if (_hasTailWaiter)
                         {
-                            await RecoverTrailingFailure(item, activated, ex, _enumerator.CompletionToken).ConfigureAwait(false);
+                            await RecoverTrailingFailure(item, activated, execGen, ex, _enumerator.CompletionToken).ConfigureAwait(false);
                         }
                     }
                 }
@@ -548,7 +553,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // enumerator's own CompletionToken. Identity-matched so a foreign or untokened OCE is NOT
             // swallowed, AND the token must have actually fired: the legitimate idiom only throws after
             // observing cancellation, while a mistranslated cancellation carrying this token on an
-            // un-fired run would otherwise read as shutdown and walk the pump out of a live loop -
+            // un-fired run would otherwise read as shutdown and drop the pump out of a live loop -
             // the teardown then faults on the mid-flight state, skipping the enumerator dispose, and
             // the source wedges open. Not-fired falls through to the capture below and faults loudly
             // with the real origin stack.
@@ -608,7 +613,6 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 _waiters.Reset();
                 _waiterRecoveryItem = default!;
                 _drainWakeupTcs = null;
-                _commitFireGate = CommitFireIdle;
                 // Reset the sentinel ONLY on a clean exit. On a fault, leave _executionTask pointing at
                 // this faulting task so CompleteAsync (which returns it) surfaces the fault; rethrow below.
                 // A settled async-Task box releases its state machine, so the faulted task roots no
@@ -629,31 +633,31 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         fault?.Throw();
     }
 
-    /// Drains remaining items after the execution loop exits. Waits for the advancer chain to
-    /// quiesce via a TCS that DrainReadyWaiters / BailoutRecoveryOnShutdown signal on release of
-    /// _advancing. Recovery continuations always complete their own items (via CompleteRecoveryWaiter
-    /// or BailoutRecoveryOnShutdown), so drain doesn't compete, it just waits for the chain to
-    /// finish. After advancer-idle, drains _waiters.
+    /// Waits for the advance chain to drain remaining items after the execution loop exits. The advance is
+    /// autonomous (head continuations fire and retire in FIFO order), so teardown does not compete - it
+    /// waits for quiescence. Quiescence = count==0 AND no in-flight executor item: keying on count==0
+    /// alone is insufficient for the deferred-executor population (a race-back consumes the exec word to
+    /// None while the exec item still runs, non-resident with count 0), so the predicate keys on the
+    /// executor's lifecycle (_hasInFlightItem), not the exec word. The advancer's count-0 exit signals
+    /// _drainWakeupTcs to wake this loop.
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask DrainOnCompletionAsync()
     {
-        // Wait for both the advancer chain to be idle (no callback mid-flight) and _waiters to be empty
-        // (every committed item's waiter task completed and its callback drained it). Each callback
-        // signals _drainWakeupTcs on release, waking this loop to re-check. The count condition makes
-        // drain wait for in-flight pipeline tasks to finish naturally - dequeueing items ourselves would
-        // race the body's still-running pipeline task and tear down state it depends on.
-        while (_advancing.IsHeld || _waiters.Count > 0)
+        // Wait for _waiters to be empty (every committed item's task completed and the advance retired it)
+        // AND no executor item in flight. The count condition makes teardown wait for in-flight pipeline
+        // tasks to finish naturally - retiring items ourselves would race the body's still-running task
+        // and tear down state it depends on.
+        while (_waiters.Count > 0 || Volatile.Read(ref _hasInFlightItem))
         {
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             // Full fence, NOT Volatile.Write: this is the arm side of a Dekker-shaped arm-then-check
-            // against the callbacks' release-then-signal. A release-only publish lets the re-check's
-            // loads hoist ABOVE the store - the check reads a stale IsHeld/Count, the releasing
-            // callback reads the not-yet-visible null tcs, and the wakeup is lost with both sides
-            // convinced the other had it. The signal side is already fenced by the latch release's
-            // Interlocked.Exchange, so this is the matching half.
+            // against the advancer's publish-then-signal. A release-only publish lets the re-check's loads
+            // hoist ABOVE the store - the check reads a stale Count, the exiting advancer reads the
+            // not-yet-visible null tcs, and the wakeup is lost with both sides convinced the other had it.
+            // The signal side is fenced by the advancer's DecrementCount, so this is the matching half.
             Interlocked.Exchange(ref _drainWakeupTcs, tcs);
-            // Re-check post-publish in case the last callback released while we were setting up.
-            if (!_advancing.IsHeld && _waiters.Count == 0)
+            // Re-check post-publish in case the last advancer exited while we were setting up.
+            if (_waiters.Count == 0 && !Volatile.Read(ref _hasInFlightItem))
             {
                 Volatile.Write(ref _drainWakeupTcs, null);
                 break;
@@ -665,12 +669,26 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// Handles execution-phase or pipeline-task failures, including recovery.
     /// Recovery items get the full async treatment since they're taking the place of the original item.
+    /// <paramref name="activated"/> is the FAILED item's own dispatch-time activation status - it's
+    /// what distinguishes "failedTurn is -gen because X was self-activated, no census ever involved"
+    /// from "failedTurn is -gen because a census genuinely won X's grant" (ExecOwnedTurn collapses
+    /// both to the same -gen encoding; only the caller, which computed `activated` before the fault,
+    /// can still tell them apart). Only the latter needs WaitForCensusResolution before X or R is
+    /// touched further - a self-activated X was never at risk of a racing census in the first place.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async ValueTask RecoverItem(T item, PipelineItemFailureContext context, CancellationToken cancellationToken)
+    async ValueTask RecoverItem(T item, bool activated, PipelineItemFailureContext context, long failedTurn, CancellationToken cancellationToken)
     {
+        // A live failedTurn (-gen) that ISN'T from self-activation can only be a census's grant of
+        // this exact gen (ExecOwnedTurn's only other output is TurnNone) - wait for that specific
+        // census's ActivateHeadItem(X, ...) to have returned before touching X or R any further, so
+        // whatever happens next (complete X directly below, or activate R past this point) is
+        // ordered after X's real activation rather than racing it.
+        if (!activated && failedTurn != WaiterStore<T>.TurnNone)
+            WaitForCensusResolution(-failedTurn, cancellationToken);
+
         if (!_policy.TryRecoverItemFailure(context, item, cancellationToken, out var recoveryItem))
         {
-            CompleteWaiter(item, context.Exception);
+            CompleteWaiter(item, context.Exception, failedTurn);
             return;
         }
 
@@ -682,27 +700,35 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         SetExecutingItem(recoveryItem);
         Volatile.Write(ref _hasInFlightItem, true);
         var recoveryActivated = false;
+        long recoveryGen = 0;
         if (_waiters.Count is 0)
         {
-            // Recovery substitutes: the recovery item takes over the failed item's pipeline position
-            // INCLUDING its activation state, so this ungated activate may land while the
-            // predecessor's grant is nominally live (a C-path that claimed the pending publish before
-            // the fault and activated after it - ClearExecutingItem's lost arm). That grant is
-            // vacuous by construction: the failed item is parked in recovery and never returns to
-            // the wire, and the turn it held transfers here, released by this item's own retirement
-            // or the binding discharge. No lock or gate: the pending word was consumed in-lock by
-            // ClearExecutingItem before this runs, so no claimant can race a second activation onto
-            // the substitute, and the count arms are mutually exclusive with the deferred publish.
-            ActivateHeadItem(recoveryItem, preferAsync: false);
-            recoveryActivated = true;
+            // Recovery substitutes take over the failed item's position INCLUDING its turn: INHERIT
+            // the failed item's grant in place (real activation, ordered-safe by the wait above when
+            // it was a census's; vacuous-for-X when it was X's own) or FAIL-IF-LIVE claim a fresh
+            // grant; a live FOREIGN turn (a census granting another non-resident) declines and the
+            // substitute defers for a later stop. Under the edge lock like every count==0 grant; the
+            // policy call runs outside the hold.
+            var inheritGen = failedTurn < 0 ? -failedTurn : _waiters.NextGrantGen();
+            var recoveryLock = _waiters.EdgeLock;
+            recoveryLock.Enter();
+            recoveryGen = _waiters.ClaimOrInherit(inheritGen);
+            recoveryLock.Exit();
+            if (recoveryGen != 0)
+            {
+                ActivateHeadItem(recoveryItem, preferAsync: false);
+                recoveryActivated = true;
+            }
+            else
+            {
+                recoveryGen = _waiters.PlaceExecDeferred(recoveryItem);
+            }
         }
         else
         {
-            // Release publish (STLR): claims are lock-serialized, but the publish itself needs no
-            // lock - a claimant that misses an in-buffer publish leaves it for a later pass or the
-            // executor's own reclaim, same as the historical Exchange protocol. The release orders
-            // the SetExecutingItem above before the flag; claimants pair with a Volatile.Read.
-            Volatile.Write(ref _executingItemActivationPending, true);
+            // Republish for deferred activation. PlaceExecDeferred's Volatile.Write orders the
+            // SetExecutingItem above before the word; the census acquire-reads and captures first.
+            recoveryGen = _waiters.PlaceExecDeferred(recoveryItem);
         }
 
         try
@@ -714,9 +740,17 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
             if (result.PipelineTask.IsCompleted)
             {
-                ClearExecutingItem(recoveryActivated);
-                result.PipelineTask.GetAwaiter().GetResult();
-                CompleteWaiter(recoveryItem, null);
+                if (ClearExecutingItem(recoveryActivated))
+                {
+                    result.PipelineTask.GetAwaiter().GetResult();
+                    CompleteWaiter(recoveryItem, null, ownedTurn: ExecOwnedTurn(recoveryActivated, owned: true, recoveryGen));
+                }
+                else
+                {
+                    // Census-granted mid-recovery: route through the store (guarded - a recovery's own
+                    // late fault is never re-recovered), same lost-item rule as the main loop.
+                    CommitWaiter(recoveryItem, sentinelHeld: true, own: false, grantGen: 0, GuardRecoveryTask(result.PipelineTask));
+                }
             }
             else
             {
@@ -727,6 +761,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 Volatile.Write(ref _hasInFlightItem, false);
                 _tailWaiter = recoveryItem;
                 _tailWaiterTask = GuardRecoveryTask(result.PipelineTask);
+                _tailWaiterActivated = recoveryActivated;
+                _tailWaiterGen = recoveryGen;
                 Volatile.Write(ref _hasTailWaiter, true);
             }
         }
@@ -734,14 +770,15 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         {
             // No in-flight tail-waiter to observe here: the only _tailWaiter publish in the try
             // is in the trailing pending branch, which doesn't throw.
-            ClearExecutingItem(recoveryActivated);
-            CompleteWaiter(recoveryItem, recoveryEx);
+            var ownedEx = ClearExecutingItem(recoveryActivated);
+            CompleteWaiter(recoveryItem, recoveryEx,
+                ownedTurn: ExecOwnedTurn(recoveryActivated, ownedEx, recoveryGen));
         }
     }
 
     /// Handles trailing execution task failures, including tail waiter recovery.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async ValueTask RecoverTrailingFailure(T item, bool activated, Exception ex, CancellationToken cancellationToken)
+    async ValueTask RecoverTrailingFailure(T item, bool activated, long failedGen, Exception ex, CancellationToken cancellationToken)
     {
         // Preserve the pipeline task: the framework re-uses the materialized Task locally below
         // (no-recovery branch's CommitWaiter), so we want a stable handle that outlives this
@@ -756,49 +793,72 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // Items can handle their own interdependency between the two tasks if needed.
             _hasTailWaiter = false;
             _tailWaiterTask = default;
+            _tailWaiterActivated = false;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _tailWaiter = default!;
-            CommitWaiter(item, activated, pipelineTask);
+            // Resolve the parked deferral before the commit (the commit invariant): the one-winner
+            // consume decides ownership; a lost item commits sentinel-held (the census granted it).
+            // PLAIN consume (see ClearExecutingItem's doc) - residents may be live here.
+            var own = activated || _waiters.TryConsumeExecDeferred();
+            CommitWaiter(item, sentinelHeld: !own || activated, own, grantGen: failedGen, pipelineTask);
             return;
         }
 
-        // Swap the tail: replace _executingItem with the recovery item under the activation lock
-        // so the advancer's count==0 claim can't observe partial state and double-activate.
-        // On inline activation also clear the published slots so a later advancer claim cannot
-        // re-read recovery and activate it twice.
-        // If _activationLock is still null we never escalated, so no advancer can be running and
-        // the lock body runs uncontended without it.
+        // Swap the tail: replace _executingItem with the recovery item. LOCK-FREE UNPUBLISH-FIRST: the
+        // failed item X's deferral is a genuinely multi-location transaction (identity field + exec-word
+        // must flip atomically vs lock-free claimants, and a packed long can't carry generic-T
+        // identity). A naive eager swap (SetExecutingItem before consume) would let a C-path read R's
+        // new identity against X's still-live deferral. So UNPUBLISH FIRST - consume the deferral
+        // (which fails against a C-path's ACTIVATING, giving the ordering) - THEN swap identity in the
+        // now-owned window, THEN republish/activate. No recovery mutex: recovery runs on the executor's
+        // logical strand (the Debug tripwire below asserts it), so recovery-vs-recovery is structurally
+        // impossible, and the unpublish-first word ordering alone protects the swap against the
+        // lock-free claimants.
+#if DEBUG
+        Debug.Assert(Interlocked.Exchange(ref _recoverySwapGuard, 1) == 0,
+            "Concurrent recovery swap - the executor-strand premise was violated (multi-strand recovery restructure?).");
+#endif
+        // Unpublish: the one-winner consume resolves X's deferral. WON (still deferred) means no
+        // grant exists or ever can - swap the identity and republish for R (the census that reads
+        // the fresh deferral captures R). LOST means a census's gen-pinned consume of this exact gen
+        // already won: its capture happened before its take, so its ActivateHeadItem(X, ...) call is
+        // REAL, not vacuous - X's own activation genuinely fires. What makes activating R immediately
+        // afterward safe is not that X's activation doesn't happen, but that it's ORDERED to happen
+        // first: WaitForCensusResolution below blocks until that exact census's ActivateHeadItem call
+        // has returned (WaiterStore.IsCensusResolved(failedGen)), so R's activation is guaranteed to
+        // be a clean eclipse-transfer (Activate(X) happens-before Activate(R)), the same shape as a
+        // self-activated item whose trailing later faults and gets eclipsed - never two unordered,
+        // concurrently-live activations.
+        var recoverySwapWon = _waiters.TryConsumeExecDeferred();
+        SetExecutingItem(recoveryItem);
         bool recoveryActivated;
-        if (_activationLock is { } activationLock)
+        long recoveryGen;
+        if (recoverySwapWon)
         {
-            lock (activationLock)
-            {
-                SetExecutingItem(recoveryItem);
-                // Plain lock-protected state: every claimant runs under this lock.
-                recoveryActivated = !_executingItemActivationPending;
-                _executingItemActivationPending = true;
-                if (recoveryActivated)
-                {
-                    ActivateHeadItem(recoveryItem, preferAsync: false);
-                    _executingItemActivationPending = false;
-                    // _executingItem stays populated: the recovery's ExecuteItemAsync below needs it
-                    // for write-phase gating (same C-path pattern).
-                }
-            }
+            recoveryGen = _waiters.PlaceExecDeferred(recoveryItem);
+            recoveryActivated = false;
         }
         else
         {
-            SetExecutingItem(recoveryItem);
-            // No-lock path: a null _activationLock means no escalation ever happened, so no
-            // advancer exists to read this flag. Single strand, plain access.
-            recoveryActivated = !_executingItemActivationPending;
-            _executingItemActivationPending = true;
-            if (recoveryActivated)
-            {
-                ActivateHeadItem(recoveryItem, preferAsync: false);
-                _executingItemActivationPending = false;
-            }
+            // R inherits X's grant in place: the turn already holds -failedGen (X's), and R takes it -
+            // R releases/converts that same -recoveryGen. _executingItem stays populated: the
+            // recovery's ExecuteItemAsync below needs it for write-phase gating.
+            //
+            // The consume can lose for two different reasons the code must not conflate: X was
+            // self-activated at dispatch (elided/self-reclaimed - `activated` is true here, nothing
+            // was ever deferred, so there is no census to wait for and failedGen names X's OWN turn,
+            // never a stamped grant), or a census's gen-pinned consume of this exact gen already won
+            // (`activated` is false - the only case WaitForCensusResolution's premise, "a census
+            // exists for this gen", actually holds). Only the latter needs the wait.
+            if (!activated)
+                WaitForCensusResolution(failedGen, cancellationToken);
+            recoveryGen = failedGen;
+            ActivateHeadItem(recoveryItem, preferAsync: false);
+            recoveryActivated = true;
         }
+#if DEBUG
+        Debug.Assert(Interlocked.Exchange(ref _recoverySwapGuard, 0) == 1);
+#endif
 
         try
         {
@@ -814,8 +874,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                 {
                     _hasTailWaiter = false;
                     _tailWaiterTask = default;
-                    ClearExecutingItem(recoveryActivated);
-                    CompleteWaiter(recoveryItem, trailingEx);
+                    var ownedTrail = ClearExecutingItem(recoveryActivated);
+                    CompleteWaiter(recoveryItem, trailingEx,
+                        ownedTurn: ExecOwnedTurn(recoveryActivated, ownedTrail, recoveryGen));
                     return;
                 }
             }
@@ -824,17 +885,25 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             {
                 _hasTailWaiter = false;
                 _tailWaiterTask = default;
-                ClearExecutingItem(recoveryActivated);
-                Exception? pipelineEx = null;
-                try
+                if (ClearExecutingItem(recoveryActivated))
                 {
-                    result.PipelineTask.GetAwaiter().GetResult();
+                    Exception? pipelineEx = null;
+                    try
+                    {
+                        result.PipelineTask.GetAwaiter().GetResult();
+                    }
+                    catch (Exception e)
+                    {
+                        pipelineEx = e;
+                    }
+                    CompleteWaiter(recoveryItem, pipelineEx,
+                        ownedTurn: ExecOwnedTurn(recoveryActivated, owned: true, recoveryGen));
                 }
-                catch (Exception e)
+                else
                 {
-                    pipelineEx = e;
+                    // Census-granted mid-recovery: route through the store (guarded), the lost-item rule.
+                    CommitWaiter(recoveryItem, sentinelHeld: true, own: false, grantGen: 0, GuardRecoveryTask(result.PipelineTask));
                 }
-                CompleteWaiter(recoveryItem, pipelineEx);
                 return;
             }
 
@@ -842,6 +911,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             // late fault completes it directly, never re-enters recovery.
             _tailWaiter = recoveryItem;
             _tailWaiterTask = GuardRecoveryTask(result.PipelineTask);
+            _tailWaiterActivated = recoveryActivated;
+            _tailWaiterGen = recoveryGen;
         }
         catch (Exception recoveryEx)
         {
@@ -849,8 +920,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             _tailWaiterTask = default;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _tailWaiter = default!;
-            ClearExecutingItem(recoveryActivated);
-            CompleteWaiter(recoveryItem, recoveryEx);
+            var ownedRec = ClearExecutingItem(recoveryActivated);
+            CompleteWaiter(recoveryItem, recoveryEx,
+                ownedTurn: ExecOwnedTurn(recoveryActivated, ownedRec, recoveryGen));
         }
     }
 
@@ -872,45 +944,43 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _tailWaiter = default!;
 
-        // Reclaim the publish under the lock: replaces the old lock-free Exchange PLUS the empty
-        // fence-acquire lock{} it needed (any in-progress advancer ActivateHeadItem runs inside its
-        // own lock section, so entering ours means it finished - CompleteWaiter below cannot outrun
-        // it). alreadyActivated covers both "advancer's C-path consumed the pending" and "never
-        // published" (inline activation never set it). When _activationLock is still null no advancer
-        // has ever run and pending is executor-private - plain access, nothing to synchronize with.
-        bool alreadyActivated;
-        if (_activationLock is { } activationLock)
-        {
-            lock (activationLock)
-            {
-                alreadyActivated = !_executingItemActivationPending;
-                _executingItemActivationPending = false;
-            }
-        }
-        else
-        {
-            alreadyActivated = !_executingItemActivationPending;
-            _executingItemActivationPending = false;
-        }
-        // Clear unconditionally post-claim: if the advancer won, its ActivateHeadItem (which reads
-        // _executingItem under the lock) completed before our lock section above; any future C-path
-        // win requires a fresh publish that rewrites _executingItem first. Without this the item
-        // strands in _executingItem across the whole idle period.
+        var tailActivated = _tailWaiterActivated;
+        _tailWaiterActivated = false;
+        var tailGen = _tailWaiterGen;
+        _tailWaiterGen = 0;
+        // One-winner reclaim, no rendezvous. own = the completion and token are ours: activated on
+        // our own strand (elision/race-back - no deferral was ever placed), or the parked deferral
+        // was consumed un-granted. !own = the census granted (or is mid-grant): the item MUST route
+        // through the store - the census advancer acts under the license and the advance's claim needs
+        // that license, so the activation is ordered before the retire (the deleted rendezvous's
+        // happens-before, carried by license ordering).
+        var own = tailActivated || _waiters.TryConsumeExecDeferred();
+        // Clearing is safe in both arms: the census captures _executingItem BEFORE its take, so a
+        // lost reclaim means the capture already happened. Without this the item strands in
+        // _executingItem across the whole idle period.
         SetExecutingItem(default!);
 
-        if (task.IsCompleted)
+        if (task.IsCompleted && own)
         {
-            if (task.IsCompletedSuccessfully)
+            // Head-gated like the sync shortcut: the store plus the head-gated drain is a reorder
+            // buffer, and this inline completion bypasses it, so it is only safe when the ROB is
+            // empty (Count is 0 = this item is the head). A completed-but-non-head tail waiter
+            // falls through to the store as a drain-only commit and retires in FIFO order.
+            if (task.IsCompletedSuccessfully && _waiters.Count is 0)
             {
                 task.GetAwaiter().GetResult();
-                CompleteWaiter(item, null);
+                CompleteWaiter(item, null, ownedTurn: ExecOwnedTurn(tailActivated, owned: true, tailGen));
                 return null;
             }
 
-            return RecoverCommittedTailWaiterAsync(item, task).AsTask();
+            if (!task.IsCompletedSuccessfully)
+                return RecoverCommittedTailWaiterAsync(item, task, tailActivated, tailGen).AsTask();
         }
 
-        CommitWaiter(item, activated: alreadyActivated, task);
+        // A lost item's fault (rare: census-raced) routes through the store too; the advance's claim
+        // surfaces it to the waiter-drain recovery (kind PipelineTaskWaiter instead of PipelineTask -
+        // advisory drift, accepted).
+        CommitWaiter(item, sentinelHeld: !own || tailActivated, own, grantGen: tailGen, task);
         return null;
     }
 
@@ -919,8 +989,15 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     // producer), keeps pipeline ordering correct (recovery enqueues before subsequent items are
     // committed), and avoids the dual-producer hazard that a fire-and-forget continuation pattern
     // would create.
+    //
+    // OUT OF SCOPE for the census-race wait (WaitForCensusResolution): this method is only ever
+    // reached from CommitTailWaiter's `task.IsCompleted && own` branch, where
+    // `own = tailActivated || _waiters.TryConsumeExecDeferred()` - so `own` is provably true at
+    // every entry to this method. A census can only ever win by beating the plain consume
+    // (own=false); it can never be live here, so tailActivated/tailGen below always describe a
+    // genuinely self-owned turn, never a census's.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async ValueTask RecoverCommittedTailWaiterAsync(T item, ValueTask task)
+    async ValueTask RecoverCommittedTailWaiterAsync(T item, ValueTask task, bool tailActivated, long tailGen)
     {
         Exception exception;
         try
@@ -936,16 +1013,17 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // A recovery item's own guarded tail faulting between SetTail and this commit (the
         // recovery substitutes re-enter the normal tail lifecycle; see GuardRecoveryTask).
         // Complete directly with the real fault - never re-recovered, never consulted.
+        var failedTurn = ExecOwnedTurn(tailActivated, owned: true, tailGen);
         if (exception is Pipeline.RecoveryItemFaultException recoveryFault)
         {
-            CompleteWaiter(item, recoveryFault.InnerException);
+            CompleteWaiter(item, recoveryFault.InnerException, failedTurn);
             return;
         }
 
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTask, exception);
         if (!_policy.TryRecoverItemFailure(context, item, _enumerator.CompletionToken, out var recoveryItem))
         {
-            CompleteWaiter(item, exception);
+            CompleteWaiter(item, exception, failedTurn);
             return;
         }
 
@@ -955,19 +1033,30 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         SetExecutingItem(recoveryItem);
         Volatile.Write(ref _hasInFlightItem, true);
         var recoveryActivated = false;
+        long recoveryGen = 0;
         if (_waiters.Count is 0)
         {
-            // Recovery substitutes - activation state transfers with the position, so this ungated
-            // activate over the predecessor's vacuous grant is the design, not a race. Full argument
-            // at RecoverItem's twin arm.
-            ActivateHeadItem(recoveryItem, preferAsync: false);
-            recoveryActivated = true;
+            // Recovery substitutes - inherit the failed item's grant in place, or fail-if-live claim
+            // a fresh one; a live foreign turn defers (full argument at RecoverItem's twin arm).
+            var inheritGen = failedTurn < 0 ? -failedTurn : _waiters.NextGrantGen();
+            var recoveryLock = _waiters.EdgeLock;
+            recoveryLock.Enter();
+            recoveryGen = _waiters.ClaimOrInherit(inheritGen);
+            recoveryLock.Exit();
+            if (recoveryGen == 0)
+            {
+                recoveryGen = _waiters.PlaceExecDeferred(recoveryItem);
+            }
+            else
+            {
+                ActivateHeadItem(recoveryItem, preferAsync: false);
+                recoveryActivated = true;
+            }
         }
         else
         {
-            // Release publish (STLR), no lock - see RecoverItem's twin: claimants are
-            // lock-serialized and miss-tolerant; the release orders the item before the flag.
-            Volatile.Write(ref _executingItemActivationPending, true);
+            // Republish - see RecoverItem's twin: the census captures before its take.
+            recoveryGen = _waiters.PlaceExecDeferred(recoveryItem);
         }
 
         PipelineItemResult result;
@@ -977,8 +1066,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         catch (Exception recoveryEx)
         {
-            ClearExecutingItem(recoveryActivated);
-            CompleteWaiter(recoveryItem, recoveryEx);
+            var ownedRec = ClearExecutingItem(recoveryActivated);
+            CompleteWaiter(recoveryItem, recoveryEx,
+                ownedTurn: ExecOwnedTurn(recoveryActivated, ownedRec, recoveryGen));
             return;
         }
 
@@ -990,8 +1080,9 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
             catch (Exception ex)
             {
-                ClearExecutingItem(recoveryActivated);
-                CompleteWaiter(recoveryItem, ex);
+                var ownedTrail = ClearExecutingItem(recoveryActivated);
+                CompleteWaiter(recoveryItem, ex,
+                    ownedTurn: ExecOwnedTurn(recoveryActivated, ownedTrail, recoveryGen));
                 return;
             }
         }
@@ -999,57 +1090,46 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         var pipelineTask = result.PipelineTask;
         if (pipelineTask.IsCompleted)
         {
-            ClearExecutingItem(recoveryActivated);
-            Exception? pipelineException = null;
-            try
+            // Inline completion, ownership-gated like every executor-side completion: a lost
+            // (census-granted) substitute routes through the store instead.
+            if (ClearExecutingItem(recoveryActivated))
             {
-                pipelineTask.GetAwaiter().GetResult();
+                Exception? pipelineException = null;
+                try
+                {
+                    pipelineTask.GetAwaiter().GetResult();
+                }
+                catch (Exception ex)
+                {
+                    pipelineException = ex;
+                }
+                CompleteWaiter(recoveryItem, pipelineException,
+                    ownedTurn: ExecOwnedTurn(recoveryActivated, owned: true, recoveryGen));
             }
-            catch (Exception ex)
+            else
             {
-                pipelineException = ex;
+                CommitWaiter(recoveryItem, sentinelHeld: true, own: false, grantGen: 0, GuardRecoveryTask(pipelineTask));
             }
-            CompleteWaiter(recoveryItem, pipelineException);
         }
         else if (_enumerator.CompletionToken.IsCancellationRequested)
         {
             // Pipeline shutdown while recovery's async work was in flight. EnqueueWaiter at this
             // point would leak: OnWaiterTaskCompleted bails on wake completion, and DrainOnCompletionAsync
             // has likely already passed. Complete directly so depth tracking and CompleteItem still fire.
-            ClearExecutingItem(recoveryActivated);
-            CompleteWaiter(recoveryItem, _completionException);
+            var ownedShut = ClearExecutingItem(recoveryActivated);
+            CompleteWaiter(recoveryItem, _completionException,
+                ownedTurn: ExecOwnedTurn(recoveryActivated, ownedShut, recoveryGen));
         }
         else
         {
             // The recovery enters the store as an ordinary waiter; its identity travels in the TASK
             // (the guard wrapper rethrows late faults as RecoveryItemFaultException, see the marker
             // type), not in pipeline state - no fields, no value-T-unsound item comparisons.
-            //
-            // Reclaim the publish under the lock before the commit (this runs inside the executor's
-            // commit await, so the tail slot is not an option). Mirrors CommitTailWaiter: entering
-            // the lock means any advancer C-path ActivateHeadItem finished, so the commit below
-            // cannot race it - the old Exchange + empty fence-acquire pair collapses into the claim.
-            // Executor strand: the only lock-free publisher of the flag is this strand itself, so a
-            // plain in-lock read is exact.
-            bool alreadyActivated;
-            if (_activationLock is { } activationLock)
-            {
-                lock (activationLock)
-                {
-                    alreadyActivated = !_executingItemActivationPending;
-                    _executingItemActivationPending = false;
-                }
-            }
-            else
-            {
-                alreadyActivated = !_executingItemActivationPending;
-                _executingItemActivationPending = false;
-            }
-            // Unconditional post-claim clear (see CommitTailWaiter): without this the recovery item
-            // strands in _executingItem across the idle period.
+            // Resolve the deferral before the commit (the commit invariant), one-winner.
+            var ownCommit = recoveryActivated || _waiters.TryConsumeExecDeferred();
             SetExecutingItem(default!);
             Volatile.Write(ref _hasInFlightItem, false);
-            CommitWaiter(recoveryItem, activated: alreadyActivated, GuardRecoveryTask(pipelineTask));
+            CommitWaiter(recoveryItem, sentinelHeld: !ownCommit || recoveryActivated, ownCommit, grantGen: 0, GuardRecoveryTask(pipelineTask));
         }
     }
 
@@ -1070,17 +1150,22 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
     }
 
-    void CompleteWaiter(T item, Exception? exception)
+    // Retire an item that completes OUTSIDE the advance (an owned inline completion, a recovery
+    // substitute, a no-recovery fault, a shutdown bailout). Runs the retirement effects and fires
+    // the depth-0 idle signal.
+    void CompleteWaiter(T item, Exception? exception, long ownedTurn)
     {
-        if (CompleteWaiterDeferred(item, exception))
+        var reachedZero = CompleteWaiterDeferred(item, exception, ownedTurn);
+        if (reachedZero)
             _depthState.OnDepthReachedZero();
     }
 
-    /// Same as <see cref="CompleteWaiter"/> but skips the <see cref="DepthState.OnDepthReachedZero"/>
-    /// signal so the caller can defer it (returns true iff depth reached 0). Drain paths holding the
-    /// advancer latch or _activationLock use this: firing OnDepthReachedZero there would resume external
-    /// WaitForEmptyAsync awaiters while internal sync is still held. Defer until the drainer releases.
-    bool CompleteWaiterDeferred(T item, Exception? exception)
+    /// The retirement effects (the advance's Drive step): decrement depth, clear the depth-0 ActivatedItem
+    /// slot, release the reader turn, run the policy's CompleteItem. Skips the
+    /// <see cref="DepthState.OnDepthReachedZero"/> signal so the advancer can fire it once at its exit,
+    /// AFTER the count-0 publish (firing it mid-advance would resume external WaitForEmptyAsync awaiters
+    /// while the advance is still retiring). Returns true iff depth reached 0.
+    bool CompleteWaiterDeferred(T item, Exception? exception, long ownedTurn)
     {
         var depth = _depthState.DecrementDepth();
         // A negative depth means a double-decrement, which would feed garbage to the policy and let
@@ -1109,719 +1194,445 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         {
             SetActivatedItem(default!);
         }
-        // Release the activation turn: this item retired (its use of the policy's shared per-connection
-        // resource ended before its waiter task completed), so a deferred next activation may now be
-        // granted. Head-ordered retirement + one-live-activation makes an idempotent clear here correct.
-        Volatile.Write(ref _liveActivation, false);
-        DrainTrace.RecordItem(DrainTrace.Kind.Retire, item, depth, exception is null ? 0 : 1);
+        // Release the turn BY OWNER IDENTITY: the CAS-if-mine declines when this item never held it
+        // (a never-activated head, an unactivated inline completion), so the old owner-blind
+        // retire's whole "who may call me" discipline collapses into the identity comparison -
+        // a release can never clear a foreign owner's turn.
+        if (ownedTurn != WaiterStore<T>.TurnNone)
+            _waiters.ReleaseTurn(ownedTurn);
         _policy.CompleteItem(item, depth, exception);
         return depth is 0;
     }
 
-    /// Commits a waiter to the store and coordinates activation with the execution loop. The
-    /// store routes to the inline slot when empty (zero alloc), otherwise it escalates to the
-    /// SPSC queue (allocates queue + lock on first overlap). All call sites run on the executor's
-    /// logical thread, preserving the SPSC single-producer contract. The wired completion
-    /// callback dispatches on _waiters.IsEscalated at fire time (slot occupant -> DrainSlotInline,
-    /// queued or post-escalation moved-to-head -> DrainReadyWaiters).
-    void CommitWaiter(T item, bool activated, ValueTask waiterTask)
+    /// Commits a waiter to the store (INCREMENT-FIRST, the edge-lock protocol; LockedWalk.tla). All
+    /// call sites run on the executor's logical thread (the SPSC single-producer contract) with the
+    /// item's deferral already RESOLVED (consumed, or granted - never parked; the Debug guard bites).
+    /// prev==0 is THE EDGE: the item will be the sole head (the count is exact at zero), so this
+    /// committer owns the frontier - activate-before-publish (policy on a never-activated own item,
+    /// skipped when the task already completed: an own-token pre-publish read), the pre-publish
+    /// frontier attach, then lock { assign-or-inherit the turn, THEN publish - assign-first is a
+    /// hard in-hold ordering (LW2_pubfirst RED: the unlocked stop can see a published head before
+    /// its assign and double-grant) } and the acquire-or-FLAG arm (the deposit covers a
+    /// census-exiting holder whose exit never re-peeks after a pre-publish fire consumed the
+    /// carrier - LW2 wedge). prev>0 is MID-CHAIN: bare publish, no turn, no attach (the stop is the
+    /// frontier's mover), and a plain-read arm that never deposits (a mid-chain deposit would CAS +
+    /// force a serve once per pipelined item against a continuously-held license).
+    /// <paramref name="sentinelHeld"/>: the turn sentinel is (or is about to be) this item's - it
+    /// was activated on the executor strand or a census granted it; the edge lock inherits and
+    /// converts, and no policy call is owed here.
+    // The turn identity an executor-processed item holds at its inline completion / recovery: a
+    // same-strand self-act (TurnExec), or a census grant carrying the item's deferral gen (-gen),
+    // or none. `owned` is the reclaim result (activated, or won its own consume); !owned means a
+    // census granted this item, so its live turn is -gen and the completion must release exactly it.
+    static long ExecOwnedTurn(bool activated, bool owned, long gen)
+        => activated || !owned ? -gen : WaiterStore<T>.TurnNone;
+
+    void CommitWaiter(T item, bool sentinelHeld, bool own, long grantGen, ValueTask waiterTask)
     {
-        // Allocate the activation lock on first commit (slot or queue): the count==0 handoff
-        // serializes against the executor's deferred-publish + ClearExecutingItem fence-acquire,
-        // and deferred-publish kicks in for any subsequent iter once Count > 0. One small Lock
-        // allocation per Pipeline lifetime, amortized across all subsequent commits and runs.
-        _activationLock ??= new Lock();
+        Debug.Assert(!_waiters.ExecDeferredVisible, "Commit with this item's deferral still parked - resolve (consume or route) before committing.");
+        var prev = _waiters.IncrementCommitCount();
 
-        // Capture and wire while this commit still exclusively owns the task. Publication hands
-        // the pair to a store a concurrent drainer may claim and CONSUME at any moment, and
-        // consumption ends the task token's lifetime: the pooled promise behind it is re-rented
-        // by a later item, and any read of the stale token throws out of the pump. So the
-        // completion status is read once here, the callback is registered here, and after the
-        // publish below this method never touches waiterTask again - every later decision keys
-        // on store words. The deferral gate keeps a completion that lands between this
-        // registration and the publish from running its drain pass against a store that does not
-        // yet contain the item (the pass would consume the drain signal, and the count-gated
-        // conservation cannot restore at count zero); the post-publish replay runs it once the
-        // item is visible.
-        var wasCompletedAtCommit = waiterTask.IsCompleted;
-        if (!wasCompletedAtCommit)
+        if (prev == 0)
         {
-            Volatile.Write(ref _commitFireGate, CommitFireArmed);
-            waiterTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(_onWaiterTaskCompletedAction);
-        }
-
-        var count = _waiters.TryEscalateOrEnqueue(item, waiterTask, out _, out var slotWasMoved);
-        var wasEmpty = count is 1;
-        DrainTrace.RecordItem(DrainTrace.Kind.Commit, item, count, slotWasMoved ? 1 : 0);
-
-        // The atomic _executingItemActivationPending claim already happened in CommitTailWaiter /
-        // ClearExecutingItem. Just clear for hygiene and inline-activate if we're the head.
-        if (!activated)
-        {
-            _executingItemActivationPending = false;
-            SetExecutingItem(default!);
-
-            if (wasEmpty && !wasCompletedAtCommit)
+            // THE EDGE. Sole head guaranteed; the executor still owns the item and its token
+            // (unpublished), so the status read and the registration below are contract-clean.
+            if (!sentinelHeld && !waiterTask.IsCompleted)
             {
-                // Live-activation gate, serialized with the C-path under _activationLock: only self-activate
-                // the sole committed waiter if no reader is live. If one is (the executor's in-flight item
-                // was granted the turn via the C-path), leave this item committed and the advancer activates
-                // it in FIFO order (count>0 branch) when the live reader retires.
-                // NOTE: this gate looks redundant and is not. Deleting it reproduces the commit-vs-C-path
-                // double activation under soak. Do not remove it without a model-level witness of why it
-                // would be safe.
-                lock (_activationLock!)
-                {
-                    if (!_liveActivation)
-                    {
-                        // The captured verdict can be stale by now: the task may have completed and a
-                        // drainer already serving the store may have claimed and retired the item.
-                        // Activating a retiree grants a turn nothing will ever release, and the next
-                        // committed item strands on the closed gate. The spurious activation is
-                        // accepted (same cost as the D-path guards); the verify below detects the
-                        // retirement purely from store words and releases the grant. Task state is
-                        // deliberately NOT re-read - the token may already be consumed and recycled.
-                        DrainTrace.RecordItem(DrainTrace.Kind.CommitSelfAct, item);
-                        ActivateHeadItem(item, preferAsync: true);
-
-                        // Post-grant verify, store words only, in this order: count re-read zero (the
-                        // acquire that orders the taken probe behind the drain's fenced decrement),
-                        // then head taken. Under complete-before-decrement the conjunction proves the
-                        // item fully retired. Taken-but-counted is NOT a trip: that grant is transient
-                        // and the item's own drain releases it, and clearing the slot there would
-                        // stomp a live tenure. On a trip, release our own grant and clear the slot;
-                        // the drain's own clears are idempotent against ours, and no re-grant can
-                        // interleave because every granter serializes on this lock.
-                        if (_waiters.Count is 0 && _waiters.CommitHeadTaken())
-                        {
-                            DrainTrace.RecordItem(DrainTrace.Kind.CommitVerifyClear, item);
-                            SetActivatedItem(default!);
-                            Volatile.Write(ref _liveActivation, false);
-                        }
-                    }
-                    else
-                    {
-                        DrainTrace.RecordItem(DrainTrace.Kind.CommitGateSkip, item);
-                    }
-                }
+                // ACTIVATE-BEFORE-PUBLISH: a never-activated incomplete head needs its policy call,
+                // and here - pre-publication - it is exclusive by invisibility (the recovery
+                // double-activate CE killed the post-release placement). A completed-at-commit item
+                // needs no activation at all: the carrier and the arm drive its advance.
+                ActivateHeadItem(item, preferAsync: false);
             }
-        }
-
-        // Callback disposition, post-publish. A task completed at capture was never registered -
-        // run its pass now that the item is visible. Otherwise drain the deferral gate: a fire
-        // that landed in the registration-to-publish window was recorded instead of run, and the
-        // replay owns it here. Idle means no early fire - the callback runs on its own when the
-        // task completes, finding the item already visible.
-        if (wasCompletedAtCommit)
-            _onWaiterTaskCompletedAction();
-        else if (Interlocked.Exchange(ref _commitFireGate, CommitFireIdle) == CommitFireDeferred)
-            _onWaiterTaskCompletedAction();
-
-        // Compensation check for the slot drainer's chain arm: if our escalation's move raced
-        // the drainer's head peek, the drainer published its activation obligation instead of
-        // waiting out our two enqueue writes. We claim it exactly once via the flag Exchange
-        // against the drainer's one-shot re-peek, and decide on the completion verdict CAPTURED
-        // at the escalation claim - the moved pair is published at the queue head and a drain may
-        // consume its task at any moment, so no fresh read of it is legal here. A verdict gone
-        // stale (completed after the capture) costs one spurious activation whose turn the item's
-        // own drain releases; a completed moved head is drained, not activated - the nudge below
-        // picks it up.
-        if (slotWasMoved)
-        {
-            _waiters.TakeMovedSlotPair(out var movedItem, out var movedWasCompleted);
-            var claimed = Interlocked.Exchange(ref _pendingHeadActivation, false);
-            DrainTrace.RecordItem(DrainTrace.Kind.CommitMoved, movedItem, claimed ? 1 : 0, movedWasCompleted ? 1 : 0);
-            if (claimed && !movedWasCompleted)
+            // Sole head: no claim can run before our publish, so the ordinal read is stable.
+            var mySeq = _waiters.HeadSeq;
+            if (own && _waiters.TryAcquireIfFree())
             {
-                ActivateHeadItem(movedItem, preferAsync: true);
-            }
-        }
-
-        // During first escalation a slot callback can fire after the queue is published but
-        // before the slot contents are moved into it, bumping completedCount without finding
-        // anything to drain. Without this nudge the slot item would wait for the next callback
-        // fire, unbounded when the next item is a long-lived, long-running exclusive operation.
-        // Losing the acquire deposits the obligation on the holder (including a stale-verdict
-        // reclaim hold).
-        // Every commit checks, not just the escalation move: a set signal at commit time means
-        // a completed entry may be resident with its callback already spent, and committing
-        // threads are the one actor guaranteed to keep arriving while the pipeline is fed.
-        // Cost when the signal is clear: one volatile read.
-        if (Volatile.Read(ref _drainSignal))
-        {
-            var acquired = _advancing.TryAcquireOrFlagPending();
-            DrainTrace.RecordItem(DrainTrace.Kind.CommitNudge, item, acquired ? 1 : 0);
-            if (acquired)
-            {
-                if (_waiters.IsEscalated)
-                    DrainReadyWaiters();
-                else
-                    DrainSlotInline();
-            }
-        }
-    }
-
-    /// Called when a committed waiter's task completes. Dispatches to the drain matching the
-    /// store's tier at fire time: slot occupant (pre-escalation) -> DrainSlotInline; queued
-    /// entry, or a slot occupant whose contents were moved to queue head by a later
-    /// escalation, -> DrainReadyWaiters.
-    void OnWaiterTaskCompleted()
-    {
-        // Deferral gate: a fire landing while the owning commit is between its pre-publication
-        // registration and its publish is recorded and replayed by the commit once the item is
-        // visible (see CommitWaiter). Running the pass early would consume the drain signal
-        // against a store that does not yet contain the item, and the count-gated conservation
-        // cannot restore at count zero - the item would strand with its callback spent. The
-        // callback is shared across items, so this can also defer a PRIOR item's fire that lands
-        // in the window; the replayed pass drains every ready item, so the obligation is
-        // preserved, just coalesced.
-        if (Interlocked.CompareExchange(ref _commitFireGate, CommitFireDeferred, CommitFireArmed) == CommitFireArmed)
-        {
-            DrainTrace.Record(DrainTrace.Kind.CbDeferred);
-            return;
-        }
-
-        // Plain store: the acquire RMW below is the full fence that publishes it. The flag
-        // keeps the materializing-token role (gates the nudge and the reclaim); the lost-wake
-        // hole the flag alone could not close now lives in the latch word.
-        _drainSignal = true;
-        DrainTrace.Record(DrainTrace.Kind.CbFire, _waiters.IsEscalated ? 1 : 0);
-
-        // Try to become the advancer, only one thread processes completions at a time.
-        // Process even during shutdown: drain's wait-for-advancer-idle is what coordinates with
-        // us, and bailing out here would let drain "complete" the item via DrainOnCompletionAsync's
-        // queue sweep while the body's pipeline task is still running, stranding the item in a
-        // half-completed state (activated slot cleared but its body still reading).
-        if (!_advancing.TryAcquireOrFlagPending())
-        {
-            // Obligation deposited in the latch word; the holder's release serves it.
-            DrainTrace.Record(DrainTrace.Kind.CbBail);
-            return;
-        }
-        DrainTrace.Record(DrainTrace.Kind.CbAcq, _waiters.IsEscalated ? 1 : 0);
-
-        if (_waiters.IsEscalated)
-            DrainReadyWaiters();
-        else
-            DrainSlotInline();
-    }
-
-    /// Slot-mode drain. Advancer latch is held by the caller. CAS-claims the slot and processes
-    /// the (item, task). A concurrent escalation that won the CAS leaves nothing here to drain
-    /// and we re-route to the queue drain.
-    void DrainSlotInline()
-    {
-        while (true)
-        {
-        if (!_waiters.TryClaimSlotForDrain(out var item, out var task))
-        {
-            // Escalation got there first, and head of queue is our item now.
-            if (_waiters.IsEscalated)
-            {
-                DrainReadyWaiters();
+                // THE LICENSED OWN-EDGE COMMIT (LW2_licedge GREEN incl. EWalkBounded): hold the
+                // advance license across assign + publish + attach. No lock (LW2_noownedgelock:
+                // no census can exist for an owned item), no probe advance, no Dekker fence (RMWs
+                // on both sides), and the attach runs POST-publish safely - claims are license-
+                // serialized and we hold it, the same argument as the stop's attach. A completed
+                // task's inline fire (or any racing fire) DEPOSITS on us; the release-or-serve
+                // consumes it and we advance our own SOLE head only - the executor-advancer
+                // bound is the checked EWalkBounded invariant, not prose.
+                _waiters.AssignTurnAtCommit(grantGen, mySeq);
+                _waiters.PublishCommitted(item, waiterTask, out _);
+                RegisterAdvanceFire(waiterTask, mySeq);
+                if (_waiters.Release())
+                    Advance();
                 return;
             }
-            // Empty, a still-running occupant (tri-state peek bail), or claimed elsewhere.
-            // (No signal bookkeeping: a stale dirty flag costs one spurious reclaim check.)
-            var failServeDeposit = _advancing.ReleaseAndCheckPending();
-            SignalDrainWakeupIfWaiting();
-            // A deposit during our hold transfers the obligation here; re-enter the claim
-            // loop to serve it. Losing the re-acquire re-deposits on the winner.
-            var failReacquired = failServeDeposit && _advancing.TryAcquireOrFlagPending();
-            DrainTrace.Record(DrainTrace.Kind.SlotFailRel, failServeDeposit ? 1 : 0, failReacquired ? 1 : 0);
-            if (failReacquired)
+            // Contended (a census or a spurious probe holds the license) or census-raced (!own):
+            // the ARMED shape - frontier attach pre-publish (an inline fire bails on the phantom
+            // edge; the arm re-drives), assign+publish under the lock when a census can be
+            // mid-hold, then acquire-or-FLAG (the deposit is load-bearing here - the holder's
+            // exit consumes it).
+            RegisterAdvanceFire(waiterTask, mySeq);
+            if (own)
             {
-                continue;
-            }
-            return;
-        }
-        DrainTrace.RecordItem(DrainTrace.Kind.SlotClaim, item);
-
-        // Pass start: consume the signal (full fence orders the clear before this pass's
-        // reads). Completions that fire during the pass re-set it and the post-release
-        // recheck below catches them - the clear/fence/recheck gate.
-        Interlocked.Exchange(ref _drainSignal, false);
-
-        // Consume the waiter task BEFORE DecrementCount publishes the freed position to the
-        // executor's Count==0 inline-activation gate. The consume is the release point for
-        // per-item resources tied to the task (pooled/shared IValueTaskSource implementations
-        // reset in GetResult), and a successor dispatched the instant the count drops must
-        // find them released. The queue drain already orders this way (consume at the head,
-        // DecrementCount after processing): without it a successor could reuse a per-item shared
-        // resource before its release, surfacing an already-started fault.
-        Exception? taskException = null;
-        try
-        {
-            task.GetAwaiter().GetResult();
-        }
-        catch (Exception ex)
-        {
-            taskException = ex;
-        }
-
-        // Fault decision BEFORE the decrement, mirroring the queue drain. Decrementing first would
-        // publish the freed position mid-recovery: the executor's Count==0 inline-activation gate
-        // could dispatch a successor against the recovery's own activation (a second active reader),
-        // and the recovery rejoin's AdvanceAndDrain would decrement the SAME position again (a double
-        // decrement, which the -1 skew arm then misattributes to a counted successor).
-        bool emptyReached = false;
-        if (taskException is not null && !RecoverWaiter(item, taskException, out emptyReached))
-        {
-            // Recovery item taking over; the count still carries this position. The advancer
-            // flag stays held, and the recovery continuation decrements exactly once and
-            // re-runs the activation partition via AdvanceAndDrainRecovery's slot-mode rejoin.
-            return;
-        }
-
-        // Complete BEFORE Decrement. CompleteWaiterDeferred's _activatedItem clear is depth-gated
-        // (it only fires when this completion drains the pipeline to empty), so an intermediate
-        // completion cannot stomp a live successor in the first place. The depth-0 boundary case
-        // still needs this ordering: were the store count decremented first, the inline-activation
-        // gate (Count==0) could fire on another path - executor's deferred-publish branch, a
-        // successor commit's wasEmpty inline-activate - admitting a brand-new item and writing
-        // _activatedItem = NEW between our DecrementDepth-to-0 and the gated clear, which would then
-        // null NEW. NEW's body's first decoder read would see _activatedItem=null and NRE in
-        // CurrentExecutionControl. Running the complete (hence the clear) while the store count still
-        // carries this position keeps that gate shut until after the clear. Mirrors the recovery-fault
-        // path's Complete-before-Decrement ordering.
-        if (taskException is null)
-            emptyReached = CompleteWaiterDeferred(item, null);
-
-        // The skew floor and the at-or-below-zero partition rationale live in the store (see
-        // DecrementCount). No count==0 assertion: TryClaimSlotForDrain already emptied the
-        // slot, so a successor's commit can CAS into it (or first-escalate) before our decrement
-        // lands - the store's _hasSlot CAS is the ownership contract, not the count.
-        var ownsCPath = _waiters.DecrementCount();
-
-        ActivateNextAfterSlotAdvance(ownsCPath);
-
-        // Capture the deposit consumed by the release: a contended acquirer (a callback, the nudge)
-        // that bailed against this hold flagged the latch word. The obligation must be SERVED, not
-        // delegated to the flag - the slot drain's own claim cleared _drainSignal at consume time, so
-        // a deposit whose companion flag the claim ate would vanish if the reclaim below read only the
-        // flag (stranding the queue head). OR-ing the deposit into the reclaim gate carries the
-        // obligation past the flag's self-consumption.
-        var serveDeposit = _advancing.ReleaseAndCheckPending();
-        DrainTrace.Record(DrainTrace.Kind.SlotRel, serveDeposit ? 1 : 0, emptyReached ? 1 : 0);
-        // Signal AFTER advancer release: prevents a WaitForEmptyAsync awaiter from resuming and
-        // committing a new slot waiter whose callback would then race the still-held advancer
-        // (the callback's failed acquire deposits, costing the holder a serve pass).
-        if (emptyReached)
-            _depthState.OnDepthReachedZero();
-        SignalDrainWakeupIfWaiting();
-
-        // Serve a consumed deposit unconditionally. ReleaseAndCheckPending cleared the pending bit,
-        // so the obligation is ours and must not be gated on cancellation. During shutdown the drain
-        // never dequeues, so a dropped wake strands the waiter and hangs completion on Count > 0.
-        if (serveDeposit)
-        {
-            var serveReacquired = _advancing.TryAcquireOrFlagPending();
-            DrainTrace.Record(DrainTrace.Kind.SlotServeReacq, serveReacquired ? 1 : 0);
-            if (serveReacquired)
-            {
-                if (_waiters.IsEscalated)
-                {
-                    DrainReadyWaiters();
-                    return;
-                }
-                continue;
-            }
-            return;
-        }
-
-        // Dirty-flag reclaim: a successor's waiter that completed while we held the advancer set the
-        // signal from its callback, and without reclaim its activation is lost. A set signal in
-        // non-escalated slot mode means that waiter is the current slot occupant with a completed
-        // task, so looping back to the claim is safe. Gated off during shutdown, where the drain
-        // sweep owns completions and the deposit-serve above already covers any real bail.
-        var reclaimed = !_enumerator.CompletionToken.IsCancellationRequested
-            && Volatile.Read(ref _drainSignal)
-            && _advancing.TryAcquireOrFlagPending();
-        DrainTrace.Record(DrainTrace.Kind.SlotReclaim, reclaimed ? 1 : 0);
-        if (reclaimed)
-        {
-            if (_waiters.IsEscalated)
-            {
-                DrainReadyWaiters();
-                return;
-            }
-            continue;
-        }
-        return;
-        }
-    }
-
-    /// The slot-mode activation partition on a DecrementCount result, shared by
-    /// DrainSlotInline's advance path and the recovery rejoin (AdvanceAndDrain's slot branch).
-    /// Caller holds the advancer latch.
-    void ActivateNextAfterSlotAdvance(bool ownsCPath)
-    {
-        if (!ownsCPath)
-        {
-            // Slot-mode D-path, mirroring DrainReadyWaiters' D-path arm: the successor's
-            // commit-increment preceded our decrement, so that commit observed the claimed-but-
-            // uncounted position (wasEmpty false) and skipped self-activation - the partition
-            // designates us its activator. Without this arm both sides skip and the activation
-            // decision is lost (a hang with a null pending-activation control).
-            if (_waiters.TryPeekSlotForActivation(out var next, out var nextTask))
-            {
-                // Mirror CommitWaiter's guard: a completed-at-commit waiter is never
-                // activated - its callback already fired (and bailed against our held
-                // latch), so the post-release reclaim below drains it.
-                if (!nextTask.IsCompleted)
-                {
-                    DrainTrace.RecordItem(DrainTrace.Kind.SlotDPathAct, next);
-                    ActivateHeadItem(next, preferAsync: true);
-                }
-                else
-                {
-                    DrainTrace.RecordItem(DrainTrace.Kind.SlotDPathDone, next);
-                }
+                _waiters.AssignTurnAtCommit(grantGen, mySeq);
+                _waiters.PublishCommitted(item, waiterTask, out _);
             }
             else
             {
-                // A first escalation is (or was) relocating the head to the queue; hand the
-                // obligation to the escalating commit instead of waiting out its move.
-                // Publish the obligation, then re-peek ONCE: the flag ops are full fences,
-                // so an invisible head means the escalator's enqueue is not yet ordered
-                // before our peek - its compensation check (CommitWaiter, slotWasMoved) is
-                // still ahead and will claim the flag. A visible head means we claim our
-                // own flag back; whichever Exchange wins owns the activation, exactly once.
-                // No thread ever waits on another thread's progress.
-                Interlocked.Exchange(ref _pendingHeadActivation, true);
-                var headVisible = _waiters.TryPeek(out var head);
-                var claimedBack = headVisible && Interlocked.Exchange(ref _pendingHeadActivation, false);
-                DrainTrace.RecordItem(DrainTrace.Kind.SlotDPathPend, head.Waiter,
-                    claimedBack ? 1 : 0, headVisible && head.WaiterTask.IsCompleted ? 1 : 0);
-                if (claimedBack && !head.WaiterTask.IsCompleted)
-                {
-                    ActivateHeadItem(head.Waiter, preferAsync: true);
-                }
+                var edgeLock = _waiters.EdgeLock;
+                edgeLock.Enter();
+                _waiters.AssignTurnAtCommit(grantGen, mySeq);
+                _waiters.PublishCommitted(item, waiterTask, out _);
+                edgeLock.Exit();
             }
+            if (_waiters.TryAcquire())
+                Advance();
+            return;
         }
-        else
-        {
-            // Same lock-guarded claim+activate as DrainReadyWaiters' count==0 branch: the executor may
-            // have deferred-published a next item against our Count==1 read. If so, claim and activate
-            // under the lock so its ClearExecutingItem fence-acquire sees us done. Consume the publish
-            // ONLY at Count == 0: a successor that raised the count since our decrement observed count 1
-            // (wasEmpty) and self-activated, and its own drain continues the chain. Consuming here
-            // without activating would orphan the published item (slot mode has no recurring D-path to
-            // recover it). The Count-then-Exchange TOCTOU is benign: a commit's Exchange precedes its
-            // count increment, so whichever Exchange wins owns that item's activation exactly once.
-            // Pre-check outside the lock, an entry filter only: no publish pending means nothing to
-            // claim, so skip the lock acquire on the common no-publish drain. The read itself is an
-            // acquire load, fresh per drain. It writes nothing and skips nothing else; a stale-false
-            // read is rescued by the committer's own locked arm (the wasEmpty self-activate or the
-            // reclaim), which re-reads under its lock.
-            if (Volatile.Read(ref _executingItemActivationPending))
-            {
-                lock (_activationLock!)
-                {
-                    // Count is clamped, so == 0 also covers the -1 face (see DecrementCount): the
-                    // committer's own late increment returns wasEmpty false and its IsCompleted guard
-                    // skips, so without this arm both sides skip and the publish strands.
-                    if (_waiters.Count is 0 && Volatile.Read(ref _executingItemActivationPending))
-                    {
-                        // Claim is lock-serialized; the acquire load above orders the item read (see the
-                        // queue C-path). Plain clear.
-                        _executingItemActivationPending = false;
-                        var executing = _executingItem;
-                        DrainTrace.RecordItem(DrainTrace.Kind.SlotCPathAct, executing);
-                        // _executingItem stays populated: the main loop is concurrently about to call
-                        // _policy.ExecuteItemAsync(executing), which needs ExecutingItem for write-phase
-                        // gating. The next iteration overwrites or clears it naturally.
-                        ActivateHeadItem(executing, preferAsync: true);
-                    }
-                    else
-                    {
-                        DrainTrace.Record(DrainTrace.Kind.SlotCPathSkip, _waiters.Count,
-                            Volatile.Read(ref _executingItemActivationPending) ? 1 : 0);
-                    }
-                }
-            }
-        }
+
+        // MID-CHAIN: publish bare, then the certified committer arm - ACQUIRE-OR-FLAG (LW2
+        // ECommitWordRead; nocommitterarm DEADLOCKs, so the flag is load-bearing). A held license
+        // means an advancer is live: DEPOSIT, and its release-or-serve re-probes and drives this
+        // item - the hand-off is lossless BY CONSTRUCTION. Winning the acquire means no advancer is
+        // live (the prior one exited past our still-invisible increment via a phantom bail): we
+        // drive. Both outcomes are count-word CASes, and the publish is program-order-before them,
+        // so the CAS IS the StoreLoad fence - no separate barrier, and the earlier bare-read decline
+        // (which dropped the deposit and stranded a commit racing an exiting advancer - the iter-1800
+        // permanent-strand, a fidelity gap I introduced by "optimizing" the flag away) is gone.
+        //
+        // DOCTRINE NOTE (EWalkBounded): a win with Count > 1 advances a deep chain inline on the
+        // executor. That is a latency-doctrine relaxation, NOT a safety issue - losslessness first;
+        // dispatching the deep-win advance to the scheduler restores the bound without touching
+        // correctness and is the tracked follow-up.
+        _waiters.PublishCommitted(item, waiterTask, out _);
+        if (_waiters.TryAcquire())
+            Advance();
     }
 
-    /// The advancer loop: processes completed waiters from the head of the queue in order.
-    /// Only one thread runs this at a time, ensuring head-first processing and ordered completion.
-    /// Reachable only after a waiter was committed and escalated to the queue (slot-mode drains
-    /// route through DrainSlotInline), so _activationLock is non-null and _waiters.Queue
-    /// is non-null on every code path here.
-    void DrainReadyWaiters()
+    /// Register the fixed advance-fire trampoline on a task. IRREVOCABLE and at-most-once per task
+    /// tenure (a second OnCompleted on the production MRVTSC task throws) - callers are the two
+    /// frontier owners only: the edge committer (pre-publish, own token) and the stop
+    /// (license-held, gated by its own turn assign). An already-completed task invokes inline.
+    /// Arming precedes the registration: the inline-invoke case runs the fire (and its
+    /// delivery mark, which reads the armed word) inside the UnsafeOnCompleted call itself.
+    void RegisterAdvanceFire(ValueTask task, long seq)
     {
-        var emptyReached = false;
+        _waiters.ArmFire(seq);
+        task.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(_onAdvanceFire);
+    }
+
+    /// The fixed head-continuation trampoline (the advance-fire). A committed head's task completion invokes
+    /// this. Co-fire safety lives entirely on the ATTACH side, not here: TryAttachHead registers the
+    /// trampoline AT MOST ONCE per head-tenure ticket (a same-ticket rebind reads CellOnly and never
+    /// calls UnsafeOnCompleted again, which the production MRVTSC task would throw on), so two binds
+    /// on the same tenure (the arm's fallback bind and a granter's re-bind) never produce two live
+    /// trampolines to begin with. This fire is just the advance license's wake-protocol acquirer (the
+    /// latch, folded into the count word): acquire wins the advance, a loss DEPOSITS on the holder,
+    /// whose release-and-serve owns the redrive.
+    void OnAdvanceFire()
+    {
+        // Delivery mark FIRST: from this instant the completer's pair reads are behind us, so the
+        // armed head is safely claimable. Must precede the acquire-or-deposit - a losing deposit
+        // is consumed by a holder whose gate re-read is ordered after this write through the
+        // count-word RMW chain (our CAS after the write, its serve CAS after ours).
+        _waiters.MarkFireDelivered();
+        if (!_waiters.TryAcquire())
+        {
+            return;
+        }
+        Advance();
+    }
+
+    /// The advance chain: retires completed heads in FIFO order and, on reaching an incomplete head,
+    /// assigns it the turn, activates it, and registers the frontier trampoline so its completion
+    /// re-enters here (the advancer chains the single continuation forward, stop by stop). SINGLE
+    /// ADVANCER by the license. Entered by (a) a frontier fire (OnAdvanceFire), (b) a committer arm
+    /// (edge acquire-or-flag / mid-chain acquire-if-idle), or (c) a recovery continuation resuming
+    /// after retiring its substitute (ResumeAdvanceAfterRecovery).
+    ///
+    /// Model map (LockedWalk.tla): the claim+retire is AdvanceClaim's done arm; the incomplete head is
+    /// WalkStop (unlocked - the count partition); the peek-miss with count>0 is the PHANTOM EDGE
+    /// (WalkBailRelease + WalkRepeek: a committer between its increment and its publish - the
+    /// two-sided protocol's advancer side); the count==0 probe runs the locked census.
+    void Advance(bool emptyReached = false)
+    {
+        var holdsLicense = true;
         while (true)
         {
-            // Sub-pass start: consume the signal (full fence orders the clear before the pass's queue
-            // reads). Completions firing mid-pass re-set it and the do-while's post-release recheck
-            // catches them - the clear/fence/recheck gate.
-            Interlocked.Exchange(ref _drainSignal, false);
-            DrainTrace.Record(DrainTrace.Kind.QPass, _waiters.Count);
-            var drainedAny = false;
-
-            while (_waiters.TryPeek(out var item) && item.WaiterTask.IsCompleted)
+            // Claim the completed head out of the store (slot or queue - the store owns the FIFO
+            // ordering contract). Claims are license-serialized, which is the token-read exclusion:
+            // the claim's IsCompleted and the GetResult below can never race a rival consumer.
+            // The license does NOT cover the head's own completer, whose two-phase dispatch is
+            // mid-flight exactly when an armed head first turns claimable - the fire-delivery
+            // gate (fireDeliveryPending) is that exclusion; see the store's gate doc.
+            if (_waiters.TryClaimCompletedHead(out var claimedItem, out var claimedTask, out var claimedSeq, out var fireDeliveryPending))
             {
-                _waiters.TryDequeue(out _);
-                drainedAny = true;
-                DrainTrace.RecordItem(DrainTrace.Kind.QDrain, item.Waiter);
+                // The claimed tenure's ordinal, out of the SAME atomic operation that advanced
+                // _headTicket - not a separate LastClaimedSeq read afterward (see the 3-arg
+                // overload's own doc). The turn identity this retirement releases (the release is
+                // CAS-if-mine, so a head that never held the turn declines harmlessly).
 
-                // Process the completed waiter. The consume here already precedes this
-                // path's DecrementCount below - the queue drain has always had the
-                // consume-before-republish ordering (see DrainSlotInline).
-                var waiter = item.Waiter;
+                // Consume the task BEFORE DecrementCount so a successor dispatched the instant the count
+                // drops finds per-item resources (reset in GetResult) released. GetResult CONSUMES the
+                // token (the MRVTSC tenure contract): claimedTask is never touched again after this.
                 Exception? taskException = null;
                 try
                 {
-                    item.WaiterTask.GetAwaiter().GetResult();
+                    claimedTask.GetAwaiter().GetResult();
                 }
                 catch (Exception ex)
                 {
                     taskException = ex;
                 }
 
-                bool advance;
-                if (taskException is null)
+                if (taskException is not null)
                 {
-                    // Accumulate the idle signal across the do-while: depth can reach 0 mid-loop
-                    // (last drained item), but the OR captures it for after the final release.
-                    emptyReached |= CompleteWaiterDeferred(waiter, null);
-                    advance = true;
+                    if (!RecoverWaiter(claimedItem, taskException, claimedSeq, out var recEmpty))
+                        // Recovery substitute took over this position; its continuation resumes the advance
+                        // (ResumeAdvanceAfterRecovery) after retiring the substitute. The count credit stays.
+                        return;
+                    emptyReached |= recEmpty; // recovered inline (no substitute / sync-complete)
                 }
                 else
                 {
-                    advance = RecoverWaiter(waiter, taskException, out var recoveryEmpty);
-                    emptyReached |= recoveryEmpty;
+                    // Retirement effects (Drive): complete BEFORE decrement so the depth-0 ActivatedItem
+                    // clear runs while the store count still shuts the executor's Count==0 inline gate.
+                    emptyReached |= CompleteWaiterDeferred(claimedItem, null, ownedTurn: claimedSeq);
                 }
 
-                if (!advance)
-                {
-                    // Recovery item is occupying this pipeline position. The advancer flag stays
-                    // held. The recovery continuation will complete the item, advance via
-                    // AdvanceAndDrainRecovery, and release the flag (which signals any waiting drain).
-                    // The recovery continuation also fires the idle signal if applicable, so it is
-                    // safe to forget our local emptyReached here (cannot be true: depth hasn't yet
-                    // hit zero or we wouldn't be doing recovery).
-                    return;
-                }
-
-                // Advance: decrement queue count and take the activation-responsibility partition.
-                // The skew floor and the C-path-owns-the--1 rationale live in the store (see
-                // DecrementCount).
-                if (_waiters.DecrementCount())
-                {
-                    // Pre-check outside the lock, an entry filter only: no publish pending means
-                    // nothing to claim, so skip the lock acquire on the common no-publish drain and
-                    // let the pass continue (further head drains, then the conservation/release
-                    // tail). The read itself is an acquire load, fresh per pass (the decrement above
-                    // is a full fence). It writes nothing and skips nothing else; a stale-false read
-                    // is rescued by the committer's own locked arm (the wasEmpty self-activate or
-                    // the reclaim), which re-reads under its lock.
-                    if (Volatile.Read(ref _executingItemActivationPending))
-                    {
-                        // Last waiter drained. Hold the lock around claim+activate so the executor's
-                        // ClearExecutingItem fence-acquire blocks until ActivateHeadItem finishes.
-                        // Wrapping just the ActivateHeadItem call would leave a TOCTOU where the
-                        // executor observes the Exchange and acquires its fence-lock uncontested.
-                        lock (_activationLock!)
-                        {
-                            // The claim gates on the store being drained (Count is clamped, so `is 0` also
-                            // covers the -1 face - see DecrementCount). A successor committing between our
-                            // decrement and here reads non-zero, and the publish is the item we would have
-                            // claimed, whose own commit sees alreadyActivated and does not self-activate -
-                            // LEAVE it for the executor's CommitTailWaiter reclaim to activate;
-                            // consuming-then-clearing here would strand the activation (neither side
-                            // activates). The claim stays inside the lock so the executor's reclaim (which
-                            // enters the same lock) cannot race ActivateHeadItem.
-                            // Live-activation gate: only grant the turn if no activation is live (checked under
-                            // the same _activationLock CommitWaiter's wasEmpty self-activate takes, so the two
-                            // paths serialize). If one is live, leave the pending flag - its retirement clears
-                            // _liveActivation and this C-path re-fires in the same advancer pass.
-                            // Volatile.Read on the flag: claims are lock-serialized, but the executor's
-                            // publish is a lock-free release store (STLR) - the acquire load orders the
-                            // _executingItem read below after the flag observation (plain load-load can
-                            // speculate on ARM; control dependency does not order loads). The clear is
-                            // plain: claimants are lock-serialized and the executor-strand publishes
-                            // never race a cross-strand clear (clears here are observation-gated).
-                            if (_waiters.Count is 0 && !_liveActivation && Volatile.Read(ref _executingItemActivationPending))
-                            {
-                                // Peek-gated license: the count under-promises the store (a commit's enqueue
-                                // precedes its increment), so a completed-unactivated head can be resident at
-                                // count 0. Firing past it activates the publish out of FIFO order and the
-                                // resident head's retirement clear then releases a turn its retiree never
-                                // held. The peek is the residency truth, read fresh at the fire point under
-                                // the advancer latch (the licensed consumer). A decline leaves publish and
-                                // pending intact like the gate skip. This pass drains the resident head and
-                                // the C-path re-fires.
-                                if (!_waiters.TryPeek(out var resident))
-                                {
-                                    _executingItemActivationPending = false;
-                                    var executing = _executingItem;
-                                    DrainTrace.RecordItem(DrainTrace.Kind.QCPathAct, executing);
-                                    ActivateHeadItem(executing, preferAsync: true);
-                                }
-                                else
-                                {
-                                    DrainTrace.RecordItem(DrainTrace.Kind.QCPathPeekDecline, resident.Waiter);
-                                }
-                            }
-                            else
-                            {
-                                DrainTrace.Record(DrainTrace.Kind.QCPathSkip,
-                                    (_waiters.Count is 0 ? 0 : 2) + (_liveActivation ? 1 : 0),
-                                    Volatile.Read(ref _executingItemActivationPending) ? 1 : 0);
-                            }
-                        }
-                    }
-                }
-                else
-                {
-                    // More waiters remain, activate the next one (different item from _executingItem
-                    // so no executor-completion race, no activation lock needed). count > 0 implies a
-                    // peekable head (the count under-promises the queue, never over-promises), so the
-                    // failed peek is a canary, not a case.
-                    if (_waiters.TryPeek(out var nextItem))
-                    {
-                        // Completed-head guard, mirroring the slot D-path: a completed-at-commit head
-                        // is drain-only, and this pass's own next peek dequeues it. Best-effort
-                        // dispatch saver, not load-bearing. A stale not-completed read costs one
-                        // spurious activation whose turn the item's own drain promptly releases.
-                        if (!nextItem.WaiterTask.IsCompleted)
-                        {
-                            DrainTrace.RecordItem(DrainTrace.Kind.QDPathAct, nextItem.Waiter);
-                            ActivateHeadItem(nextItem.Waiter, preferAsync: true);
-                        }
-                        else
-                        {
-                            DrainTrace.RecordItem(DrainTrace.Kind.QDPathDone, nextItem.Waiter);
-                        }
-                    }
-                    else
-                        Debug.Assert(false, "count > 0 with no peekable queue head.");
-                }
+                if (AdvanceDecrement(ref emptyReached, out holdsLicense))
+                    continue; // a successor may exist: the top of the loop peeks and drives it uniformly.
+                break; // idle edge: AdvanceDecrement already resolved the license (held or released).
             }
 
-            // SIGNAL CONSERVATION, count-gated: a pass that consumed the signal and dequeued nothing
-            // did not satisfy it - the signaled work is still materializing (the escalation's slot-to-
-            // queue move, or a commit between its enqueue and its increment) and was truthfully
-            // invisible to our peeks. Destroying the token here would let every later rescue (the
-            // one-shot nudge, the reclaim) read FALSE and decline, stranding completion. Restore before
-            // the release: the release's full fence publishes it, and the materializer's own tail check
-            // finds the token. The count gate kills the dangling restore - with no entry resident there
-            // is no materializer left to owe a token to, and an unconditional restore fed a
-            // reclaim-retry livelock.
-            if (!drainedAny)
+            // A completed head whose registered advance-fire is undelivered: its completer is
+            // mid-dispatch, and retiring it here would consume/reset the tenure under the
+            // dispatcher's pair reads (the retire-vs-dispatch tear). Exit through the standard
+            // release tail - NOT the peek path, whose IsCompleted continue would spin on the gate.
+            // Lossless: the fire is guaranteed in flight, and its acquire-or-deposit against this
+            // advance's release-or-serve re-drives the walk once the delivery mark is visible.
+            if (fireDeliveryPending)
             {
-                var conserveCount = _waiters.Count;
-                DrainTrace.Record(DrainTrace.Kind.QConserve, conserveCount > 0 ? 1 : 0, conserveCount);
-                if (conserveCount > 0)
-                {
-                    _drainSignal = true;
-                }
-            }
-
-            // The release Exchange consumes a deposited obligation atomically with releasing: a
-            // contended acquirer (callback, nudge, a sibling reclaim) that lost against our hold
-            // flagged the latch word instead of spending a one-shot wake against a recheck that
-            // already ran - the two-location strand the plain latch + flag protocol could not close.
-            // Deposit set means we are obligated: re-acquire and run another pass. Losing the
-            // re-acquire re-deposits on the winner, whose own release then serves - obligation
-            // transfer, no kernel wait.
-            if (_advancing.ReleaseAndCheckPending())
-            {
-                var serveReacquired = _advancing.TryAcquireOrFlagPending();
-                DrainTrace.Record(DrainTrace.Kind.QRelServe, serveReacquired ? 1 : 0);
-                if (serveReacquired)
-                    continue;
                 break;
             }
-            DrainTrace.Record(DrainTrace.Kind.QRel);
 
-            // No deposit consumed: re-check for late signals. The sandwich argument (release
-            // fence before, TryReclaim's acquire fence after) licenses a plain read here;
-            // Volatile.Read defeats JIT hoisting.
-            var recheck = !_enumerator.CompletionToken.IsCancellationRequested
-                && Volatile.Read(ref _drainSignal);
-            DrainTrace.Record(DrainTrace.Kind.QRecheck, recheck ? 1 : 0);
-            if (!recheck || !TryReclaimAdvancerForWork())
+            // No completed head to claim.
+            if (_waiters.TryPeekHead(out var peekedItem, out var peekedTask))
+            {
+                // License-covered status read: claims are the only token consumers and we hold the
+                // license, so this can never land on a consumed token.
+                if (peekedTask.IsCompleted)
+                    continue; // completed since the claim miss: claim it inline.
+                // Incomplete resident head: THE STOP - the frontier moves here. Turn assignment is
+                // LOCK-FREE (the count partition: a resident head means count>=1, and every rival
+                // assigner is in the count==0 family; TLC-certified, stop UNLOCKED). A live turn
+                // means the head's own edge committer carried it (assign-first ordering: a published
+                // head's turn precedes its publish) - exit bare, its carrier fires the advance.
+                if (_waiters.Turn == WaiterStore<T>.TurnNone)
+                {
+                    var headSeq = _waiters.HeadSeq;
+                    _waiters.AssignTurnAtStop(headSeq);
+                    ActivateHeadItem(peekedItem, preferAsync: true);
+                    // The frontier attach: license-held, once per tenure (gated by the None->assign
+                    // above - a second stop on this head sees the live turn and exits).
+                    RegisterAdvanceFire(peekedTask, headSeq);
+                }
                 break;
+            }
+
+            // Peek miss. count>0 = the PHANTOM EDGE: a committer counted but has not published yet
+            // (increment-first over-promises). ONE still-licensed re-peek before giving up the
+            // license at all: TryPeekHead's queue leg is a mutating consumer-side operation on the
+            // SPSC queue (refreshes _lastCopy, hops _head on the slow path), not a pure read - the
+            // queue's contract is single-consumer, peeks included. A prior release-then-repeek shape
+            // touched it AFTER releasing the license, making this thread a second, unlicensed
+            // consumer for the duration of that touch - unsafe by construction regardless of whether
+            // a live overlap is ever caught. Holding the license one extra peek costs nothing: a
+            // depositor's claim is never lost regardless of how long the current holder holds it.
+            if (_waiters.Count > 0)
+            {
+                if (_waiters.TryPeekHead(out _, out _))
+                {
+                    continue; // still licensed throughout - the publish landed, re-probe from the top.
+                }
+                if (_waiters.Release())
+                    continue; // a deposit landed during this hold: kept the license, re-probe.
+                holdsLicense = false;
+                break; // still invisible after both checks: the committer's own arm covers it.
+            }
+
+            // count==0 idle probe (a fire landed on an already-drained store): run the census - a
+            // deferral may be parked with no other driver.
+            RunIdleCensus();
+            break;
         }
 
-        // Signal AFTER advancer release for the same reason as DrainSlotInline (external awaiter
-        // must not resume while internal sync is still held).
+        // Every stop above either already resolved the license (the idle edge inside AdvanceDecrement, or
+        // the phantom bail) or still holds it here - releasing it is this advance's own tail, the point
+        // a rival fire can acquire and advance.
+        if (AdvanceExit(emptyReached, releaseLicense: holdsLicense))
+            Advance(emptyReached);
+    }
+
+    /// Decrement the store count. Returns true to keep looping (a successor may exist, resolved fresh
+    /// at the top of Advance's loop), false to stop (the idle edge, already resolved below). DecrementCount
+    /// is THE quiescence-visible publish and the LAST run-scoped write on the idle-edge path (the
+    /// exit-ordering discipline): at the idle edge the advancer touches only the postdecr exec grant and
+    /// then nothing else, so a teardown observer seeing count==0 is guaranteed the advancer will not touch
+    /// reset run-scoped state.
+    bool AdvanceDecrement(ref bool emptyReached, out bool holdsLicense)
+    {
+        // License state is EXPLICIT, never inferred from the signal flags: the idle-edge paths
+        // release (in the edge CAS, or after the licensed census) and exit unlicensed; every
+        // other stop still holds. Conflating this with emptyReached wedged the license held
+        // forever after any serve (every subsequent fire deposited into a dead hold).
+        holdsLicense = true;
+        // The fold's decrement split (the DepositCount law): mid-advance, the advancer's count view is a
+        // LOWER bound (commits only raise it; we are the only decrementer), so view > 1 proves the
+        // edge is unreachable and the wait-free XADD stays. At the edge the decrement, the license
+        // release, and the deposit consume are ONE CAS: no deposit -> the license drops HERE and
+        // the idle-edge granters below run license-free; a deposit -> consume it, KEEP the license,
+        // and re-probe after the granters (the serve never lets the license go).
+        bool idle, serve = false;
+        if (_waiters.Count > 1)
+            idle = _waiters.DecrementCount();
+        else
+            idle = _waiters.DecrementCountAtEdge(out serve);
+        if (!idle)
+            return true; // a successor exists (count under-promises the store, never over-promises).
+        // Idle edge: this decrement drained the count to zero. The census runs HERE - after the
+        // decrement (the executor race-back Dekker closes: our decrement is the write its count-read
+        // observes), LICENSED (the serve arm kept the license at the edge CAS; the released arm
+        // re-acquires or flags, and the flag is complete coverage: the holder's serve re-probes and
+        // ends at its OWN idle edge). The license is what orders the census's activation before any
+        // advance claim can retire the granted item (the deleted rendezvous's happens-before). There is
+        // NO resident granter and NO edge pin: the deferral grant is the census's whole job
+        // (FoldedWalk probe-proved the resident granter redundant; the stale-edge/corpse-grant
+        // machinery guarded generations that no longer exist).
+        emptyReached = true;
+        if (!serve && !_waiters.TryAcquire())
+        {
+            // Deposited on a live holder: its eventual edge census covers the grant.
+            holdsLicense = false;
+            return false;
+        }
+        RunIdleCensus();
+        if (serve)
+            return true; // the edge CAS consumed a deposit: licensed re-probe from the top.
+        // Census done under the re-acquired license: release it - a deposit that landed during
+        // the census re-probes (nothing between the census and this release can be dropped);
+        // a clean release exits unlicensed.
+        if (_waiters.Release())
+            return true;
+        holdsLicense = false;
+        return false;
+    }
+
+    /// The exit tail (runs on every advance stop). The DecrementCount that published quiescence was the last
+    /// run-scoped write; these two signals are the only post-exit actions and read no run-scoped state
+    /// that teardown resets. The depth-0 idle signal is fired here (after the count publish) so an
+    /// external WaitForEmptyAsync awaiter never resumes mid-advance; the teardown wake re-checks count.
+    /// Returns TRUE when the license release consumed a deposit: the caller re-enters the advance
+    /// (the serve keeps the license). The idle-edge path releases inside its decrement CAS and
+    /// passes releaseLicense: false.
+    bool AdvanceExit(bool emptyReached, bool releaseLicense = false)
+    {
         if (emptyReached)
             _depthState.OnDepthReachedZero();
         SignalDrainWakeupIfWaiting();
-
-        // Re-acquire the advancer latch and check for a ready waiter. Returns true with the
-        // latch held if the pass should continue, false otherwise. TryPeek MUST run inside the
-        // latch's protection so the SPSC single-consumer contract on _waiters holds against a
-        // racing OnWaiterTaskCompleted caller.
-        bool TryReclaimAdvancerForWork()
-        {
-            // The transient hold had a strand: a callback's one-shot wake bailed against the hold
-            // while the miss path below released with no post-release rendezvous - signal set, latch
-            // free, completed entry resident, nobody left. The pending word closes it: a bail against
-            // this hold deposits in the latch word, and the miss release reads the deposit atomically
-            // with releasing and serves.
-            if (!_advancing.TryAcquireOrFlagPending())
-            {
-                // Obligation deposited on the winner; its release serves.
-                DrainTrace.Record(DrainTrace.Kind.QReclaimBail);
-                return false;
-            }
-
-            if (_waiters.TryPeek(out var pending) && pending.WaiterTask.IsCompleted)
-            {
-                DrainTrace.RecordItem(DrainTrace.Kind.QReclaimHit, pending.Waiter);
-                return true;
-            }
-
-            // Bounded stale-view retry: this reclaim is the last reader of the signal that
-            // brought it here, and a completed head invisible to this exact peek would strand
-            // forever (its callback is spent). A genuine miss re-misses instantly, a stale view
-            // has a beat to converge. The commit-side nudge covers the fed pipeline, this covers
-            // a quiescent tail.
-            if (_waiters.Count > 0)
-            {
-                var spinner = new SpinWait();
-                for (var attempt = 0; attempt < 4; attempt++)
-                {
-                    spinner.SpinOnce();
-                    if (_waiters.TryPeek(out pending) && pending.WaiterTask.IsCompleted)
-                    {
-                        DrainTrace.RecordItem(DrainTrace.Kind.QReclaimHit, pending.Waiter, 1);
-                        return true;
-                    }
-                }
-            }
-
-            if (_advancing.ReleaseAndCheckPending())
-            {
-                // A bail landed against our transient hold after the peek's verdict went
-                // stale. Re-acquire and continue the pass; losing re-deposits on the winner.
-                var reacquired = _advancing.TryAcquireOrFlagPending();
-                DrainTrace.Record(DrainTrace.Kind.QReclaimMiss, 1, reacquired ? 1 : 0);
-                return reacquired;
-            }
-            DrainTrace.Record(DrainTrace.Kind.QReclaimMiss);
-            return false;
-        }
+        // The license release is LAST (after the signals): the release is the point a rival fire can
+        // acquire and advance, and everything above is this advance's own tail.
+        return releaseLicense && _waiters.Release();
     }
 
-    /// Returns true if the advancer should continue (recovery completed or no recovery),
-    /// false if recovery is occupying this pipeline position (advancer must stop, recovery will resume knowing it held the advancer flag).
-    /// <paramref name="emptyReached"/> propagates the deferred-empty signal up to the drain caller
-    /// on the sync return-true paths so it fires after the advancer release. The async return-false
-    /// path now fires the depth-0 signal on EVERY branch: deferred completions thread emptyReached to
-    /// AdvanceAndDrainRecovery(emptyReached) (fires after the advancer release); the inline
-    /// CompleteRecoveryWaiter branches fire OnDepthReachedZero inline. (A queue-count reclaim window
-    /// remains benign - DrainReadyWaiters' do-while reclaim catches stranded counts downstream - but
-    /// the depth-0 idle signal is no longer among the things that can strand.)
+    /// The locked idle-edge census (license-held). The one cross-thread race the edge lock exists
+    /// for: the census's take+assign vs the executor's cnt==0 self-assigns. VERSION-PINNED CAPTURE:
+    /// the granted item comes from the deferral itself (TryCensusConsumeDeferred), read under the
+    /// generation pin, so it is EXACTLY the consumed deferral's item. Capture-before-take (reading
+    /// _executingItem before the consume) was unsound - a suspended census could consume a RECYCLED
+    /// deferral while granting the stale captured item, activating it after its own retirement (the
+    /// NoTwoItemsActivatedConcurrently collision, iter-7). The pin declines a recycle instead of
+    /// granting stale; the executor's own reclaim covers the deferral the census declined. The
+    /// policy call runs OUTSIDE the hold, under the license: if the granted item's completion races
+    /// this activation, the reclaim loser routes it through the store, whose claim needs the license
+    /// we hold - activation-before-retire by license ordering.
+    void RunIdleCensus()
+    {
+        if (!_waiters.ExecDeferredVisible)
+        {
+            return;
+        }
+        T captured = default!;
+        var censusLock = _waiters.EdgeLock;
+        censusLock.Enter();
+        // PEEK the deferral's gen, FAIL-IF-LIVE claim the turn as -gen (IDENTITY-TAGGED so a
+        // committing item inherits only its own census grant - the iter-83 steal fix), then
+        // GEN-PIN the consume to that exact deferral. Both the Count==0 idle-edge decision and the
+        // turn can be STALE by now (the executor commits + self-acts lock-free); the turn CAS is
+        // the authority (a live turn - a resident's ordinal, TurnExec, or another -g - declines),
+        // and the gen-pinned consume declines a recycled deferral (the stale edge), releasing -gen.
+        var granted = false;
+        var grantGen = 0L; // only ever read below once granted is true, which proves it was assigned
+        if (_waiters.Count == 0 && _waiters.TryPeekExecDeferred(out grantGen, out captured)
+            && _waiters.TryClaimTurnGrant(grantGen))
+        {
+            granted = _waiters.TryConsumeExecDeferredGen(grantGen);
+            if (!granted)
+            {
+                _waiters.ReleaseTurn(-grantGen);
+                captured = default!;
+            }
+        }
+        censusLock.Exit();
+        if (!granted)
+        {
+            return;
+        }
+        ActivateHeadItem(captured, preferAsync: true);
+        // Stamp AFTER the policy call returns, not before: a recovery that lost this exact gen's
+        // consume (Pipeline.cs's RecoverItem/RecoverTrailingFailure) waits on this stamp specifically
+        // so it never proceeds to activate its own substitute before this call has actually returned -
+        // that ordering, not vacuity, is what makes the substitute's activation safe.
+        _waiters.RecordCensusResolved(grantGen);
+    }
+
+    /// Spins until the census that won <paramref name="gen"/>'s grant has returned from its
+    /// ActivateHeadItem call (WaiterStore.IsCensusResolved). Called only after a recovery's own
+    /// TryConsumeExecDeferred(gen) has already lost - that loss proves a census's gen-pinned consume
+    /// of exactly this gen succeeded, so the stamp for it is at most one synchronous policy call
+    /// away and this is expected to resolve near-instantly, never on a gen nothing claimed. The
+    /// cancellation check exists purely so a shutdown race can't turn this into a permanent park (see
+    /// the park-point inventory) - on cancellation this returns without the stamp necessarily having
+    /// landed, matching every other shutdown branch in this file that favors not hanging over strict
+    /// ordering once the pipeline is tearing down anyway.
+    void WaitForCensusResolution(long gen, CancellationToken cancellationToken)
+    {
+        var spin = new SpinWait();
+        while (!_waiters.IsCensusResolved(gen) && !cancellationToken.IsCancellationRequested)
+            spin.SpinOnce();
+    }
+
+    /// Resume the advance from a recovery continuation that has just retired its substitute
+    /// (CompleteRecoveryWaiter ran the effects). The recovery held this position's count credit, so
+    /// resume at DecrementCount (AdvanceDecrement) and continue retiring or exit.
+    void ResumeAdvanceAfterRecovery(bool emptyReached = false)
+    {
+        // The recovery episode held the advance license across the substitute (the license is
+        // episode-affine, not thread-affine); resume under it and release through the normal exits.
+        if (AdvanceDecrement(ref emptyReached, out var holdsLicense))
+            Advance(emptyReached);
+        else if (AdvanceExit(emptyReached, releaseLicense: holdsLicense))
+            Advance(emptyReached);
+    }
+
+    /// Returns true if the advance should continue (recovery completed inline, or no recovery), false if a
+    /// recovery substitute is occupying this pipeline position (the advance stops; the recovery continuation
+    /// resumes it via ResumeAdvanceAfterRecovery after retiring the substitute).
+    /// <paramref name="emptyReached"/> propagates the deferred depth-0 signal up to the advance on the sync
+    /// return-true paths so it fires at the advance's exit. The async return-false path fires the depth-0
+    /// signal on EVERY branch: deferred completions thread emptyReached to ResumeAdvanceAfterRecovery
+    /// (fires at the advance exit); the inline CompleteRecoveryWaiter branches fire OnDepthReachedZero inline.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    // The caller consumed the waiter task (the consume-before-republish ordering, see
-    // DrainSlotInline) and hands over the extracted exception.
-    bool RecoverWaiter(T failedItem, Exception ex, out bool emptyReached)
+    // The caller consumed the waiter task (the consume-before-decrement ordering, see Advance) and hands
+    // over the extracted exception.
+    bool RecoverWaiter(T failedItem, Exception ex, long claimedSeq, out bool emptyReached)
     {
         emptyReached = false;
 
@@ -1830,46 +1641,55 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
         // real fault - recovery is the cleanup of last resort, its own failure means the wire
         // is gone and there is nothing a policy could substitute. This is what entitles
         // policies to assert they are never consulted about their own recovery items.
+        // Turn release is identity-CAS'd on the claimed ordinal: declines when this head never
+        // held it.
         if (ex is Pipeline.RecoveryItemFaultException recoveryFault)
         {
-            emptyReached = CompleteWaiterDeferred(failedItem, recoveryFault.InnerException);
+            emptyReached = CompleteWaiterDeferred(failedItem, recoveryFault.InnerException, ownedTurn: claimedSeq);
             return true;
         }
 
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.PipelineTaskWaiter, ex);
         if (!_policy.TryRecoverItemFailure(context, failedItem, _enumerator.CompletionToken, out var recoveryItem))
         {
-            emptyReached = CompleteWaiterDeferred(failedItem, ex);
+            emptyReached = CompleteWaiterDeferred(failedItem, ex, ownedTurn: claimedSeq);
             return true;
         }
 
-        // Recovery item takes over, activate it at the current pipeline position. Ungated and
-        // in place, deliberately: the substitution transfers the drained waiter's turn, and this
-        // position still holds its count credit, so no commit can read wasEmpty and self-activate
-        // concurrently. NOTE: do not add the activation gate here - the in-place activation is
-        // load-bearing for liveness. A gate-skip would park this position's turn on the dead
-        // predecessor while the substitute enqueues behind a head that never advances, wedging
-        // the gate, the substitute, and the drain in a cycle none of them can break.
-        ActivateHeadItem(recoveryItem);
+        // Recovery item takes over, activate it at the current pipeline position, IN PLACE - this
+        // position still holds its count credit, so no commit can read prev==0 and self-activate
+        // concurrently, and the census is count-gated away (the credit means count>=1) - which is
+        // why this placement needs NO lock (LW2_nolockrecwalk GREEN, full-space). NOTE: do not add
+        // a count gate here - the in-place activation is load-bearing for liveness. A gate-skip
+        // would park this position's turn on the dead predecessor while the substitute enqueues
+        // behind a head that never advances, wedging the gate, the substitute, and the drain in a
+        // cycle none of them can break.
+        // The turn transfers with the position: inherit-or-assign on the claimed ordinal (the old
+        // spin-until-claimable dies - there is no transient rival left to wait out; the exiting
+        // advancer's idle-edge claim was gen machinery). The substitute's completion releases it by
+        // the same identity.
+        _waiters.AssignTurnAtRecovery(claimedSeq);
+        ActivateHeadItem(recoveryItem, preferAsync: true);
+        _waiterRecoverySeq = claimedSeq;
 
         ValueTask<PipelineItemResult> executeTask;
         try
         {
-            // waiterExecution: this is the waiter-drain recovery (RecoverWaiter off the advancer chain
+            // waiterExecution: this is the waiter-drain recovery (RecoverWaiter off the advance chain
             // via OnWaiterTaskCompleted). It can run on a non-pump thread, concurrently with the
             // executor's own next dispatch, so a policy must not share single-pump per-dispatch state.
             executeTask = _policy.ExecuteItemAsync(recoveryItem, waiterExecution: true, _enumerator.CompletionToken);
         }
         catch (Exception recoveryEx)
         {
-            emptyReached = CompleteWaiterDeferred(recoveryItem, recoveryEx);
+            emptyReached = CompleteWaiterDeferred(recoveryItem, recoveryEx, ownedTurn: claimedSeq);
             return true;
         }
 
         // Publish the recovery item so the bailout path can complete it on shutdown.
         // The recovery continuation always completes this item itself (via CompleteRecoveryWaiter
         // on the normal path or BailoutRecoveryOnShutdown on shutdown), so no atomic claim race
-        // with drain is needed, drain just waits for the advancer chain to quiesce.
+        // with teardown is needed; teardown just waits for the advance to drain.
         _waiterRecoveryItem = recoveryItem;
 
         if (executeTask.IsCompletedSuccessfully)
@@ -1877,7 +1697,8 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return RecoverWaiterResult(recoveryItem, executeTask.Result, out emptyReached);
         }
 
-        // Execute is async, hook continuation. Advancer stops, continuation owns the flag.
+        // Execute is async, hook continuation. The advance stops here; the continuation owns the position's
+        // count credit and settles it exactly once (ResumeAdvanceAfterRecovery or the shutdown bailout).
         executeTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
         {
             // Bailout: wake signal completed while recovery's executeTask was in flight.
@@ -1897,14 +1718,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             catch (Exception recoveryEx)
             {
                 CompleteRecoveryWaiter(recoveryItem, recoveryEx);
-                AdvanceAndDrainRecovery();
+                ResumeAdvanceAfterRecovery();
                 return;
             }
 
             if (!RecoverWaiterResult(recoveryItem, result, out var emptyReached))
                 return; // pipeline task pending, continuation will resume
 
-            AdvanceAndDrainRecovery(emptyReached);
+            ResumeAdvanceAfterRecovery(emptyReached);
         });
         return false;
     }
@@ -1913,7 +1734,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// false if the recovery's pipeline task is pending (occupying this position).
     /// <paramref name="emptyReached"/> propagates the deferred-empty signal on the sync return-true
     /// paths. The async continuation paths (RecoverWaiter / the trailing continuation) now capture this
-    /// out-param and pass it to AdvanceAndDrainRecovery(emptyReached), which fires OnDepthReachedZero
+    /// out-param and pass it to ResumeAdvanceAfterRecovery(emptyReached), which fires OnDepthReachedZero
     /// after the advancer release - so a recovery that retires the last in-flight item no longer drops
     /// the depth-0 idle signal (which previously hung a parked WaitForEmptyAsync).
     bool RecoverWaiterResult(T recoveryItem, PipelineItemResult result, out bool emptyReached)
@@ -1950,14 +1771,14 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     if (trailingEx is not null)
                     {
                         CompleteRecoveryWaiter(recoveryItem, trailingEx);
-                        AdvanceAndDrainRecovery();
+                        ResumeAdvanceAfterRecovery();
                         return;
                     }
 
                     if (!RecoverWaiterPipelineTask(recoveryItem, pipelineTask, out var emptyReached))
-                        return; // pipeline task pending, lock still held
+                        return; // pipeline task pending, its continuation owns the count credit
 
-                    AdvanceAndDrainRecovery(emptyReached);
+                    ResumeAdvanceAfterRecovery(emptyReached);
                 });
                 return false;
             }
@@ -1968,7 +1789,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// Handles the recovery item's pipeline task. Returns true if done, false if pending.
     /// <paramref name="emptyReached"/> propagates the deferred-empty signal to the caller on the sync
-    /// return-true path; callers capture it and pass it to AdvanceAndDrainRecovery (fires
+    /// return-true path; callers capture it and pass it to ResumeAdvanceAfterRecovery (fires
     /// OnDepthReachedZero after the advancer release). The async return-false path completes via the
     /// NON-deferred CompleteRecoveryWaiter inside its own continuation, which fires OnDepthReachedZero
     /// inline - so the depth-0 signal is delivered on every path.
@@ -1990,7 +1811,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             return true;
         }
 
-        // Pipeline task pending, hook continuation. Advancer stays held.
+        // Pipeline task pending, hook continuation. The count credit stays with the continuation.
         pipelineTask.ConfigureAwait(false).GetAwaiter().UnsafeOnCompleted(() =>
         {
             Exception? pipelineException = null;
@@ -2010,55 +1831,31 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
 
             CompleteRecoveryWaiter(recoveryItem, pipelineException);
-            AdvanceAndDrainRecovery();
+            ResumeAdvanceAfterRecovery();
         });
         return false;
     }
 
-    /// Shared shutdown bailout for recovery continuations. Completes the recovery item with the
-    /// shutdown exception, releases _advancing, and signals any drain waiting for the advancer
-    /// chain to quiesce. The continuation always owns completion (no Exchange race with drain)
-    /// because drain only waits for advancer-idle and does not compete for the recovery item.
+    /// Shared shutdown bailout for recovery continuations. Completes the recovery item with the shutdown
+    /// exception, settles its count credit, and signals teardown. The continuation always owns completion
+    /// (no race with teardown) because teardown only waits for the advance to drain and does not compete for
+    /// the recovery item.
     void BailoutRecoveryOnShutdown()
     {
         var recoveryItem = _waiterRecoveryItem;
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _waiterRecoveryItem = default!;
-        CompleteWaiter(recoveryItem, _completionException);
+        CompleteWaiter(recoveryItem, _completionException, ownedTurn: _waiterRecoverySeq);
         // The recovery park holds its position's count credit (the fault decision precedes the
-        // decrement in both drains). Every park resolution settles it exactly once: the sync advance
-        // paths decrement in their drain loop, the normal continuation decrements via AdvanceAndDrain,
-        // and this bailout settles it here - without it the credit strands and DrainOnCompletionAsync's
-        // count wait never falls to zero.
-        // Partition result deliberately unused: this bailout only settles the count credit; no
-        // activation follows (completion ownership transfers to the shutdown sweep below).
+        // decrement in the advance). Every park resolution settles it exactly once: the advance decrements in
+        // its loop, the normal continuation decrements via ResumeAdvanceAfterRecovery, and this bailout
+        // settles it here - without it the credit strands and DrainOnCompletionAsync's count wait never
+        // falls to zero. No activation follows (completion ownership is the shutdown sweep's).
         _ = _waiters.DecrementCount();
-        // Shutdown bailout: a deposit consumed here is deliberately dropped - completion
-        // ownership has transferred to DrainOnCompletionAsync's queue sweep, which waits on
-        // advancer-idle (signaled below) and sweeps without consulting the signal flag.
-        _advancing.ReleaseAndCheckPending();
         SignalDrainWakeupIfWaiting();
     }
 
-    /// Called from recovery continuations to continue advancer activity after the recovery item
-    /// completion. Delegates to AdvanceAndDrain whose loop exit signals the advancer-idle TCS.
-    ///
-    /// <paramref name="emptyReached"/> carries the depth-0 crossing that happened INSIDE this
-    /// continuation's CompleteRecoveryWaiterDeferred (the deferred variant decremented depth to 0 but
-    /// did not fire OnDepthReachedZero - the continuation must). AdvanceAndDrain's own drain loops only
-    /// fire off a freshly-accumulated local emptyReached (from draining ANOTHER waiter); when this
-    /// recovery item was the LAST in-flight item there is nothing more to drain, so that local stays
-    /// false and the zero-crossing would be lost - hanging a parked WaitForEmptyAsync. Fire it here,
-    /// AFTER AdvanceAndDrain returns (the advancer is released by then, so the ordering matches the
-    /// deferred contract: never fire OnDepthReachedZero while the advancer is held).
-    void AdvanceAndDrainRecovery(bool emptyReached = false)
-    {
-        AdvanceAndDrain();
-        if (emptyReached)
-            _depthState.OnDepthReachedZero();
-    }
-
-    /// Signals any drain that's waiting for the advancer chain to quiesce. Null check is the
+    /// Signals any teardown that's waiting for the advance to drain. Null check is the
     /// common case (no one waiting), only allocates a Volatile.Read + null compare.
     /// Ordering: no hardware fence is required, cache coherence delivers the write eventually
     /// on any target. The only real requirement is to stop the JIT from hoisting or caching the
@@ -2071,92 +1868,25 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// Completes the recovery item on the normal (non-shutdown) recovery path. The continuation
     /// owns completion uncontested. Drain (DrainOnCompletionAsync) only waits for the advancer
-    /// chain to quiesce via AdvanceAndDrainRecovery's loop-exit signal.
+    /// advance to drain via ResumeAdvanceAfterRecovery's exit signal.
     void CompleteRecoveryWaiter(T recoveryItem, Exception? exception)
     {
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _waiterRecoveryItem = default!;
-        CompleteWaiter(recoveryItem, exception);
+        CompleteWaiter(recoveryItem, exception, ownedTurn: _waiterRecoverySeq);
     }
 
     /// <see cref="CompleteRecoveryWaiter"/> variant that returns the deferred-empty signal so the
     /// caller can fire <see cref="DepthState.OnDepthReachedZero"/> after releasing the advancer.
     /// Used by the sync recovery chain (<see cref="RecoverWaiter"/>, <see cref="RecoverWaiterResult"/>,
     /// <see cref="RecoverWaiterPipelineTask"/>) to avoid the same stranding window the slot drain fix
-    /// closed: signalling OnDepthReachedZero while the drain caller still holds the advancer would
-    /// let a WaitForEmptyAsync awaiter resume and commit a follow-up slot waiter whose callback
-    /// would bail on TryAcquire.
+    /// closed: signalling OnDepthReachedZero mid-advance would let a WaitForEmptyAsync awaiter resume and
+    /// observe a transient empty while the advance is still retiring. Fire it at the advance's exit instead.
     bool CompleteRecoveryWaiterDeferred(T recoveryItem, Exception? exception)
     {
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _waiterRecoveryItem = default!;
-        return CompleteWaiterDeferred(recoveryItem, exception);
-    }
-
-    /// Decrements waiter count, activates the next item, and resumes draining.
-    /// Must only be called when the advancer flag is held.
-    void AdvanceAndDrain()
-    {
-        var ownsCPath = _waiters.DecrementCount();
-
-        // Slot-mode rejoin (a slot drain parked for recovery; the count still carried the recovered
-        // position - see DrainSlotInline's recovery return): the successor, if any, lives in the SLOT,
-        // not the queue. The queue partition below would peek nothing and lose its activation (its
-        // D-path arm asserts on the empty queue). Run the slot partition instead and re-enter the
-        // slot claim loop, which serves deposits and releases the advancer.
-        if (!_waiters.IsEscalated)
-        {
-            ActivateNextAfterSlotAdvance(ownsCPath);
-            DrainSlotInline();
-            return;
-        }
-
-        // Partition + checked peek, mirroring DrainReadyWaiters (this advance is the recovery
-        // path's drain step and shares the count-skew exposure - see DecrementCount).
-        if (ownsCPath)
-        {
-            // Pre-check outside the lock, an entry filter only, same as the queue C-path: skip the
-            // lock acquire when no publish is pending (the read itself is an acquire load; the
-            // decrement above is a full fence, so it is fresh). Writes nothing, skips nothing else;
-            // a stale-false read is rescued by the committer's own locked arm.
-            if (Volatile.Read(ref _executingItemActivationPending))
-            {
-                // Same lock-guarded claim+activate as DrainReadyWaiters: lock wraps the Exchange so
-                // the executor's fence-acquire blocks until ActivateHeadItem finishes.
-                // Advancer chain reachability implies _activationLock is non-null.
-                lock (_activationLock!)
-                {
-                    // Count gates the Exchange - LEAVE the publish at Count > 0 for the executor's commit
-                    // to reclaim and activate, never consume-and-clear it (see DrainReadyWaiters' C-path).
-                    // Peek-gated like that C-path: a resident completed-unactivated head at count 0
-                    // declines the license. Publish and pending stay put, and the DrainReadyWaiters
-                    // pass below drains the head and re-fires.
-                    if (_waiters.Count is 0 && !_waiters.TryPeek(out _) && Volatile.Read(ref _executingItemActivationPending))
-                    {
-                        // Lock-serialized claim; acquire load orders the item read (see the queue C-path).
-                        _executingItemActivationPending = false;
-                        var executing = _executingItem;
-                        ActivateHeadItem(executing);
-                    }
-                }
-            }
-        }
-        else if (_waiters.TryPeek(out var nextItem))
-        {
-            // Completed-head guard, mirroring DrainReadyWaiters' D-arm: a drain-only head is
-            // picked up by the DrainReadyWaiters call below.
-            if (!nextItem.WaiterTask.IsCompleted)
-            {
-                ActivateHeadItem(nextItem.Waiter);
-            }
-        }
-        else
-        {
-            Debug.Assert(false, "count > 0 with no peekable queue head.");
-        }
-
-        // Continue draining ready items, we already hold the advancer flag.
-        DrainReadyWaiters();
+        return CompleteWaiterDeferred(recoveryItem, exception, ownedTurn: _waiterRecoverySeq);
     }
 
     // Whether a store to a slot field of type T is atomic against a concurrent getter read, deciding
@@ -2253,75 +1983,38 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void SetActivatedItem(T value) => PublishSlot(ref _activatedItem, ref _activatedItemGen, value);
 
-    // Live-activation occupancy bit (not a lock - nothing waits on it): 1 while an item has been
-    // granted the activation turn and has not yet retired. Role-neutral by design: a client policy
-    // reads on the activation side (Slon's shared read promise), a server policy writes there - either
-    // way the policy owns ONE shared per-connection resource that exactly one live activation may
-    // hold. Read as a decision input under _activationLock by the two independent activation paths
-    // (the C-path activating _executingItem, and CommitWaiter's wasEmpty self-activate of a committed
-    // head), which could otherwise both grant the turn to consecutive items. Set on every activation;
-    // cleared by the retiring side (plain write ordered by the retirement path's own sequencing).
-    bool _liveActivation;
-
-    // Deferral gate for a completion callback firing between the commit's pre-publication
-    // registration and its publish (see CommitWaiter / OnWaiterTaskCompleted). Armed by the
-    // committing thread, CAS-claimed by an early fire, drained by the commit's post-publish
-    // replay. Commits are serialized on the executor's logical thread, so one word suffices.
-    const int CommitFireIdle = 0;
-    const int CommitFireArmed = 1;
-    const int CommitFireDeferred = 2;
-    int _commitFireGate;
-
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void ActivateHeadItem(T item, bool preferAsync = true)
     {
-        DrainTrace.RecordItem(DrainTrace.Kind.Act, item);
         // Update the publicly-observed ActivatedItem slot before dispatching to the policy:
         // a same-thread inline activation sees the new value via the policy call's own
         // sequencing, and a TP-dispatched activation publishes via the dispatch fence.
+        // The TURN is not touched here: every caller assigned (or inherited) it under its own
+        // discipline - the edge lock, the license-held stop, or the recovery placement.
         SetActivatedItem(item);
-        Volatile.Write(ref _liveActivation, true); // grant the activation turn (cleared at retirement)
         _policy.ActivateHeadItem(item, preferAsync);
     }
 
+    /// Resolve the item's deferral and drop the executor-slot references. Returns TRUE when the
+    /// completion is OWNED (activated on this strand, or the reclaim won the one-winner consume -
+    /// no grant exists or ever can): the caller may inline-complete. FALSE = the census granted (or
+    /// is mid-grant): the caller must route the item through the store (never inline-complete a
+    /// lost item - the license orders the census's activation before the advance's retire; this is
+    /// what replaced the ACTIVATING observe-rendezvous and its unbounded spin). PLAIN consume, not
+    /// claim-first: this runs with no Count==0 guarantee (residents may legitimately hold the turn),
+    /// so a fail-if-live turn claim here would misread a foreign resident as a foreign census grant -
+    /// see WaiterStore.TryConsumeExecDeferred's doc for the known residual this leaves open.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    void ClearExecutingItem(bool wasActivated)
+    bool ClearExecutingItem(bool wasActivated)
     {
         // Single writer (the executor), so no RMW needed; the Volatile.Write carries the clear to
-        // the enumerator's cross-thread read. Cleared in both paths so the enumerator stops yielding
-        // the item once it's done (or transitioning to another channel like a tail-waiter).
+        // the enumerator's cross-thread read.
         Volatile.Write(ref _hasInFlightItem, false);
-
-        if (!wasActivated)
-        {
-            // Claim under the lock: replaces the lock-free Exchange plus the lost-race empty
-            // fence-acquire - entering the lock means any advancer C-path ActivateHeadItem
-            // finished, closing the activation-after-completion race before the caller proceeds
-            // to CompleteWaiter. Executor strand, so a plain in-lock read is exact (the only
-            // lock-free publisher is this strand itself). wasActivated=false means the
-            // deferred-publish branch ran, which only triggers when a waiter was committed, so
-            // _activationLock is non-null here.
-            bool won;
-            lock (_activationLock!)
-            {
-                won = _executingItemActivationPending;
-                _executingItemActivationPending = false;
-            }
-            if (won)
-            {
-                // Won the race-back: advancer won't activate. Item is done (callers invoke us after
-                // pipelineTask.IsCompleted), so activation is optional, skip it.
-                SetExecutingItem(default!);
-            }
-            // Lost: the advancer activated it (finished before our lock entry); _executingItem
-            // stays populated until the next dispatch overwrites or the commit reclaim clears it.
-        }
-        else
-        {
-            // Inline-activated path: no advancer is tracking, so we can drop the item reference
-            // along with the visibility flag.
-            SetExecutingItem(default!);
-        }
+        var owned = wasActivated || _waiters.TryConsumeExecDeferred();
+        // Clearing is safe in BOTH arms: the census captures _executingItem BEFORE its take, so a
+        // lost reclaim means the capture already happened.
+        SetExecutingItem(default!);
+        return owned;
     }
 
     [DoesNotReturn]
@@ -2333,6 +2026,11 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         readonly Pipeline<T, TPolicy, TSource, TEnumerator> _pipeline;
         SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)>.Enumerator _waitersEnumerator;
+        // Read before the slot check, not at phase 2's own turn - see the read-order comment at its
+        // use site (matches TryClaimCompletedHead/TryPeekHead's fix: read the queue reference before
+        // the slot state, since an escalating commit writes them in that order and this enumerator
+        // has no other synchronization pairing it with this store beyond these two reads).
+        SingleProducerSingleConsumerQueue<(T Waiter, ValueTask WaiterTask)>? _queueSnapshot;
         // 0: executing item, 1: init queue waiters, 2: enumerate queue waiters, 3: slot waiter, 4: tail waiter, 5: done
         int _phase;
 
@@ -2361,17 +2059,29 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                     }
                     goto case 1;
                 case 1:
-                    // Null queue means the pipeline never escalated. Skip to the slot phase.
-                    var queue = _pipeline._waiters.Queue;
-                    if (queue is null)
-                    {
-                        _phase = 3;
-                        goto case 3;
-                    }
-                    _waitersEnumerator = new(queue);
+                    // SnapshotForEnumeration owns the safe read order internally (queue reference
+                    // before slot state) - this call site just presents slot before queue in
+                    // ENUMERATION order, which is a separate concern (leave-head FIFO presentation).
+                    _pipeline._waiters.SnapshotForEnumeration(out var slotItem, out var hasSlotItem, out _queueSnapshot);
                     _phase = 2;
+                    if (hasSlotItem && slotItem is { } slot)
+                    {
+                        Current = slot;
+                        return true;
+                    }
                     goto case 2;
                 case 2:
+                    // Null queue means the pipeline never escalated. Skip to the tail phase.
+                    var queue = _queueSnapshot;
+                    if (queue is null)
+                    {
+                        _phase = 4;
+                        goto case 4;
+                    }
+                    _waitersEnumerator = new(queue);
+                    _phase = 3;
+                    goto case 3;
+                case 3:
                     while (_waitersEnumerator.MoveNext())
                     {
                         if (_waitersEnumerator.Current.Waiter is { } waiter)
@@ -2380,15 +2090,7 @@ public sealed class Pipeline<T, TPolicy, TSource, TEnumerator>
                             return true;
                         }
                     }
-                    _phase = 3;
-                    goto case 3;
-                case 3:
                     _phase = 4;
-                    if (_pipeline._waiters.TrySnapshotSlot(out var slotItem) && slotItem is { } slot)
-                    {
-                        Current = slot;
-                        return true;
-                    }
                     goto case 4;
                 case 4:
                     _phase = 5;
@@ -2436,7 +2138,7 @@ public static class Pipeline
     /// <para>
     /// Flyweight reuse: pass a previously-completed <paramref name="instance"/> to rebind it
     /// against the new <paramref name="policy"/> + <paramref name="source"/> and restart it.
-    /// The shell allocation (waiter queue, delegates, depth/latch machinery) gets reused while
+    /// The shell allocation (waiter queue, delegates, depth machinery) gets reused while
     /// the per-run state (enumerator, execution task) gets fresh.
     /// </para>
     /// <para>

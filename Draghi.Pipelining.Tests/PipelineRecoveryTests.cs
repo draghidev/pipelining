@@ -511,7 +511,18 @@ public class PipelineRecoveryTests
     /// paths call into policy.CompleteItem on the same item, double dispatch, a contract
     /// violation. Stress test: many iterations of "recovery with async execute, race CompleteAsync
     /// against executeTask completion". Even one observed double-complete fails the test.
-    [Ignore("Timing-based stress test, flaky on cold threadpool. Re-enable when needed to validate regressions.")]
+    ///
+    /// FIXED (2026-07-10, this was previously mis-`[Ignore]`d as "flaky on cold threadpool" - it
+    /// wasn't threadpool-related at all): item's PipelineTaskException can be discovered by either
+    /// of two distinct recovery entry points depending on a genuine, expected timing race - the
+    /// advance-chain's own retire-walk (RecoverWaiter, PipelineItemFailureKind.PipelineTaskWaiter,
+    /// Pipeline.cs ~1671) if item is already a committed resident when its task settles, or
+    /// CommitTailWaiter's own completion check (RecoverCommittedTailWaiterAsync,
+    /// PipelineItemFailureKind.PipelineTask, ~1037) if CompletePipelineTask races ahead of the
+    /// executor looping back to commit it. Both are legitimate, both need the same
+    /// no-double-complete-under-shutdown-race property this test checks - the factory below must
+    /// offer the substitute for both kinds, not just PipelineTaskWaiter, or roughly 10-25% of
+    /// iterations hang forever waiting for a substitute that a declined-recovery path never creates.
     [TestMethod]
     public async Task RecoverWaiter_ContinuationSuccessPath_NoDoubleCompleteUnderShutdown()
     {
@@ -522,7 +533,7 @@ public class PipelineRecoveryTests
 
             var pipeline = Pipeline.Create<TestPipelineItem, CompletionCountingPolicy>(
                 new CompletionCountingPolicy(completeCounts,
-                    ctx => ctx.Kind == PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null));
+                    ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter or PipelineItemFailureKind.PipelineTask ? recovery : null));
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
             var item = new TestPipelineItem
