@@ -162,7 +162,7 @@ public class PipelineTests
     }
 
     [TestMethod]
-    public async Task CompleteAsyncDrainsWaiters()
+    public async Task CompleteAsyncDrainsInFlightItems()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true));
@@ -190,7 +190,7 @@ public class PipelineTests
     /// thread, item becomes a tail waiter, pipeline task completion happens on whichever thread
     /// completes the TCS (here, the test thread). Cross-thread coordination still works.
     [TestMethod]
-    public async Task SyncEnqueue_AsyncPipelineTask_CompletesViaWaiterPath()
+    public async Task SyncEnqueue_AsyncPipelineTask_CompletesViaInFlightPath()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(false));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);

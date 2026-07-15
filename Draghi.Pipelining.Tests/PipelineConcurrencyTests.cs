@@ -49,7 +49,7 @@ public class PipelineConcurrencyTests
 
     // ROOT-CAUSE REPRO (2026-07-11, EXPECTED RED until the fix - see the
     // draghi_advance_retire_dispatch_race memory): retirement-before-activation violated at its
-    // premise. Waiter-task completion is TWO-PHASE - (1) publish completed, (2) read the
+    // premise. Pipeline-task completion is two-phase: (1) publish completed, (2) read the
     // (continuation, state) pair and dispatch - and phase 2 runs unlicensed on the completer's
     // thread. The done-arm judges retire-eligibility from phase 1 alone (TryClaimCompletedHead ->
     // IsCompleted), so a committer arm claims the head, GetResult-consumes it (resetting the
@@ -192,7 +192,7 @@ public class PipelineConcurrencyTests
     /// predecessor buffered in the store is head-gated through the ROB instead: its retirement
     /// defers until the predecessor completes, keeping retirement strictly FIFO (an inline complete
     /// there would jump the ROB and clear the head word out from under the live reader - the baton
-    /// wedge). Async items (CompleteAsync=true) commit via CommitTailWaiter and drain in FIFO.
+    /// wedge). Async items (CompleteAsync=true) commit via CommitPendingTail and drain in FIFO.
     /// Verifies both behaviors and that every item completes.
     [TestMethod]
     public async Task MixedSyncAsyncPipelineTasks_AllItemsComplete()
@@ -278,7 +278,7 @@ public class PipelineConcurrencyTests
 
         pipeline.Enqueue(a).Execute();
         // Barrier: only A is enqueued, so the first idle deterministically means A was dispatched,
-        // committed to _waiters with its callback registered, and the pump is free and suspended.
+        // committed to _inFlight with its callback registered, and the pump is free and suspended.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         pipeline.Enqueue(b).Execute();
@@ -320,9 +320,9 @@ public class PipelineConcurrencyTests
     [TestMethod]
     public async Task PipelinedCompletionOrder()
     {
-        // Wait for executor to suspend before completing tasks so all items are in _waiters with
-        // callbacks registered. Otherwise items still at _tailWaiter get completed via the
-        // executor's CommitTailWaiter sync-success path, breaking the FIFO completion order.
+        // Wait for executor to suspend before completing tasks so all items are in _inFlight with
+        // callbacks registered. Otherwise items still at _pendingTail get completed via the
+        // executor's CommitPendingTail sync-success path, breaking the FIFO completion order.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
@@ -480,7 +480,7 @@ public class PipelineConcurrencyTests
     /// two live holders = the collision.
     ///
     /// Trips on the executor's dispatch-time inline-activate (Count is 0 -> activate) racing the
-    /// advancer's drain-time activation: the executor reads _waiters.Count is 0 the instant the
+    /// advancer's drain-time activation: the executor reads _inFlight.Count is 0 the instant the
     /// advancer has dequeued the last waiter but not yet activated it, so both strands activate the
     /// head - two readers on one baton. A stress loop because the window is narrow per iteration.
     [TestMethod, DoNotParallelize]
@@ -665,25 +665,25 @@ public class PipelineConcurrencyTests
     }
 
     /// Standing concurrency coverage for recovery: before this test, recovery paths (RecoverItem,
-    /// RecoverTrailingFailure, RecoverCommittedTailWaiterAsync) were entirely unexercised by the
+    /// RecoverTrailingFailure, RecoverCommittedPendingTailAsync) were entirely unexercised by the
     /// concurrency stress suite - the main NoTwoItemsActivatedConcurrently_SingleReaderInvariant
     /// loop never triggers a recovery factory. One in eight items faults its trailing task and gets
     /// eclipsed by a fresh substitute, mixed into the same sync/async concurrent load as the main
     /// stress test, so recovery's activation/completion machinery gets hammered against the same
-    /// elision/census/tail-waiter interleavings the rest of the suite already covers.
+    /// elision/empty-edge pass/pending-tail interleavings the rest of the suite already covers.
     ///
-    /// FIXED (2026-07-10): RunIdleCensus peeks the deferred item's value (capturing X) before winning
+    /// FIXED (2026-07-10): ResolveEmptyEdgeHandoff peeks the deferred item's value (capturing X) before winning
     /// its claim+consume CAS, and calls ActivateHeadItem(captured, ...) only after releasing the edge
     /// lock. When RecoverTrailingFailure's/RecoverItem's own consume lost that CAS race to a genuine
-    /// census grant, the code used to activate/complete its substitute immediately, assuming the
-    /// census's grant was "vacuous" - it wasn't; both could fire, unordered. The fix doesn't touch the
-    /// census (eliminating it breaks a genuine liveness case - a stuck backpressure write needs
+    /// empty-edge pass grant, the code used to activate/complete its substitute immediately, assuming the
+    /// empty-edge pass's grant was "vacuous" - it wasn't; both could fire, unordered. The fix doesn't touch the
+    /// empty-edge pass (eliminating it breaks a genuine liveness case - a stuck backpressure write needs
     /// something to grant it activation once the store drains) or the eclipse contract (R activating
     /// while X's activation is live is correct by design). It keys a wait to a dedicated
-    /// per-grant stamp (WaiterStore.RecordCensusResolved/IsCensusResolved, written right after the
-    /// census's ActivateHeadItem call returns) so a losing recovery waits for that exact grant's
+    /// per-grant stamp (ActivationGate.MarkHandoffResolved/IsHandoffResolved, written right after the
+    /// empty-edge pass's ActivateHeadItem call returns) so a losing recovery waits for that exact grant's
     /// activation to have returned before proceeding - turning an unordered race into a clean,
-    /// sequential eclipse transfer. See census_recovery_fix_spec.md for the full design history
+    /// sequential eclipse transfer. See empty-edge pass_recovery_fix_spec.md for the full design history
     /// (five independent reviews) and the rejected alternatives.
     [TestMethod, DoNotParallelize]
     public async Task RecoveryEclipse_UnderConcurrentLoad_SingleReaderInvariant()
@@ -700,7 +700,7 @@ public class PipelineConcurrencyTests
             {
                 // Decline recovery for ExecuteItemTask failures (exercises RecoverItem's no-recovery-
                 // decline path, which inline-completes the failed item directly - the site identified
-                // as needing the same census-resolution wait as the inherit-and-activate arms) while
+                // as needing the same empty-edge pass-resolution wait as the inherit-and-activate arms) while
                 // still offering a substitute for TrailingExecutionTask failures (the eclipse path).
                 if (ctx.Kind is PipelineItemFailureKind.ExecuteItemTask)
                     return null;
@@ -717,7 +717,7 @@ public class PipelineConcurrencyTests
             for (var i = 0; i < count; i++)
             {
                 // Every eighth item (all odd, i.e. the async half - a synchronously-completing
-                // pipeline task never reaches the tail-waiter path a trailing fault needs) faults its
+                // pipeline task never reaches the pending-tail path a trailing fault needs) faults its
                 // trailing task and is eclipsed by a recovery substitute.
                 var triggersRecovery = i % 8 == 7;
                 // A disjoint residue (i % 16 == 5 - avoids both i%8==7 and i%4==3) throws synchronously
@@ -921,7 +921,7 @@ public class PipelineConcurrencyTests
             _recoveryFactory = recoveryFactory;
         }
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             if (item.ThrowOnExecute is { } ex)
                 throw ex;
@@ -995,7 +995,7 @@ public class PipelineConcurrencyTests
 
         public ActivationOrderRecordingPolicy(System.Collections.Concurrent.ConcurrentQueue<int> order) => _order = order;
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();
@@ -1016,13 +1016,13 @@ public class PipelineConcurrencyTests
 
     /// Stresses the advancer's drain loop by completing many waiter pipeline tasks from
     /// parallel threads simultaneously. Exercises the do-while re-acquire at the end of
-    /// DrainReadyWaiters and the count-decrement-then-_executingItemActivationPending-check ordering.
+    /// in-flight drain and the count-decrement-then-_executingItemActivationPending-check ordering.
     [TestMethod]
-    public async Task ConcurrentWaiterCompletions()
+    public async Task ConcurrentPipelineTaskCompletions()
     {
-        // Wait for executor to suspend (all items committed to _waiters via pre-idle commit) before
-        // completing tasks. Otherwise some items are still at _tailWaiter when CompletePipelineTask
-        // fires, and executor's CommitTailWaiter handles them via sync-success branch instead of the
+        // Wait for executor to suspend (all items committed to _inFlight via pre-idle commit) before
+        // completing tasks. Otherwise some items are still at _pendingTail when CompletePipelineTask
+        // fires, and executor's CommitPendingTail handles them via sync-success branch instead of the
         // advancer path - mixed routing that pulls the test away from what it's supposed to exercise.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
@@ -1037,7 +1037,7 @@ public class PipelineConcurrencyTests
             pipeline.Enqueue(items[i]).Execute();
         }
 
-        // Wait for all to be in the waiter queue.
+        // Wait for all to enter the in-flight store.
         for (var i = 0; i < count; i++)
             await items[i].WaitForExecutedAsync();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -1065,7 +1065,7 @@ public class PipelineConcurrencyTests
 
     /// Forces the executor through the deferred-activation branch (waiters present at dequeue
     /// time) repeatedly, with rapid head-of-queue completions interleaved. Confirms the dual-path
-    /// coordination (_executingItem claim by either advancer or EnqueueWaiter) never drops an
+    /// coordination (_executingItem claim by either advancer or CommitInFlightItem) never drops an
     /// activation under sustained load.
     [TestMethod]
     public async Task DeferredActivationUnderSustainedLoad()
@@ -1092,7 +1092,7 @@ public class PipelineConcurrencyTests
 
             // Drain them all back-to-back from a parallel thread while enqueueing an async
             // tail item that goes through the waiter-queue path. The tail's enqueue races with
-            // the drain finishing. Either the advancer or the EnqueueWaiter path must activate.
+            // the drain finishing. Either the advancer or the CommitInFlightItem path must activate.
             var drainTask = Task.Run(() =>
             {
                 for (var i = 0; i < itemsPerRound; i++)
@@ -1109,7 +1109,7 @@ public class PipelineConcurrencyTests
             await tail.WaitForCompleteAsync();
         }
 
-        // Activation is contract-conditional (see ActivationFiresForEveryItemUnderWaiterCompletionRace).
+        // Activation is contract-conditional under the in-flight completion race.
         // Items that complete synchronously inside the deferred path are not required to be activated.
         // Functional correctness: every item completes without exception, depth returns to 0.
         foreach (var item in allItems)
@@ -1204,7 +1204,7 @@ public class PipelineConcurrencyTests
 
     /// Regression guard for the deferred-activation handoff. When the advancer claims the
     /// published _executingItem and calls ActivateHeadItem on its own thread, the executor's
-    /// CompleteWaiter for the same item must not fire until ActivateHeadItem has finished.
+    /// RetireItem for the same item must not fire until ActivateHeadItem has finished.
     /// The _activationLock around the advancer's claim and ClearExecutingItem's fence in the
     /// deferred branch enforce this. Without that ordering a pooling policy could observe
     /// CompleteItem while ActivateHeadItem is still running on another thread, or even after
@@ -1233,7 +1233,7 @@ public class PipelineConcurrencyTests
         b.WaitForActivationStart();
 
         // Now complete B's execute task. Executor wakes, sees PipelineTask sync-completed, races
-        // to CompleteWaiter(B). Without the activation lock's fence in ClearExecutingItem,
+        // to RetireItem(B). Without the activation lock's fence in ClearExecutingItem,
         // CompleteItem would fire while ActivateHeadItem is still sleeping.
         b.CompleteExecuteTask();
 
@@ -1245,10 +1245,10 @@ public class PipelineConcurrencyTests
             "CompleteItem fired before ActivateHeadItem finished, deferred-activation race not closed.");
     }
 
-    /// Regression guard for the CommitTailWaiter activation-lock fence. CommitTailWaiter's
+    /// Regression guard for the CommitPendingTail activation-lock fence. CommitPendingTail's
     /// Exchange(_executingItemActivationPending, false) handshake mirrors ClearExecutingItem's, but if Exchange
     /// returns false (advancer already claimed and is mid-ActivateHeadItem under _activationLock)
-    /// CommitTailWaiter must wait for that activation to finish before calling CompleteWaiter on
+    /// CommitPendingTail must wait for that activation to finish before calling RetireItem on
     /// the same item. Without the fence, CompleteItem fires while ActivateHeadItem is still
     /// running on the advancer thread.
     [TestMethod]
@@ -1264,7 +1264,7 @@ public class PipelineConcurrencyTests
 
         // B: async pipeline + async trailing. Goes through deferred path (A is waiter, count>0)
         // and suspends the executor at await trailing. This is the key difference from the
-        // ClearExecutingItem test - B's pipeline is pending so it becomes _tailWaiter, and
+        // ClearExecutingItem test - B's pipeline is pending so it becomes _pendingTail, and
         // tail-commit (not inline ClearExecutingItem) is the path that races the advancer.
         var b = new ActivationOrderingItem { PipelineTaskAsync = true, HasTrailingTaskAsync = true };
         pipeline.Enqueue(b).Execute();
@@ -1274,11 +1274,11 @@ public class PipelineConcurrencyTests
         a.CompletePipelineTask();
         b.WaitForActivationStart();
 
-        // Pre-fire B's pipeline so it's already completed when the executor reaches CommitTailWaiter.
+        // Pre-fire B's pipeline so it's already completed when the executor reaches CommitPendingTail.
         b.CompletePipelineTask();
 
         // Fire B's trailing task. Executor resumes from await trailing, falls out of inner loop,
-        // hits CommitTailWaiter at the pre-idle commit site. Without the fence, CompleteWaiter(B)
+        // hits CommitPendingTail at the pre-idle commit site. Without the fence, RetireItem(B)
         // races against the advancer's still-sleeping ActivateHeadItem(B).
         b.CompleteTrailingTask();
 
@@ -1338,7 +1338,7 @@ public class PipelineConcurrencyTests
         internal void RunActivate()
         {
             _activationStartedTcs.TrySetResult();
-            // Slow activation: gives the executor time to race toward CompleteWaiter.
+            // Slow activation: gives the executor time to race toward RetireItem.
             Thread.Sleep(50);
             Volatile.Write(ref _activationFinished, 1);
         }
@@ -1391,20 +1391,20 @@ public class PipelineConcurrencyTests
     /// Three-way stress: producer enqueues, executor processes items with faulting pipeline
     /// tasks (triggering recovery via the advancer), recovery continuations fire and coordinate
     /// with the activation lock. Exercises the interleaving of executor + advancer + recovery
-    /// continuation paths against the same _executingItemActivationPending / _drainTcs / _waiterInRecovery
+    /// continuation paths against the same _executingItemActivationPending / _drainTcs / in-flight recovery
     /// state. Stress test - won't deterministically hit every interleaving but catches
     /// regressions under load.
     [TestMethod]
     public async Task ThreeWayRace_ProducerExecutorRecoveryContinuations()
     {
-        // Recovery factory only handles PipelineTaskWaiter (advancer path). Sync on the source
-        // onIdle hook so all items are committed to _waiters with callbacks registered before we
-        // fault, otherwise the trailing filler at _tailWaiter could take the executor's
-        // CommitTailWaiter path and skew the routing this test wants to stress.
+        // Recovery factory only handles PipelineTask (advancer path). Sync on the source
+        // onIdle hook so all items are committed to _inFlight with callbacks registered before we
+        // fault, otherwise the trailing filler at _pendingTail could take the executor's
+        // CommitPendingTail path and skew the routing this test wants to stress.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true,
-                ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter
+                ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask
                     ? new TestPipelineItem()
                     : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
@@ -1460,7 +1460,7 @@ public class PipelineConcurrencyTests
 
     struct ReentrantPolicy(ReentrantBox box) : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             return new(new PipelineItemResult(default));
@@ -1485,7 +1485,7 @@ public class PipelineConcurrencyTests
 
     struct ActivationOrderingPolicy : IPipelinePolicy<ActivationOrderingItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(ActivationOrderingItem item, bool waiterExecution, CancellationToken cancellationToken) => item.RunExecute();
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(ActivationOrderingItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken) => item.RunExecute();
         public void ActivateHeadItem(ActivationOrderingItem item, bool preferAsync = true) => item.RunActivate();
         public void CompleteItem(ActivationOrderingItem item, int remainingDepth, Exception? exception) => item.RunComplete();
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, ActivationOrderingItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ActivationOrderingItem? recoveryItem)
@@ -1540,18 +1540,18 @@ public class PipelineConcurrencyTests
     public async Task CompleteAsync_DuringActiveRecovery_DrainsCleanly()
     {
         var recovery = new TestPipelineItem { ExecuteAsync = true };
-        // We deliberately only handle the advancer's PipelineTaskWaiter kind. The test must avoid
-        // the racy executor-side trailing-recovery path (RecoverCommittedTailWaiterAsync), which
-        // fires kind=PipelineTask when CommitTailWaiter sees a pre-faulted tail task. Sync on the
+        // We deliberately only handle the advancer's PipelineTask kind. The test must avoid
+        // the racy executor-side trailing-recovery path (RecoverCommittedPendingTailAsync), which
+        // fires kind=PipelineTask when CommitPendingTail sees a pre-faulted tail task. Sync on the
         // source onIdle hook to guarantee the executor has done its pre-idle commit (faulting moved
-        // to _waiters with callback registered) before we fault the task.
+        // to _inFlight with callback registered) before we fault the task.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // Waiter item with a pipeline task that will fault, triggering recovery.
+        // In-flight item with a pipeline task that will fault, triggering recovery.
         var faulting = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
         pipeline.Enqueue(faulting).Execute();
         await faulting.WaitForExecutedAsync();
@@ -1604,7 +1604,7 @@ public class PipelineConcurrencyTests
     }
 
     /// Repeated drain cycles: each WaitForEmptyAsync must be cleanly resolved (TCS torn down and
-    /// new one created on next call). Exercises the SetResult+null pattern in CompleteWaiter
+    /// new one created on next call). Exercises the SetResult+null pattern in RetireItem
     /// and the lazy creation in WaitForEmptyAsync.
     [TestMethod]
     public async Task WaitForEmptyAsync_AcrossRepeatedDrainCycles()
@@ -1670,8 +1670,8 @@ public class PipelineConcurrencyTests
 
     /// WaitForEmptyAsync caller is suspended when CompleteAsync fires concurrently. The drain must
     /// complete the WaitForEmptyAsync TCS even though the trigger was CompleteAsync rather than
-    /// natural depth-to-zero. (CompleteWaiter drives the drain TCS, CompleteAsync's drain calls
-    /// CompleteWaiter for each remaining item.)
+    /// natural depth-to-zero. (RetireItem drives the drain TCS, CompleteAsync's drain calls
+    /// RetireItem for each remaining item.)
     [TestMethod]
     public async Task WaitForEmptyAsync_RacingCompleteAsync_AlwaysCompletes()
     {
@@ -1743,12 +1743,12 @@ public class PipelineConcurrencyTests
 
     /// In-proc stress runner for the DrainSlotInline shutdown deposit-drop. The shape: two
     /// CompleteAsync waiters, then CompleteAsync. The strand needs item1 drained via the slot (its
-    /// callback claims it pre-escalation) while item2's CommitTailWaiter escalation is in flight, so
+    /// callback claims it pre-escalation) while item2's CommitPendingTail escalation is in flight, so
     /// CompleteAsync must land in the narrow window before the executor commits item2. Rare per
     /// iteration, so the loop rolls it. Iterations via DRAGHI_STRESS_ITERATIONS (default 200).
     /// DRAGHI_STRESS_WAIT_ON_HANG=1 suspends after a GC shed for live capture.
     [TestMethod, DoNotParallelize]
-    public async Task CompleteAsyncDrainsWaiters_ShutdownDepositDrop_Stress()
+    public async Task CompleteAsyncDrainsInFlightItems_ShutdownDepositDrop_Stress()
     {
         var iterations = int.TryParse(
             Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 200;
@@ -1926,14 +1926,14 @@ public class PipelineConcurrencyTests
         pipeline.Enqueue(item).Execute();
     }
 
-    /// Regression guard for the _tailWaiter slot clear in CommitTailWaiter (Pipeline.cs:508-509).
-    /// An item that goes through the async-pipeline branch lands in _tailWaiter, then gets
-    /// committed to _waiters on the pre-idle CommitTailWaiter. After commit + drain, nothing in
-    /// the pipeline should pin the item. Without the line 508 `_tailWaiter = default!` clear, the
+    /// Regression guard for the _pendingTail slot clear in CommitPendingTail (Pipeline.cs:508-509).
+    /// An item that goes through the async-pipeline branch lands in _pendingTail, then gets
+    /// committed to _inFlight on the pre-idle CommitPendingTail. After commit + drain, nothing in
+    /// the pipeline should pin the item. Without the line 508 `_pendingTail = default!` clear, the
     /// completed item stays GC-rooted for the entire idle period.
     [TestMethod]
     [DoNotParallelize]
-    public async Task Idle_TailWaiterSlotDoesNotLeakCompletedItem()
+    public async Task Idle_PendingTailSlotDoesNotLeakCompletedItem()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
@@ -1943,9 +1943,9 @@ public class PipelineConcurrencyTests
         WeakReference? itemRef = null;
         Action? completer = null;
         var completed = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-        EnqueueTailWaiterItem(pipeline, completed, ref itemRef, ref completer);
+        EnqueuePendingTailItem(pipeline, completed, ref itemRef, ref completer);
 
-        // Wait for executor to suspend (pre-idle CommitTailWaiter has run, item is in _waiters).
+        // Wait for executor to suspend (pre-idle CommitPendingTail has run, item is in _inFlight).
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Drain via the captured completer. Null both refs after firing so nothing external pins.
@@ -1959,7 +1959,7 @@ public class PipelineConcurrencyTests
         // Bounded retry: transient stack rooting settles within a few rounds; a REAL retention
         // (a pipeline field holding the item) never dies, so the guard keeps its teeth.
         await AssertDiesAsync(itemRef,
-            "Item still alive after pipeline drained — committed tail not cleared (_tailWaiter / _executingItem).");
+            "Item still alive after pipeline drained — committed tail not cleared (_pendingTail / _executingItem).");
     }
 
     /// Forces a few gen2 collections, retrying while the reference is alive (transient stack
@@ -1978,7 +1978,7 @@ public class PipelineConcurrencyTests
     }
 
     [System.Runtime.CompilerServices.MethodImpl(System.Runtime.CompilerServices.MethodImplOptions.NoInlining)]
-    static void EnqueueTailWaiterItem(ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TaskCompletionSource completed, ref WeakReference? itemRef, ref Action? completer)
+    static void EnqueuePendingTailItem(ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TaskCompletionSource completed, ref WeakReference? itemRef, ref Action? completer)
     {
         var item = new TestPipelineItem { CompleteAsync = true, OnComplete = completed.SetResult };
         itemRef = new WeakReference(item);
@@ -2006,18 +2006,18 @@ public class PipelineConcurrencyTests
         var waiterCompleted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         EnqueueDeferredScenario(pipeline, waiterCompleted, ref waiterRef, ref deferredRef, ref waiterCompleter);
 
-        // Wait for executor to suspend. By this point: waiter is in _waiters, deferred item has been
+        // Wait for executor to suspend. By this point: waiter is in _inFlight, deferred item has been
         // dequeued through the deferred-publish path, sync-completed, ClearExecutingItem ran.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Drain the waiter so it leaves _waiters too, then drop the completer ref. The barrier
+        // Drain the waiter so it leaves _inFlight too, then drop the completer ref. The barrier
         // TCS lives in the OnComplete hook, which never roots the item.
         waiterCompleter!();
         waiterCompleter = null;
         await waiterCompleted.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.IsNotNull(waiterRef);
-        await AssertDiesAsync(waiterRef, "Waiter item leaked after drain.");
+        await AssertDiesAsync(waiterRef, "In-flight item leaked after drain.");
         Assert.IsNotNull(deferredRef);
         await AssertDiesAsync(deferredRef,
             "Deferred item leaked — _executingItem slot not cleared in ClearExecutingItem's race-win branch.");
@@ -2031,7 +2031,7 @@ public class PipelineConcurrencyTests
         ref WeakReference? deferredRef,
         ref Action? waiterCompleter)
     {
-        // Waiter (CompleteAsync) lands in _waiters first. The next item then takes the deferred path
+        // The async-pipeline item lands in _inFlight first. The next item then takes the deferred path
         // because waiterQueueCount > 0 when it's dequeued.
         var waiter = new TestPipelineItem { CompleteAsync = true, OnComplete = waiterCompleted.SetResult };
         var deferred = new TestPipelineItem();  // sync success, hits ClearExecutingItem's race-win
@@ -2042,20 +2042,20 @@ public class PipelineConcurrencyTests
         pipeline.Enqueue(deferred).Execute();
     }
 
-    /// Regression guard for RecoverWaiterResult's async-trailing continuation bailout
+    /// Regression guard for RecoverInFlightItemResult's async-trailing continuation bailout
     /// (Pipeline.cs:871-895). When recovery's executeTask completes sync but its trailing task is
     /// async-pending, the continuation hooked at line 871 must observe wake completion and call
     /// BailoutRecoveryOnShutdown. Without that branch the recovery would be stranded with the
     /// advancer flag still held.
     [TestMethod]
-    public async Task WaiterRecovery_AsyncTrailingDuringShutdown_BailsOutCleanly()
+    public async Task InFlightRecovery_AsyncTrailingDuringShutdown_BailsOutCleanly()
     {
         // Recovery: sync execute (ExecuteAsync default = false), async trailing (HasTrailingTask),
-        // pending pipeline task. Enters RecoverWaiterResult's async-trailing branch.
+        // pending pipeline task. Enters RecoverInFlightItemResult's async-trailing branch.
         var recovery = new TestPipelineItem { HasTrailingTask = true, CompleteAsync = true };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
@@ -2067,7 +2067,7 @@ public class PipelineConcurrencyTests
         pipeline.Enqueue(item).Execute();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Fault → advancer → RecoverWaiter → recovery executes sync → RecoverWaiterResult hooks
+        // Fault → advancer → RecoverInFlightItem → recovery executes sync → RecoverInFlightItemResult hooks
         // a continuation on the async trailing task. Advancer stays held until continuation fires.
         item.CompletePipelineTask();
         await recovery.WaitForExecutedAsync();
@@ -2078,21 +2078,21 @@ public class PipelineConcurrencyTests
 
         // Fire trailing. Continuation runs, observes _wakeSignal.IsCompleted, takes the bailout
         // branch which releases _advancing and signals advancer-idle. Without the branch the
-        // continuation would EnqueueWaiter against a completed wake and strand the recovery.
+        // continuation would CommitInFlightItem against a completed wake and strand the recovery.
         recovery.CompleteTrailingTask();
 
         await completeTask.WaitAsync(TimeSpan.FromSeconds(5));
         Assert.IsTrue(recovery.IsCompleted, "Recovery must be completed via the bailout path.");
     }
 
-    /// Regression guard for the `_waiterRecoveryItem` reference leak. RecoverWaiter sets
-    /// `_waiterRecoveryItem = recoveryItem` at the async-execute publish site. After successful
-    /// recovery, AdvanceAndDrainRecovery flips `_waiterInRecovery=false` but used to leave
-    /// `_waiterRecoveryItem` pointing at the now-completed item. For long-lived pipelines doing
+    /// Regression guard for the `_inFlightRecoveryItem` reference leak. RecoverInFlightItem sets
+    /// `_inFlightRecoveryItem = recoveryItem` at the async-execute publish site. After successful
+    /// recovery, AdvanceAndDrainRecovery flips `in-flight recovery=false` but used to leave
+    /// `_inFlightRecoveryItem` pointing at the now-completed item. For long-lived pipelines doing
     /// rare recoveries this is one stale strong reference, observable via WeakReference after GC.
     [TestMethod]
     [DoNotParallelize]
-    public async Task RecoverWaiter_ClearsWaiterRecoveryItemReferenceAfterSuccess()
+    public async Task RecoverInFlightItem_ClearsInFlightRecoveryItemReferenceAfterSuccess()
     {
         WeakReference? recoveryRef = null;
         TestPipelineItem? heldRecovery = null;
@@ -2102,7 +2102,7 @@ public class PipelineConcurrencyTests
             new(true,
                 ctx =>
                 {
-                    if (ctx.Kind == PipelineItemFailureKind.PipelineTaskWaiter)
+                    if (ctx.Kind == PipelineItemFailureKind.PipelineTask)
                     {
                         var r = new TestPipelineItem { ExecuteAsync = true };
                         recoveryRef = new WeakReference(r);
@@ -2148,7 +2148,7 @@ public class PipelineConcurrencyTests
             _observed = observed;
         }
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();

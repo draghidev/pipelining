@@ -116,7 +116,7 @@ sealed class PipelineChannel<T>
 
     struct Policy(PipelineChannel<T> channel) : IPipelinePolicy<T>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(T item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(T item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
             => new(new PipelineItemResult(ValueTask.CompletedTask));
 
         public void ActivateHeadItem(T item, bool preferAsync = true) { }

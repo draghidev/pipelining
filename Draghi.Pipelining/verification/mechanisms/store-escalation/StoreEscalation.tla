@@ -13,17 +13,17 @@ Items  == 1..N
 NoItem == 0
 
 VARIABLES
-  \* -- store surface (WaiterStore fields) --
-  slotState,   \* "empty" | "occupied" | "consuming"  (WaiterStore._slotState)
-  slotItem,    \* the item in the slot, or NoItem       (WaiterStore._slotItem)
+  \* -- InFlightStore surface --
+  slotState,   \* "empty" | "occupied" | "consuming"  (InFlightStore._slotState)
+  slotItem,    \* the item in the slot, or NoItem       (InFlightStore._slotItem)
   queue,       \* FIFO of items                          (the SPSC queue)
-  escalated,   \* _queue != null (monotonic)             (WaiterStore.IsEscalated)
+  escalated,   \* _queue != null (monotonic)             (InFlightStore.IsEscalated)
   \* -- first-escalation state --
   escalationPhase,    \* "idle" | "published"
   escalationTail,     \* the overflow tail item being escalated, or NoItem
   \* -- item lifecycle --
   nextCommit,  \* next item to commit (1..N+1)
-  taskDone,    \* [Items -> BOOLEAN]  the waiter task has completed
+  taskDone,    \* [Items -> BOOLEAN]  the pipeline task has completed
   retired,     \* [Items -> BOOLEAN]  ghost: _policy.CompleteItem ran (retirement)
   retireCount, \* [Items -> Nat]      ghost: retirement fire count (exactly-once)
   activated    \* [Items -> Nat]      ghost: _policy.ActivateHeadItem fire count
@@ -65,7 +65,7 @@ Init ==
   /\ activated = [i \in Items |-> 0]
 
 (* ===========================================================================
-   Producer (executor, single thread) - CommitWaiter / TryEscalateOrEnqueue
+   Producer (executor, single thread) - CommitInFlightItem / TryEscalateOrEnqueue
    =========================================================================== *)
 
 \* Pre-escalation zero-alloc slot commit. Arm A (the wasEmpty self-activate) lives
@@ -108,7 +108,7 @@ BeginEscalation ==
   /\ nextCommit' = nextCommit + 1
   /\ UNCHANGED <<slotState, slotItem, queue, taskDone, retired, retireCount, activated>>
 
-\* LEAVE-HEAD escalation, step 2: enqueue ONLY the overflow tail. The slot is never
+\* Leave-head escalation, step 2: enqueue only the overflow tail. The slot is never
 \* touched; the head retires through the slot tier.
 PublishLeaveHeadOverflow ==
   /\ escalationPhase = "published"
@@ -154,9 +154,9 @@ ReleaseSlotClaim ==
   /\ slotItem'  = NoItem
   /\ UNCHANGED <<queue, escalated, escalationPhase, escalationTail, nextCommit, taskDone, activated>>
 
-\* Escalated drain (DrainReadyWaiters).  Under LEAVE-HEAD it must retire the slot-
+\* Escalated drain (in-flight drain).  Under LEAVE-HEAD it must retire the slot-
 \* resident head before the queue - the callback dispatched here by IsEscalated=TRUE,
-\* and post-escalation this is the ONLY drain path (DrainSlotInline is entered only
+\* and post-escalation this is the only drain path (DrainSlotInline is entered only
 \* when !IsEscalated). Escalation never touches the slot, so a plain claim is faithful.
 DrainSlotHead ==
   /\ escalated
@@ -173,13 +173,13 @@ DrainQueueHead ==
   /\ escalated
   /\ Len(queue) > 0
   /\ taskDone[Head(queue)]
-  \* Advancer-latch cross-path exclusion (modeled minimally): the escalated drain
-  \* cannot run while a pre-escalation slot-drain holds the latch mid-claim
+  \* Advance-license cross-path exclusion (modeled minimally): the escalated drain
+  \* cannot run while a pre-escalation slot drain holds the license mid-claim
   \* (slotState="consuming").  Without this the model admits a slot-drain / queue-
-  \* drain OVERLAP the real single-advancer latch forbids - a spurious FIFO break
+  \* drain overlap the real single-advancer license forbids - a spurious FIFO break
   \* (the two drain PASSES never run concurrently in code).
   /\ slotState # "consuming"
-  \* THE ORDERING DISCIPLINE (intra-pass, latch-independent): a SINGLE DRW pass must
+  \* Ordering within a pass is license-independent: a single retirement pass must
   \* retire the slot-resident head before the queue head.  Dropping it is the weakening.
   /\ slotState = "empty"
   /\ retired'     = [retired     EXCEPT ![Head(queue)] = TRUE]
@@ -190,7 +190,7 @@ DrainQueueHead ==
 
 (* ===========================================================================
    The SAFE successor/head activation arm (the D-path).  Activates the current
-   logical head exactly once, and NEVER a retired item (guarded ~retired).  This
+   logical head exactly once, and never a retired item (guarded ~retired). This
    It reads the live store head rather than a captured stale identity.
    =========================================================================== *)
 ActivateIncompleteHead ==

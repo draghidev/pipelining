@@ -81,7 +81,7 @@ sealed class TestPipelineItem
     public bool HasTrailingTask { get; init; }
     // Custom trailing-task backing source (takes precedence over the TCS-backed trailing task).
     // Lets tests observe the executor's trailing await registration - the only deterministic
-    // suspension between the tail transition and the next iteration's CommitTailWaiter.
+    // suspension between the tail transition and the next iteration's CommitPendingTail.
     public System.Threading.Tasks.Sources.IValueTaskSource? TrailingTaskSource { get; init; }
     // Custom pipeline-task backing source (takes precedence over CompleteAsync's strict source).
     // Lets a test own the waiter task's completion protocol itself - e.g. the two-phase window
@@ -267,7 +267,7 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
         _recoveryFactory = recoveryFactory;
     }
 
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
     {
         // Before anything else, including the throw below: the executor's own dispatch activation
         // strictly precedes this call, so BeforeExecute classification needs the flag up first.

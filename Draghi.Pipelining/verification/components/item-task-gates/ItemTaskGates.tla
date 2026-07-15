@@ -20,7 +20,7 @@ Resolved == {"absent", "succeeded", "handled"}
 VARIABLES
   pipelineState,   \* [Items -> pending|succeeded|faulted|handled]
   trailingState,   \* [Items -> absent|pending|succeeded|faulted|handled]
-  tailResident,    \* NONE | item retained as tail waiter
+  tailResident,    \* NONE | item retained as pending tail
   retired,         \* [Items -> BOOLEAN]
   faultDoubleRetire,
   successorIssued, \* [Items -> BOOLEAN]
@@ -75,7 +75,7 @@ ExecutorStartItem ==   \* execute policy: both tasks come into being (trailing o
   /\ UNCHANGED <<tailResident, retired, faultDoubleRetire, successorIssued,
                  recoveryState, sharedOutputTouched, executorItem>>
 
-ExecutorInspectPipelineTask ==   \* inspect PipelineTask: direct-retire (naked) or publish tail waiter
+ExecutorInspectPipelineTask ==   \* inspect PipelineTask: direct-retire (naked) or publish pending tail
   /\ executorPc = "inspectPipelineTask"
   /\ IF pipelineState[executorItem] = "succeeded"
         /\ trailingState[executorItem] \in Resolved
@@ -85,7 +85,7 @@ ExecutorInspectPipelineTask ==   \* inspect PipelineTask: direct-retire (naked) 
        ELSE /\ tailResident' = executorItem
             /\ UNCHANGED <<retired, faultDoubleRetire>>
             \* A FAULTED pipeline is discovered at the commit regardless of the
-            \* trailing task (code :988: the fault-commit branch runs before any
+            \* trailing task (the fault-commit branch runs before any
             \* trailing await - trailing gates ISSUE, not fault discovery), so
             \* recovery can receive OUTSTANDING trailing work. Success paths
             \* await; the fault path goes straight to the commit.
@@ -100,7 +100,7 @@ ExecutorAwaitTrailingTask ==
   /\ UNCHANGED <<pipelineState, trailingState, tailResident, retired, faultDoubleRetire,
                  successorIssued, recoveryState, sharedOutputTouched, executorItem>>
 
-ExecutorCommitItem ==   \* commit/complete the tail waiter (retire, or hand to recovery)
+ExecutorCommitItem ==   \* commit/complete the pending tail (retire, or hand to recovery)
   /\ executorPc = "commitItem"
   /\ IF tailResident = NONE
        THEN /\ UNCHANGED <<pipelineState, retired, faultDoubleRetire, tailResident, recoveryState>>

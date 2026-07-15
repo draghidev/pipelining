@@ -46,10 +46,10 @@ public class PipelineEnumeratorTests
     }
 
     [TestMethod]
-    public async Task PendingWaiters_YieldsAllInEnqueueOrder()
+    public async Task PendingInFlightItems_YieldsAllInEnqueueOrder()
     {
         // Items are CompleteAsync, so depth never reaches 0 - use the source onIdle hook as the
-        // executor-at-rest signal (CommitTailWaiter's transit window must be settled before enum).
+        // executor-at-rest signal (CommitPendingTail's transit window must be settled before enum).
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
@@ -89,7 +89,7 @@ public class PipelineEnumeratorTests
     {
         // SPSC initial segment size is 32. Enqueue more than that to force segment growth.
         // Items are CompleteAsync, so depth never reaches 0 - use the source onIdle hook as the
-        // executor-at-rest signal (CommitTailWaiter's transit window must be settled before enum).
+        // executor-at-rest signal (CommitPendingTail's transit window must be settled before enum).
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(runEnqueueAsynchronously: true),
@@ -196,7 +196,7 @@ public class PipelineEnumeratorTests
     public async Task ManualMoveNext_ReturnsFalseAfterLastItem()
     {
         // WaitForExecutedAsync only signals that SignalExecuted fired inside ExecuteItemAsync.
-        // the executor hasn't yet committed the item to _tailWaiter / _waiters. Use the source
+        // the executor hasn't yet committed the item to _pendingTail / _inFlight. Use the source
         // onIdle hook to wait until the executor is settled before enumerating, otherwise MoveNext
         // races the routing and may see no items.
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);

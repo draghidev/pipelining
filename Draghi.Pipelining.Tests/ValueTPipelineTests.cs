@@ -7,8 +7,8 @@ public class ValueTPipelineTests
 {
     /// Smoke test for value-type T: pushes items through the full pipeline lifecycle and verifies
     /// activation + completion fire. Exercises the publish-pair fence paths that differ from ref-T
-    /// (no GC write barrier on _executingItem / _tailWaiter), the Volatile.Write on _executingItemActivationPending
-    /// at line 209, and the Volatile.Write on _hasTailWaiter publish.
+    /// (no GC write barrier on _executingItem / _pendingTail), the Volatile.Write on _executingItemActivationPending
+    /// at line 209, and the Volatile.Write on _hasPendingTail publish.
     [TestMethod]
     public async Task ValueTypeT_BasicLifecycle()
     {
@@ -40,7 +40,7 @@ public class ValueTPipelineTests
         Assert.AreEqual(0, pipeline.Pipeline.ActivatedItem.Id, "value-type ActivatedItem slot should clear to default after drain.");
     }
 
-    /// Enumeration with value-type T. Exercises the Enumerator's reads of _tailWaiter / _waiters
+    /// Enumeration with value-type T. Exercises the Enumerator's reads of _pendingTail / _inFlight
     /// for value-T (no GC barrier on the ref write side). After the executor suspends, all items should
     /// be observable via the enumerator in enqueue order.
     [TestMethod]
@@ -94,10 +94,10 @@ public class ValueTPipelineTests
     /// DOCUMENTS a cross-cycle tearing limitation that affects enumerator-style readers racing
     /// the writer thread for large value-T. Two sites have this shape:
     ///
-    /// 1. Pipeline.Enumerator reading `_tailWaiter`: the publish-pair fence on `_hasTailWaiter`
+    /// 1. Pipeline.Enumerator reading `_pendingTail`: the publish-pair fence on `_hasPendingTail`
     ///    (Volatile.Write/Read) prevents single-cycle tearing, but across cycles the executor's
-    ///    PLAIN clear of `_hasTailWaiter=false` may not propagate before the reader's Volatile.Read
-    ///    sees the prior cycle's `true`, the reader then PLAIN-reads a multi-word `_tailWaiter`
+    ///    PLAIN clear of `_hasPendingTail=false` may not propagate before the reader's Volatile.Read
+    ///    sees the prior cycle's `true`, the reader then PLAIN-reads a multi-word `_pendingTail`
     ///    that the executor is mid-writing for the next cycle.
     ///
     /// 2. SPSC.Enumerator reading an `_array[i]` slot: TryDequeue clears the slot to default after
@@ -106,8 +106,8 @@ public class ValueTPipelineTests
     ///
     /// The PRIMARY functions of both, single SPSC consumer reading slots that were written once
     /// before the producer's release of `_last`, and the executor itself reading its own
-    /// `_tailWaiter`, are NOT affected: slots are read after a release-acquire pair, and
-    /// `_tailWaiter` is single-thread for its primary reader.
+    /// `_pendingTail`, are NOT affected: slots are read after a release-acquire pair, and
+    /// `_pendingTail` is single-thread for its primary reader.
     ///
     /// Enable manually to verify, or use as the template for a future snapshot-via-CAS publishing
     /// pattern that would close both races.
@@ -119,11 +119,11 @@ public class ValueTPipelineTests
     /// cross-cycle window here, not evidence the race is gone. Left `[Ignore]`d: this remains a
     /// deliberate, accepted trade-off for large value-T, not a regression to chase.
     [TestMethod]
-    [Ignore("Cross-cycle Enumerator tearing on _tailWaiter for large value-T - confirmed still real " +
+    [Ignore("Cross-cycle Enumerator tearing on _pendingTail for large value-T - confirmed still real " +
         "2026-07-10 at a larger workload (200_000 items; the original 1000-item load was too small to " +
         "reliably reproduce it here). Enable manually to verify, or use as the template for a future " +
         "snapshot-via-CAS publishing fix.")]
-    public async Task LargeValueTypeT_EnumeratorTailWaiterCrossCycleTearing()
+    public async Task LargeValueTypeT_EnumeratorPendingTailCrossCycleTearing()
     {
         var pool = new ValueItemPool();
         var pipeline = Pipeline.Create<LargeValueItem, LargeValueItemPolicy>(new(pool));
@@ -164,7 +164,7 @@ public class ValueTPipelineTests
         Assert.IsFalse(tearObserved, "Slot write torn — expected for large value-T without a snapshot-publishing fix.");
     }
 
-    /// Value-type T with async pipeline tasks - exercises the deferred-publish + _tailWaiter
+    /// Value-type T with async pipeline tasks - exercises the deferred-publish + _pendingTail
     /// path for value-T. Tests the publish-pair fence ordering under load.
     [TestMethod]
     public async Task ValueTypeT_DeferredPublishAndDrain()
@@ -184,7 +184,7 @@ public class ValueTPipelineTests
             pipeline.Enqueue(new ValueItem(ids[i])).Execute();
         }
 
-        // Wait until the executor suspends (all items in _waiters with callbacks registered).
+        // Wait until the executor suspends (all items in _inFlight with callbacks registered).
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Complete pipeline tasks in order.
@@ -297,7 +297,7 @@ sealed class ValueItemPool
 
 readonly struct ValueItemPolicy(ValueItemPool pool) : IPipelinePolicy<ValueItem>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(ValueItem item, bool waiterExecution, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(ValueItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         => new(new PipelineItemResult(default, pool.Get(item.Id).GetPipelineTask()));
 
     public void ActivateHeadItem(ValueItem item, bool preferAsync = true) => pool.Get(item.Id).Activate();
@@ -319,7 +319,7 @@ readonly record struct LargeValueItem(long A, long B, long C, long D);
 
 readonly struct LargeValueItemPolicy(ValueItemPool pool, Action<long, long, long, long>? onComplete = null) : IPipelinePolicy<LargeValueItem>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(LargeValueItem item, bool waiterExecution, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(LargeValueItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         => new(new PipelineItemResult(default, default));
 
     public void ActivateHeadItem(LargeValueItem item, bool preferAsync = true) { }

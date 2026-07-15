@@ -21,7 +21,7 @@ public interface IPipelineEnumerator<T> : IAsyncDisposable
     CancellationToken CompletionToken { get; }
 
     /// <summary>
-    /// Signals the enumeration to stop producing items. After Complete, the source resolves its
+    /// Signals the enumeration to stop accepting or producing new items. After Complete, the source resolves its
     /// residual (items enqueued but not yet dispatched) and then resolves completed. The
     /// disposition is the source's choice: drain the residual through the executor, or reclaim it
     /// in bulk for the producer to dispose or migrate. CompletionToken fires so policy methods
@@ -47,11 +47,11 @@ public interface IPipelineEnumerator<T> : IAsyncDisposable
     /// resolves to an immediate retry rather than a lost wake.
     /// </summary>
     /// <remarks>
-    /// This pair replaces <see cref="IAsyncEnumerator{T}.MoveNextAsync"/> as the executor's pull
+    /// This pair replaces the usual <c>MoveNextAsync</c> operation as the executor's pull
     /// seam: the miss path returns a concrete awaitable (see <see cref="WaitForNextAwaitable"/>)
     /// instead of a <see cref="ValueTask{TResult}"/>, which on the wait-per-item production shape
-    /// skips the value-task-source dispatch stack entirely. MoveNextAsync remains as the
-    /// <c>await foreach</c>-compatible surface.
+    /// skips the value-task-source dispatch stack entirely. Await-foreach compatibility is supplied
+    /// by <see cref="PipelineSourceAsyncEnumerable{T,TSource,TEnumerator}"/>.
     /// </remarks>
     WaitForNextAwaitable WaitForNextAsync();
 }

@@ -170,7 +170,7 @@ Spec ==
          /\ WF_vars(DeliverCompletionCallback(i)) /\ WF_vars(CompletionCallbackAcquireOrDeposit(i))
 
 (* ------------------------------ properties -------------------------------- *)
-\* THE AOORE FACE: no consumption tears a live-or-pending phase-2 completionDispatch.
+\* AOORE property: no consumption tears a live-or-pending phase-2 completionDispatch.
 CompletionDispatchNeverTorn == \A i \in 1..N : ~completionDispatchTorn[i]
 
 \* The mid-completionDispatch subclass alone (the literal AOORE: pair-reads live at consume).

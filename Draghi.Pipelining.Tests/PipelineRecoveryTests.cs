@@ -88,7 +88,7 @@ public class PipelineRecoveryTests
     }
 
     [TestMethod]
-    public async Task RecoveryPipelineTaskPending_StoredAsTailWaiter()
+    public async Task RecoveryPipelineTaskPending_StoredAsPendingTail()
     {
         var recovery = new TestPipelineItem { CompleteAsync = true };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
@@ -121,12 +121,12 @@ public class PipelineRecoveryTests
     }
 
     [TestMethod]
-    public async Task WaiterPipelineTaskFaults_RecoveryOnAdvancer()
+    public async Task InFlightPipelineTaskFaults_RecoveryOnAdvancer()
     {
         var recovery = new TestPipelineItem();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
@@ -147,29 +147,29 @@ public class PipelineRecoveryTests
 
     // Regression: an ASYNC waiter-recovery that retires the LAST in-flight item must fire the depth-0
     // idle signal, so a WaitForEmptyAsync armed BEFORE the terminal completion is woken. The bug: the
-    // recovery continuation completes the item via CompleteRecoveryWaiterDeferred (depth -> 0 without
+    // recovery continuation completes the item via CompleteRecoveryItemDeferred (depth -> 0 without
     // firing OnDepthReachedZero, by design) and discarded `emptyReached` via `out _`, so the zero-
     // crossing was lost - hanging the parked WaitForEmptyAsync. Fix threads the bit to
     // AdvanceAndDrainRecovery(emptyReached) which fires after the advancer release.
     [TestMethod]
-    public async Task AsyncWaiterRecovery_LastItem_FiresDepthZeroForParkedWaitForEmpty()
+    public async Task AsyncInFlightRecovery_LastItem_FiresDepthZeroForParkedWaitForEmpty()
     {
         // BOTH the recovery's EXECUTE and its PIPELINE task are async. Execute-async hooks the
-        // continuation at RecoverWaiter; when that continuation runs the pipeline task is STILL pending
-        // (CompleteAsync), so RecoverWaiterPipelineTask returns false and hooks the pipeline-task
+        // continuation at RecoverInFlightItem; when that continuation runs the pipeline task is STILL pending
+        // (CompleteAsync), so RecoverInFlightPipelineTask returns false and hooks the pipeline-task
         // continuation. Completing the pipeline task LAST runs that continuation, which completes the
-        // recovery (the last item) via CompleteRecoveryWaiterDeferred (depth -> 0, no inline fire) and
+        // recovery (the last item) via CompleteRecoveryItemDeferred (depth -> 0, no inline fire) and
         // returned emptyReached through the `out` now threaded to AdvanceAndDrainRecovery. With both
-        // tasks sync the flow collapses into RecoverWaiter's synchronous return-true path (where
+        // tasks sync the flow collapses into RecoverInFlightItem's synchronous return-true path (where
         // emptyReached was never dropped); the async pipeline task is required to reach the dropped site.
         var recovery = new TestPipelineItem { ExecuteAsync = true, CompleteAsync = true };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // One item, committed as a waiter, whose pipeline task faults -> waiter-side recovery.
+        // One committed item whose pipeline task faults, driving pipeline-task recovery.
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
         pipeline.Enqueue(item).Execute();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -178,12 +178,12 @@ public class PipelineRecoveryTests
         var drainTask = pipeline.WaitForEmptyAsync();
         Assert.IsFalse(drainTask.IsCompleted, "WaitForEmptyAsync must park while the waiter is in flight.");
 
-        // Fault the waiter -> RecoverWaiter dispatches the substitute, whose execute is async.
+        // Fault the waiter -> RecoverInFlightItem dispatches the substitute, whose execute is async.
         item.CompletePipelineTask();
 
-        // Barrier: wait until RecoverWaiter has actually called ExecuteItemAsync and is parked on the
+        // Barrier: wait until RecoverInFlightItem has actually called ExecuteItemAsync and is parked on the
         // PENDING execute task (SignalExecuted fires right after GetExecuteTask). Without this the test
-        // can complete the execute task before RecoverWaiter checks IsCompletedSuccessfully, collapsing
+        // can complete the execute task before RecoverInFlightItem checks IsCompletedSuccessfully, collapsing
         // into the synchronous return-true path where emptyReached was never dropped.
         await recovery.WaitForExecutedAsync();
 
@@ -222,14 +222,14 @@ public class PipelineRecoveryTests
     [TestMethod]
     public async Task CommittedTailFaults_RecoveryOnExecutor()
     {
-        // The committed tail recovery path (PipelineTask kind in CommitTailWaiter) requires the
+        // The committed tail recovery path (PipelineTask kind in CommitPendingTail) requires the
         // pipeline task to fault between being stored as tail and committed on the next iteration.
         // This is hard to hit deterministically. Instead, we test that recovery works regardless
-        // of which path handles it (PipelineTask or PipelineTaskWaiter).
+        // of which path handles it (ExecutionPipelineTask or PipelineTask).
         var recovery = new TestPipelineItem();
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask or PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask or PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
@@ -367,23 +367,23 @@ public class PipelineRecoveryTests
         Assert.AreSame(recoveryTrailingEx, recovery.Exception);
     }
 
-    /// RecoverCommittedTailWaiter hooks an async executeTask continuation when recovery has
+    /// RecoverCommittedPendingTail hooks an async executeTask continuation when recovery has
     /// ExecuteAsync=true. If CompleteAsync fires while that continuation is in flight, the
-    /// continuation has no wake-signal bailout (unlike RecoverWaiter's continuation). The
-    /// continuation runs, hits EnqueueWaiter for the recovery (since its pipeline task is
-    /// pending), but OnWaiterTaskCompleted's wake-signal-completed check causes the advancer
-    /// to skip, leaving the recovery item leaked in _waiters with no one to drain it.
+    /// continuation has no wake-signal bailout (unlike RecoverInFlightItem's continuation). The
+    /// continuation runs, hits CommitInFlightItem for the recovery (since its pipeline task is
+    /// pending), but OnInFlightTaskCompleted's wake-signal-completed check causes the advancer
+    /// to skip, leaving the recovery item leaked in _inFlight with no one to drain it.
     [TestMethod]
-    public async Task RecoverCommittedTailWaiter_AsyncContinuationRacesCompleteAsync_NoLeak()
+    public async Task RecoverCommittedPendingTail_AsyncContinuationRacesCompleteAsync_NoLeak()
     {
         var recovery = new TestPipelineItem { ExecuteAsync = true, CompleteAsync = true };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+            ctx => ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask ? recovery : null));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Construct an item that hits the committed-tail-faulted path: HasTrailingTask=true
         // keeps the executor inside the trailing await past the pipeline-task fault check on
-        // lines 178/184, then CommitTailWaiter at line 238 observes the faulted pipeline task.
+        // lines 178/184, then CommitPendingTail at line 238 observes the faulted pipeline task.
         var item = new TestPipelineItem
         {
             CompleteAsync = true,
@@ -395,7 +395,7 @@ public class PipelineRecoveryTests
         // Executor is awaiting item's trailing task.
 
         item.CompletePipelineTask();   // fault the pipeline task while executor is in trailing-await
-        item.CompleteTrailingTask();   // signal trailing done. executor resumes, exits inner loop, CommitTailWaiter -> RecoverCommittedTailWaiterAsync
+        item.CompleteTrailingTask();   // signal trailing done. executor resumes, exits inner loop, CommitPendingTail -> RecoverCommittedPendingTailAsync
 
         // Wait for recovery's executeTask to be in flight: ExecuteItemAsync ran (SignalExecuted fired)
         // and the executor is now suspended in await ExecuteItemAsync on the recovery item.
@@ -406,7 +406,7 @@ public class PipelineRecoveryTests
         var completeTask = pipeline.CompleteAsync().AsTask();
 
         // Drive recovery to completion. Pipeline task pending when executor resumes from
-        // ExecuteItemAsync await, so it'll either EnqueueWaiter (if wake not yet observed) or bail
+        // ExecuteItemAsync await, so it'll either CommitInFlightItem (if wake not yet observed) or bail
         // via the wake-completed branch.
         recovery.CompleteExecuteTask();
         recovery.CompletePipelineTask();
@@ -417,17 +417,17 @@ public class PipelineRecoveryTests
         Assert.IsTrue(recovery.IsCompleted, "Recovery item must be completed.");
     }
 
-    /// Regression guard: the trailing-task continuation in RecoverCommittedTailWaiterResult also
-    /// flows through RecoverCommittedTailWaiterPipelineTask (which has the wake-completed check
+    /// Regression guard: the trailing-task continuation in RecoverCommittedPendingTailResult also
+    /// flows through RecoverCommittedPendingTailPipelineTask (which has the wake-completed check
     /// fix). Verify that path is correctly covered by the leaf fix - no separate leak.
     [TestMethod]
-    public async Task RecoverCommittedTailWaiter_TrailingContinuationRacesCompleteAsync_NoLeak()
+    public async Task RecoverCommittedPendingTail_TrailingContinuationRacesCompleteAsync_NoLeak()
     {
         // Recovery has HasTrailingTask=true (async trailing) and CompleteAsync=true (async pipeline).
-        // Executor will fire trailing continuation, which calls RecoverCommittedTailWaiterPipelineTask.
+        // Executor will fire trailing continuation, which calls RecoverCommittedPendingTailPipelineTask.
         var recovery = new TestPipelineItem { HasTrailingTask = true, CompleteAsync = true };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+            ctx => ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask ? recovery : null));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
@@ -440,7 +440,7 @@ public class PipelineRecoveryTests
         await item.WaitForExecutedAsync();
 
         item.CompletePipelineTask();   // fault pipeline task while executor in trailing-await
-        item.CompleteTrailingTask();   // signal trailing done -> CommitTailWaiter sees faulted pipeline task -> RecoverCommittedTailWaiter
+        item.CompleteTrailingTask();   // signal trailing done -> CommitPendingTail sees faulted pipeline task -> RecoverCommittedPendingTail
 
         await recovery.WaitForExecutedAsync();
 
@@ -457,25 +457,25 @@ public class PipelineRecoveryTests
         Assert.IsTrue(recovery.IsCompleted, "Recovery item must be completed even when arriving through the trailing-await path.");
     }
 
-    /// Regression guard for RecoverWaiterPipelineTask's continuation bailout. When CompleteAsync
+    /// Regression guard for RecoverInFlightPipelineTask's continuation bailout. When CompleteAsync
     /// fires while recovery's pipeline task is pending, the continuation holds _advancing across
     /// the async boundary. DrainOnCompletion spins on Interlocked.Exchange(ref _advancing, true)
-    /// until the continuation releases it. The original bailout only set _waiterInRecovery=false
+    /// until the continuation releases it. The original bailout only set in-flight recovery=false
     /// and never released _advancing, deadlocking CompleteAsync. The bailout now mirrors the
     /// executeTask continuation pattern (lock + complete-if-needed + release _advancing).
     [TestMethod]
-    public async Task RecoverWaiterPipelineTask_PendingDuringCompleteAsync_DoesNotDeadlock()
+    public async Task RecoverInFlightPipelineTask_PendingDuringCompleteAsync_DoesNotDeadlock()
     {
-        // Recovery: sync execute, pipeline task pending. Triggers the RecoverWaiterPipelineTask
+        // Recovery: sync execute, pipeline task pending. Triggers the RecoverInFlightPipelineTask
         // continuation-hooked path that holds _advancing.
         var recovery = new TestPipelineItem { CompleteAsync = true };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // Original: async pipeline that will fault, drives the advancer into RecoverWaiter.
+        // Original: async pipeline that will fault, drives the advancer into RecoverInFlightItem.
         var item = new TestPipelineItem
         {
             CompleteAsync = true,
@@ -486,12 +486,12 @@ public class PipelineRecoveryTests
         // Wait for the original to be committed as a waiter.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Fault the pipeline task. Advancer fires, RecoverWaiter runs, recovery executes sync,
+        // Fault the pipeline task. Advancer fires, RecoverInFlightItem runs, recovery executes sync,
         // recovery's pipeline task is pending, continuation hooked, _advancing stays held.
         item.CompletePipelineTask();
         await recovery.WaitForExecutedAsync();
 
-        // CompleteAsync. DrainOnCompletion takes _waiterRecoveryLock, completes the recovery
+        // CompleteAsync. DrainOnCompletion takes _inFlightRecoveryLock, completes the recovery
         // item, releases the lock, then spins waiting for _advancing to be released.
         var completeTask = pipeline.CompleteAsync().AsTask();
         await Task.Delay(100); // let CompleteAsync reach the _advancing spin.
@@ -505,9 +505,9 @@ public class PipelineRecoveryTests
     }
 
     /// Regression guard for double-completion of the recovery item under shutdown race.
-    /// RecoverWaiter's executeTask continuation has a wake-check entry. If it fires while the
-    /// continuation is past the check but before CompleteWaiter, DrainOnCompletion (via
-    /// CompleteAsync) may also complete the recovery item via _waiterRecoveryItem. Both code
+    /// RecoverInFlightItem's executeTask continuation has a wake-check entry. If it fires while the
+    /// continuation is past the check but before RetireItem, DrainOnCompletion (via
+    /// CompleteAsync) may also complete the recovery item via _inFlightRecoveryItem. Both code
     /// paths call into policy.CompleteItem on the same item, double dispatch, a contract
     /// violation. Stress test: many iterations of "recovery with async execute, race CompleteAsync
     /// against executeTask completion". Even one observed double-complete fails the test.
@@ -515,16 +515,16 @@ public class PipelineRecoveryTests
     /// FIXED (2026-07-10, this was previously mis-`[Ignore]`d as "flaky on cold threadpool" - it
     /// wasn't threadpool-related at all): item's PipelineTaskException can be discovered by either
     /// of two distinct recovery entry points depending on a genuine, expected timing race - the
-    /// advance-chain's own retire-walk (RecoverWaiter, PipelineItemFailureKind.PipelineTaskWaiter,
+    /// advance-chain's own retire-walk (RecoverInFlightItem, PipelineItemFailureKind.PipelineTask,
     /// Pipeline.cs ~1671) if item is already a committed resident when its task settles, or
-    /// CommitTailWaiter's own completion check (RecoverCommittedTailWaiterAsync,
+    /// CommitPendingTail's own completion check (RecoverCommittedPendingTailAsync,
     /// PipelineItemFailureKind.PipelineTask, ~1037) if CompletePipelineTask races ahead of the
     /// executor looping back to commit it. Both are legitimate, both need the same
     /// no-double-complete-under-shutdown-race property this test checks - the factory below must
-    /// offer the substitute for both kinds, not just PipelineTaskWaiter, or roughly 10-25% of
+    /// offer the substitute for both kinds, not just PipelineTask, or roughly 10-25% of
     /// iterations hang forever waiting for a substitute that a declined-recovery path never creates.
     [TestMethod]
-    public async Task RecoverWaiter_ContinuationSuccessPath_NoDoubleCompleteUnderShutdown()
+    public async Task RecoverInFlightItem_ContinuationSuccessPath_NoDoubleCompleteUnderShutdown()
     {
         for (var i = 0; i < 10; i++)
         {
@@ -533,7 +533,7 @@ public class PipelineRecoveryTests
 
             var pipeline = Pipeline.Create<TestPipelineItem, CompletionCountingPolicy>(
                 new CompletionCountingPolicy(completeCounts,
-                    ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter or PipelineItemFailureKind.PipelineTask ? recovery : null));
+                    ctx => ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask or PipelineItemFailureKind.PipelineTask ? recovery : null));
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
             var item = new TestPipelineItem
@@ -544,14 +544,14 @@ public class PipelineRecoveryTests
             pipeline.Enqueue(item).Execute();
             await item.WaitForExecutedAsync();
 
-            // Fault pipeline → advancer → RecoverWaiter hooks async executeTask continuation,
-            // _waiterRecoveryItem = recovery.
+            // Fault pipeline → advancer → RecoverInFlightItem hooks async executeTask continuation,
+            // _inFlightRecoveryItem = recovery.
             item.CompletePipelineTask();
             await recovery.WaitForExecutedAsync();
 
             // Race window: fire CompleteAsync just before/during executeTask completion. Try to
-            // land the continuation past wake-check but before CompleteWaiter while DrainOnCompletion
-            // also runs CompleteWaiter on _waiterRecoveryItem.
+            // land the continuation past wake-check but before RetireItem while DrainOnCompletion
+            // also runs RetireItem on _inFlightRecoveryItem.
             var completeTask = Task.Run(() => pipeline.CompleteAsync().AsTask());
             recovery.CompleteExecuteTask();
             await completeTask.WaitAsync(TimeSpan.FromSeconds(30));
@@ -574,7 +574,7 @@ public class PipelineRecoveryTests
             _recoveryFactory = recoveryFactory;
         }
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             if (item.ThrowOnExecute is { } ex)
                 throw ex;
@@ -603,9 +603,9 @@ public class PipelineRecoveryTests
     /// Executor inline path: ExecuteItemAsync returns a sync-faulted PipelineTask. Pins the
     /// failure-kind for the branch at Pipeline.cs:235-250 (the sync-faulted pipeline task path),
     /// which existing CommittedTailFaults_RecoveryOnExecutor explicitly cannot distinguish from
-    /// the PipelineTaskWaiter route.
+    /// the PipelineTask route.
     [TestMethod]
-    public async Task SyncFaultedPipelineTaskOnExecutorPath_RecoveryKindIsPipelineTask()
+    public async Task SyncFaultedPipelineTaskOnExecutorPath_RecoveryKindIsExecutionPipelineTask()
     {
         var observedKind = PipelineItemFailureKind.ExecuteItemTask;  // intentionally wrong default
         Exception? observedException = null;
@@ -625,7 +625,7 @@ public class PipelineRecoveryTests
         pipeline.Enqueue(item).Execute();
         await recovery.WaitForCompleteAsync();
 
-        Assert.AreEqual(PipelineItemFailureKind.PipelineTask, observedKind);
+        Assert.AreEqual(PipelineItemFailureKind.ExecutionPipelineTask, observedKind);
         Assert.AreSame(faultEx, observedException);
     }
 
@@ -679,16 +679,16 @@ public class PipelineRecoveryTests
         Assert.AreSame(recoveryEx, recovery.Exception);
     }
 
-    /// RecoverWaiter's recovery-execute sync-throw catch (lines 799-807). Advancer-side variant
+    /// RecoverInFlightItem's recovery-execute sync-throw catch (lines 799-807). Advancer-side variant
     /// of TrailingFailure_RecoveryExecuteThrows.
     [TestMethod]
-    public async Task WaiterRecovery_RecoveryExecuteSyncThrows_RecoveryCompletedWithException()
+    public async Task InFlightRecovery_RecoveryExecuteSyncThrows_RecoveryCompletedWithException()
     {
         var recoveryEx = new ApplicationException("recovery execute fail");
         var recovery = new TestPipelineItem { ThrowOnExecute = recoveryEx };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
@@ -705,12 +705,12 @@ public class PipelineRecoveryTests
         Assert.AreSame(recoveryEx, recovery.Exception);
     }
 
-    /// Waiter-phase counterpart of SyncFaultedPipelineTaskOnExecutorPath / TrailingFailure_RecoveryPipeline
+    /// In-flight counterpart of SyncFaultedPipelineTaskOnExecutorPath / TrailingFailure_RecoveryPipeline
     /// SyncFaulted: the waiter's substitute EXECUTES fine but returns a SYNC-faulted pipeline task
-    /// (CompleteAsync=false + PipelineTaskException). RecoverWaiter sees the faulted pipeline task inline on
+    /// (CompleteAsync=false + PipelineTaskException). RecoverInFlightItem sees the faulted pipeline task inline on
     /// the ADVANCER - no executor try/catch behind it - and must still complete the recovery with that fault.
     [TestMethod]
-    public async Task WaiterRecovery_RecoveryPipelineSyncFaulted_RecoveryCompletedWithException()
+    public async Task InFlightRecovery_RecoveryPipelineSyncFaulted_RecoveryCompletedWithException()
     {
         var recoveryEx = new ApplicationException("recovery pipeline sync fault");
         // CompleteAsync=false => GetPipelineTask returns an already-faulted ValueTask, observed inline.
@@ -720,12 +720,12 @@ public class PipelineRecoveryTests
         // waiter fault), never again for the recovery's own failure. A re-consultation bumps this.
         var consults = 0;
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => { consults++; return ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null; }),
+            new(true, ctx => { consults++; return ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null; }),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Pending pipeline task => the item commits as a tail waiter; faulting it drives the advancer
-        // into the PipelineTaskWaiter recovery route (not the executor's inline path).
+        // into the PipelineTask recovery route (not the executor's inline path).
         var item = new TestPipelineItem
         {
             CompleteAsync = true,
@@ -740,23 +740,23 @@ public class PipelineRecoveryTests
         Assert.AreEqual(1, consults, "a failing recovery must NOT be re-recovered (recovery-of-recovery is unsupported)");
     }
 
-    /// Waiter-phase counterpart of RecoveryPipelineTaskFaults / RecoveryFromTrailingFailure_RecoveryPipeline
+    /// In-flight counterpart of RecoveryPipelineTaskFaults / RecoveryFromTrailingFailure_RecoveryPipeline
     /// TaskFaultsAsync: the waiter's substitute executes, then its PENDING pipeline task faults ASYNC - so
-    /// the fault lands in RecoverWaiterPipelineTask's deferred continuation on the advancer, the one path
+    /// the fault lands in RecoverInFlightPipelineTask's deferred continuation on the advancer, the one path
     /// with no executor try/catch behind it. The failed recovery must complete WITH the fault (no hang, no
-    /// unobserved advancer throw, no double-complete). RecoverWaiterPipelineTask_PendingDuringCompleteAsync
+    /// unobserved advancer throw, no double-complete). RecoverInFlightPipelineTask_PendingDuringCompleteAsync
     /// drives this same continuation but only ever with a CLEAN recovery; this is the faulting case.
     [TestMethod]
-    public async Task WaiterRecovery_RecoveryPipelineTaskFaultsAsync_RecoveryCompletedWithException()
+    public async Task InFlightRecovery_RecoveryPipelineTaskFaultsAsync_RecoveryCompletedWithException()
     {
         var recoveryEx = new ApplicationException("recovery pipeline async fault");
-        // CompleteAsync=true => pipeline task pending, so RecoverWaiterPipelineTask hooks a continuation.
+        // CompleteAsync=true => pipeline task pending, so RecoverInFlightPipelineTask hooks a continuation.
         var recovery = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = recoveryEx };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         // Recovery-of-recovery is unsupported: exactly ONE consultation, for the original waiter fault.
         var consults = 0;
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => { consults++; return ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null; }),
+            new(true, ctx => { consults++; return ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null; }),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
@@ -768,7 +768,7 @@ public class PipelineRecoveryTests
         pipeline.Enqueue(item).Execute();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        // Fault the waiter -> advancer -> RecoverWaiter dispatches the substitute, it executes sync, its
+        // Fault the waiter -> advancer -> RecoverInFlightItem dispatches the substitute, it executes sync, its
         // pipeline task is pending, the continuation is hooked.
         item.CompletePipelineTask();
         await recovery.WaitForExecutedAsync().WaitAsync(TimeSpan.FromSeconds(5));
@@ -785,15 +785,14 @@ public class PipelineRecoveryTests
     /// The TESTABLE half of the executor/advancer asymmetry: the executor IS the task CompleteAsync
     /// awaits (observable live via Completion), so a throw at an UNGUARDED seam (here the policy's
     /// TryRecoverItemFailure) is captured by the loop's catch-all and surfaced through the execution
-    /// task instead of killing the pump. The advancer half (a bare-seam throw escaping onto a TP
-    /// thread) is deliberately NOT tested. It has no task to deliver to, so fail-fast is the design
-    /// and asserting it means crashing the host.
+    /// task after retiring the failed item's tenure. The advancer half (a throw escaping onto a TP
+    /// thread after tenure cleanup) is deliberately NOT tested: it has no task surface, so fail-fast
+    /// is the design and asserting it means crashing the host.
     [TestMethod]
     public async Task ExecutorRecoveryPolicyThrows_FaultSurfacesThroughExecutionTask()
     {
         var policyEx = new InvalidOperationException("policy blew up");
-        // The recovery factory itself throws => TryRecoverItemFailure throws, which is NOT one of
-        // RecoverItem's guarded seams (it runs before RecoverItem's try), so it propagates to the
+        // The recovery factory itself throws; RecoverItem retires the item and rethrows to the
         // loop's catch-all.
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => throw policyEx));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
@@ -806,29 +805,32 @@ public class PipelineRecoveryTests
         try { await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)); }
         catch (Exception ex) { surfaced = ex; }
         Assert.AreSame(policyEx, surfaced, "an unguarded executor-seam throw must surface through the execution task, not escape");
+        Assert.IsTrue(item.IsCompleted, "terminal executor failure must still retire the failed item's tenure");
+        Assert.AreSame(policyEx, item.Exception);
+        Assert.AreEqual(0, pipeline.Depth);
     }
 
     /// The marker path: a recovery that COMMITS as a waiter (pending pipeline task) has its task wrapped in
-    /// GuardRecoveryTask (935), so a LATE fault is rethrown as RecoveryItemFaultException and RecoverWaiter
-    /// (1480) / RecoverCommittedTailWaiterAsync (819) complete it DIRECTLY - never re-consulting the policy.
-    /// The existing RecoverCommittedTailWaiter_* tests drive this commit path only with a CLEAN recovery;
+    /// GuardRecoveryTask (935), so a LATE fault is rethrown as RecoveryItemFaultException and RecoverInFlightItem
+    /// (1480) / RecoverCommittedPendingTailAsync (819) complete it DIRECTLY - never re-consulting the policy.
+    /// The existing RecoverCommittedPendingTail_* tests drive this commit path only with a CLEAN recovery;
     /// this is the faulting case, asserting the no-recovery-of-recovery invariant (consults==1) on it.
     [TestMethod]
     public async Task CommittedTailRecovery_RecoveryFaultsLate_MarkerCompletesDirectly()
     {
         var recoveryEx = new ApplicationException("recovery faults late");
-        // Async execute keeps RecoverCommittedTailWaiterAsync suspended at the execute await until we let
+        // Async execute keeps RecoverCommittedPendingTailAsync suspended at the execute await until we let
         // it through, so the pending pipeline task is still pending when it reaches the commit (918) -
         // forcing the GuardRecoveryTask wrap rather than the inline pipeline-already-faulted branch (875).
         var recovery = new TestPipelineItem { ExecuteAsync = true, CompleteAsync = true, PipelineTaskException = recoveryEx };
         var consults = 0;
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => { consults++; return ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null; }));
+            ctx => { consults++; return ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask ? recovery : null; }));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // Committed-tail-faulted path (mirrors RecoverCommittedTailWaiter_*): HasTrailingTask keeps the
-        // executor in the trailing await past the pipeline-task fault check, then CommitTailWaiter observes
-        // the faulted pipeline task and routes to RecoverCommittedTailWaiterAsync.
+        // Committed-tail-faulted path (mirrors RecoverCommittedPendingTail_*): HasTrailingTask keeps the
+        // executor in the trailing await past the pipeline-task fault check, then CommitPendingTail observes
+        // the faulted pipeline task and routes to RecoverCommittedPendingTailAsync.
         var item = new TestPipelineItem
         {
             CompleteAsync = true,
@@ -840,13 +842,13 @@ public class PipelineRecoveryTests
         item.CompletePipelineTask();
         item.CompleteTrailingTask();
 
-        // Recovery's (async) execute is now in flight inside RecoverCommittedTailWaiterAsync.
+        // Recovery's (async) execute is now in flight inside RecoverCommittedPendingTailAsync.
         await recovery.WaitForExecutedAsync().WaitAsync(TimeSpan.FromSeconds(5));
         recovery.CompleteExecuteTask();
         await Task.Delay(50); // let it reach the commit (918) with the pipeline task still pending.
 
         // Fault the now-committed recovery's pipeline task: GuardRecoveryTask rethrows the marker, and
-        // RecoverWaiter completes it directly with the inner fault - WITHOUT consulting the policy again.
+        // RecoverInFlightItem completes it directly with the inner fault - WITHOUT consulting the policy again.
         recovery.CompletePipelineTask();
 
         await recovery.WaitForCompleteAsync().WaitAsync(TimeSpan.FromSeconds(5));
@@ -854,7 +856,7 @@ public class PipelineRecoveryTests
         Assert.AreEqual(1, consults, "a late-faulting committed recovery is completed via the marker, never re-recovered");
     }
 
-    /// RecoverCommittedTailWaiterAsync's execute catch (lines 572-575). Committed-tail recovery
+    /// RecoverCommittedPendingTailAsync's execute catch (lines 572-575). Committed-tail recovery
     /// where the recovery item's ExecuteItemAsync throws synchronously.
     [TestMethod]
     public async Task CommittedTailRecovery_RecoveryExecuteThrows_RecoveryCompletedWithException()
@@ -862,12 +864,12 @@ public class PipelineRecoveryTests
         var recoveryEx = new ApplicationException("recovery execute fail");
         var recovery = new TestPipelineItem { ThrowOnExecute = recoveryEx };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+            ctx => ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask ? recovery : null));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // Same setup as RecoverCommittedTailWaiter_AsyncContinuationRacesCompleteAsync_NoLeak:
+        // Same setup as RecoverCommittedPendingTail_AsyncContinuationRacesCompleteAsync_NoLeak:
         // HasTrailingTask + PipelineTaskException keeps the executor inside trailing-await past
-        // the inline fault check. CommitTailWaiter then sees a faulted pipeline task and dispatches.
+        // the inline fault check. CommitPendingTail then sees a faulted pipeline task and dispatches.
         var item = new TestPipelineItem
         {
             CompleteAsync = true,
@@ -884,7 +886,7 @@ public class PipelineRecoveryTests
         Assert.AreSame(recoveryEx, recovery.Exception);
     }
 
-    /// RecoverCommittedTailWaiterAsync's trailing-await catch (lines 584-588). Recovery item's
+    /// RecoverCommittedPendingTailAsync's trailing-await catch (lines 584-588). Recovery item's
     /// own trailing task throws after sync execute success.
     [TestMethod]
     public async Task CommittedTailRecovery_RecoveryTrailingThrows_RecoveryCompletedWithException()
@@ -896,7 +898,7 @@ public class PipelineRecoveryTests
             TrailingTaskException = recoveryTrailingEx,
         };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true,
-            ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+            ctx => ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask ? recovery : null));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
@@ -920,16 +922,16 @@ public class PipelineRecoveryTests
     }
 
     /// Trailing task fails AFTER the item already completed via sync-success pipeline task
-    /// (no pending tail). With no _tailWaiter to recover for, the executor's catch silently
+    /// (no pending tail). With no _pendingTail to recover for, the executor's catch silently
     /// absorbs the trailing exception. The item stays cleanly completed.
     [TestMethod]
-    public async Task TrailingFailure_NoPendingTailWaiter_TrailingExceptionAbsorbed()
+    public async Task TrailingFailure_NoPendingPendingTail_TrailingExceptionAbsorbed()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // Sync-success pipeline task (CompleteAsync=false) → CompleteWaiter fires inline,
-        // _tailWaiter never set. Then trailing fault has no tail to recover for.
+        // Sync-success pipeline task (CompleteAsync=false) → RetireItem fires inline,
+        // _pendingTail never set. Then trailing fault has no tail to recover for.
         var item = new TestPipelineItem
         {
             HasTrailingTask = true,
@@ -967,7 +969,7 @@ public class PipelineRecoveryTests
     /// Recovery-of-recovery does not exist: a committed recovery's own late fault completes the
     /// recovery directly with the REAL exception (the framework's marker is unwrapped, never
     /// observable), and the policy is NOT consulted a second time. This variant pins the
-    /// committed-tail recovery path (RecoverCommittedTailWaiterAsync): the original item's
+    /// committed-tail recovery path (RecoverCommittedPendingTailAsync): the original item's
     /// pipeline task is already faulted at commit time, which routes the recovery through the
     /// guarded commit deterministically.
     [TestMethod]
@@ -985,7 +987,7 @@ public class PipelineRecoveryTests
         }));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // Fault the original's pipeline task BEFORE enqueue: CommitTailWaiter observes a
+        // Fault the original's pipeline task BEFORE enqueue: CommitPendingTail observes a
         // completed+faulted task and takes the committed-tail recovery path.
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("original") };
         item.CompletePipelineTask();
@@ -1045,7 +1047,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { Name = "R", ExecuteAsync = true };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
@@ -1053,7 +1055,7 @@ public class PipelineRecoveryTests
         pipeline.Enqueue(faulting).Execute();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)); // A committed (slot tier)
 
-        // Fault the committed waiter: the drain claims the slot, the policy substitutes R, and
+        // Fault the committed item: the drain claims the slot, the policy substitutes R, and
         // the drain parks on R's pending execute task with the advancer held.
         faulting.CompletePipelineTask();
         await recovery.WaitForExecutedAsync();
@@ -1103,7 +1105,7 @@ public class PipelineRecoveryTests
         var recovery = new TestPipelineItem { Name = "R", ExecuteAsync = true };
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTaskWaiter ? recovery : null),
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
@@ -1135,16 +1137,16 @@ public class PipelineRecoveryTests
     }
 
     /// Audit reorder (b): a tail whose pipeline task is already settled-and-faulted at
-    /// commit time recovers via RecoverCommittedTailWaiterAsync. With a PRIOR committed waiter
+    /// commit time recovers via RecoverCommittedPendingTailAsync. With a prior in-flight item
     /// still in flight, the recovery install must be count-gated (mirroring RecoverItem): the
     /// prior waiter is the active reader and the recovery defers, completing unactivated when its
     /// work finishes first. The old shape activated unconditionally, a second active reader.
     [TestMethod]
-    public async Task CommittedTailFaultsAtCommit_PriorWaiterInFlight_RecoveryActivationGated()
+    public async Task CommittedTailFaultsAtCommit_PriorItemInFlight_RecoveryActivationGated()
     {
         var recovery = new TestPipelineItem { Name = "R" };
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
-            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null));
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.ExecutionPipelineTask ? recovery : null));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var prior = new TestPipelineItem { Name = "W", CompleteAsync = true };
@@ -1152,7 +1154,7 @@ public class PipelineRecoveryTests
         await prior.WaitForExecutedAsync();
 
         // The faulting tail. The trailing await is the only deterministic suspension between the
-        // tail transition and the next iteration's CommitTailWaiter; the pipeline task faults
+        // tail transition and the next iteration's CommitPendingTail; the pipeline task faults
         // inside that window, so the commit observes a settled, faulted task.
         var gate = new AwaitObservedTrailingSource();
         var tail = new TestPipelineItem
@@ -1183,7 +1185,7 @@ public class PipelineRecoveryTests
 
     /// Trailing task source whose await registration is observable. The executor suspending on
     /// the trailing await is the deterministic window in which a tail's pipeline task can fault
-    /// before CommitTailWaiter observes it (the RecoverCommittedTailWaiterAsync branch).
+    /// before CommitPendingTail observes it (the RecoverCommittedPendingTailAsync branch).
     /// Single-use, single-awaiter; the test serializes Complete after Awaited.
     sealed class AwaitObservedTrailingSource : System.Threading.Tasks.Sources.IValueTaskSource
     {

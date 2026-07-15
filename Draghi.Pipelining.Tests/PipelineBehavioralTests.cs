@@ -150,7 +150,7 @@ public class PipelineBehavioralTests
 
     struct CustomSchedulerPolicy : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();
@@ -169,7 +169,7 @@ public class PipelineBehavioralTests
 
     struct FailureCapturingPolicy(List<PipelineItemFailureContext> captured) : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();
@@ -189,7 +189,7 @@ public class PipelineBehavioralTests
 
     struct PreferAsyncCapturingPolicy(List<bool> preferAsyncValues) : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();
@@ -213,7 +213,7 @@ public class PipelineBehavioralTests
 
     struct ThrowingIdlePolicy : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             var task = item.GetExecuteTask();
             item.SignalExecuted();
@@ -232,7 +232,7 @@ public class PipelineBehavioralTests
 
     struct TokenCapturingPolicy(TaskCompletionSource<CancellationToken> capture) : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             capture.TrySetResult(cancellationToken);
             var task = item.GetExecuteTask();
@@ -324,7 +324,7 @@ public class PipelineBehavioralTests
         readonly Action<TestPipelineItem> _onActivate;
         public ReentrantEnqueueOnActivatePolicy(Action<TestPipelineItem> onActivate) => _onActivate = onActivate;
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             return new(new PipelineItemResult(default));
@@ -349,7 +349,7 @@ public class PipelineBehavioralTests
 
     struct ReentrantEnqueueOnIdlePolicy : IPipelinePolicy<TestPipelineItem>
     {
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             return new(new PipelineItemResult(default));

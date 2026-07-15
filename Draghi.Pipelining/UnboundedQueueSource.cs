@@ -17,7 +17,7 @@ namespace Draghi.Pipelining;
 /// Construct with <see cref="Create"/>, pass to <see cref="Pipeline{T,TPolicy,TSource,TEnumerator}"/>
 /// (or use <see cref="Pipeline.Create{T,TPolicy,TSource,TEnumerator}"/>), then call
 /// <see cref="Enqueue"/> as items become available. The pipeline's executor walks the source's
-/// enumerator via <c>await foreach</c>. The enumerator blocks on the wake signal when the queue
+/// enumerator through its pull/wait seam. The enumerator waits on the wake signal when the queue
 /// is empty and wakes when <see cref="Enqueue"/> signals.
 /// </para>
 /// </remarks>
@@ -61,10 +61,10 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// <c>Depth + Backlog</c> is the total outstanding. Lock-free read, may be stale.</summary>
     public int Backlog => _state.Queue.Count;
 
-    /// <summary>Returns a struct enumerator that the pipeline drives via <c>await foreach</c>.</summary>
+    /// <summary>Returns the struct enumerator driven by the pipeline.</summary>
     /// <remarks>
     /// Registers a callback on <paramref name="cancellationToken"/> that completes the wake signal,
-    /// ensuring that consumer cancellation propagates to a waiting MoveNextAsync. Without this,
+    /// ensuring that consumer cancellation propagates to a pending wait. Without this,
     /// the enumerator would wait forever on the wake signal while the pipeline considers itself
     /// shut down.
     /// </remarks>
@@ -113,7 +113,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         public void Execute() => _signal?.Signal();
     }
 
-    /// <summary>The struct enumerator driven by the pipeline's <c>await foreach</c>.</summary>
+    /// <summary>The struct enumerator driven by the pipeline.</summary>
     public struct Enumerator : IPipelineEnumerator<T>
     {
         readonly State _state;

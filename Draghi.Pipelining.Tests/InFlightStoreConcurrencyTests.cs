@@ -5,11 +5,11 @@ namespace Draghi.Pipelining.Tests;
 /// Targeted regression guard for the slot field/flag tear. The tear was a claim
 /// winning between a commit's flag publish and its field writes, reading a stale/default or torn
 /// pair. The tri-state word fixed it (data-then-license commit, peek-gated claim). These races
-/// hammer exactly that window at the WaiterStore boundary, a far tighter loop than the full
+/// hammer exactly that window at the InFlightStore boundary, a far tighter loop than the full
 /// pipeline stress, so a reintroduced tear surfaces fast as a default(0) or a lost/duplicated
 /// marker. DRAGHI_STRESS_ITERATIONS overrides the iteration count.
 [TestClass, DoNotParallelize]
-public class WaiterStoreConcurrencyTests
+public class InFlightStoreConcurrencyTests
 {
     // SlotClaimRace is a probabilistic torn-claim hunter: one persistent claimer thread races the
     // committer on a reused slot for Iterations inner iterations (a deep sweep raises it via
@@ -19,13 +19,13 @@ public class WaiterStoreConcurrencyTests
 
     /// Slot-tier churn: the producer commits a marker then waits (via Count) for the claimer to
     /// drain it before committing the next, so the store never escalates and every iteration is a
-    /// fresh slot tenancy. The claimer spins on TryClaimSlotForDrain, so it is mid-peek exactly
+    /// fresh slot tenancy. The claimer spins on TryClaimCompletedSlot, so it is mid-peek exactly
     /// when the producer publishes - the tear window. Markers are strictly sequential under the
     /// handshake, so a torn claim shows as a non-sequential or zero value.
     [TestMethod]
     public void SlotClaimRace_NoTornOrStaleClaims()
     {
-        var box = new WaiterStoreBox<int>();
+        var box = new InFlightStoreBox<int>();
         var n = Iterations;
         Exception? failure = null;
 
@@ -36,7 +36,7 @@ public class WaiterStoreConcurrencyTests
                 for (var expected = 1; expected <= n; expected++)
                 {
                     int item;
-                    while (!box.TryClaimSlotForDrain(out item, out _))
+                    while (!box.TryClaimCompletedSlot(out item, out _))
                         Thread.SpinWait(1);
                     Assert.AreNotEqual(0, item, "Torn/stale claim: read a default(T) mid-commit.");
                     Assert.AreEqual(expected, item, "Torn/stale claim: read the wrong tenancy's value.");
@@ -71,23 +71,23 @@ public class WaiterStoreConcurrencyTests
     /// and escalation each pivot on one Interlocked CAS against Occupied. So EVERY observable outcome is
     /// reachable by ORDERING the calls; the spin only sampled these probabilistically. We drive each
     /// interleaving explicitly and assert no torn/default/lost/duplicated marker. (Weak-memory
-    /// ordering, the actual concurrency hazard, is covered by the WaiterStore ordering units, not
+    /// ordering, the actual concurrency hazard, is covered by the InFlightStore ordering units, not
     /// by this brute-force sampler.)
     [TestMethod]
     public void SlotEscalation_AllInterleavings_NoLostOrTornMarkers()
     {
         // Case 1: claim takes the slot BEFORE escalation (claimer wins the slot).
         {
-            var box = new WaiterStoreBox<int>();
+            var box = new InFlightStoreBox<int>();
             box.TryEscalateOrEnqueue(1, default, out var isSlot);
             Assert.IsTrue(isSlot, "marker 1 must land in the slot on a fresh box.");
-            Assert.IsTrue(box.TryClaimSlotForDrain(out var claimed, out _), "occupied slot must be claimable.");
+            Assert.IsTrue(box.TryClaimCompletedSlot(out var claimed, out _), "occupied slot must be claimable.");
             Assert.AreEqual(1, claimed, "claim must read the committed pair, never default/torn.");
             box.DecrementCount();
             // Slot now empty; further commits go to the queue (still pre-escalation slot path first).
             box.TryEscalateOrEnqueue(2, default, out var isSlot2);
             Assert.IsTrue(isSlot2, "after the slot drained, marker 2 re-occupies the (empty) slot.");
-            Assert.IsTrue(box.TryClaimSlotForDrain(out var c2, out _)); Assert.AreEqual(2, c2); box.DecrementCount();
+            Assert.IsTrue(box.TryClaimCompletedSlot(out var c2, out _)); Assert.AreEqual(2, c2); box.DecrementCount();
             Assert.AreEqual(0, box.Count);
         }
 
@@ -95,7 +95,7 @@ public class WaiterStoreConcurrencyTests
         // escalates, and enqueues ONLY marker2 - marker1 STAYS in the slot (never moved). The head
         // retires from the slot tier first, then the queue overflow, in FIFO order.
         {
-            var box = new WaiterStoreBox<int>();
+            var box = new InFlightStoreBox<int>();
             box.TryEscalateOrEnqueue(1, default, out var s1);
             Assert.IsTrue(s1);
             box.TryEscalateOrEnqueue(2, default, out var s2);
@@ -112,14 +112,14 @@ public class WaiterStoreConcurrencyTests
         // Case 3: claim on an EMPTY slot returns false; on an ESCALATED box the slot occupant is
         // still resident (leave-head), so the slot claim SUCCEEDS for the head. Never a torn/default.
         {
-            var box = new WaiterStoreBox<int>();
-            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "empty box: claim returns false.");
+            var box = new InFlightStoreBox<int>();
+            Assert.IsFalse(box.TryClaimCompletedSlot(out _, out _), "empty box: claim returns false.");
             box.TryEscalateOrEnqueue(1, default, out _);
             box.TryEscalateOrEnqueue(2, default, out _); // escalates; marker 1 stays in the slot
-            Assert.IsTrue(box.TryClaimSlotForDrain(out var slotHead, out _), "escalated box: slot occupant still claimable (leave-head).");
+            Assert.IsTrue(box.TryClaimCompletedSlot(out var slotHead, out _), "escalated box: slot occupant still claimable (leave-head).");
             Assert.AreEqual(1, slotHead);
             box.DecrementCount();
-            Assert.IsFalse(box.TryClaimSlotForDrain(out _, out _), "slot now drained: claim returns false.");
+            Assert.IsFalse(box.TryClaimCompletedSlot(out _, out _), "slot now drained: claim returns false.");
             while (box.TryDequeue(out _)) box.DecrementCount();
             Assert.AreEqual(0, box.Count);
         }
@@ -130,7 +130,7 @@ public class WaiterStoreConcurrencyTests
         const int perBox = 3;
         for (var b = 0; b < 5_000; b++)
         {
-            var box = new WaiterStoreBox<int>();
+            var box = new InFlightStoreBox<int>();
             var drained = new bool[perBox + 1];
             for (var marker = 1; marker <= perBox; marker++)
                 box.TryEscalateOrEnqueue(marker, default, out _);
@@ -208,27 +208,28 @@ public class WaiterStoreConcurrencyTests
     }
 }
 
-/// Boxes the WaiterStore struct so racing threads share one instance (the producer commits, the
+/// Boxes the InFlightStore struct so racing threads share one instance (the producer commits, the
 /// consumer claims/dequeues against the same storage).
-sealed class WaiterStoreBox<T>
+sealed class InFlightStoreBox<T>
 {
-    // WaiterStore<T> is a struct with a custom parameterless constructor (allocates the edge lock);
+    // InFlightStore<T> is a struct with a custom parameterless constructor (allocates the edge lock);
     // a bare field declaration zero-inits instead of calling it (the 2026-07-08 struct-ctor trap:
     // then the count bias, now the lock).
-    WaiterStore<T> _store = new();
+    InFlightStore<T> _store = new();
+    ItemTenure _tenure;
     public int Count => _store.Count;
     public bool IsEscalated => _store.IsEscalated;
     public int TryEscalateOrEnqueue(T item, ValueTask task, out bool isSlot)
     {
-        // Increment-first commit pair (what CommitWaiter does around its edge/mid routing). Returns
+        // Increment-first commit pair (what CommitInFlightItem does around its edge/mid routing). Returns
         // the new count to keep this harness's callers' arithmetic unchanged.
         var prev = _store.IncrementCommitCount();
         _store.PublishCommitted(item, task, out isSlot);
         return prev + 1;
     }
-    public bool TryClaimSlotForDrain(out T item, out ValueTask task) => _store.TryClaimSlotForDrain(out item, out task);
-    public bool TryClaimCompletedHead(out T item, out ValueTask task) => _store.TryClaimCompletedHead(out item, out task);
+    public bool TryClaimCompletedSlot(out T item, out ValueTask task) => _store.TryClaimCompletedSlot(ref _tenure, out item, out task, out _);
+    public bool TryClaimCompletedHead(out T item, out ValueTask task) => _store.TryClaimCompletedHead(ref _tenure, out item, out task, out _, out _);
     public bool TrySnapshotSlot(out T item) => _store.TrySnapshotSlot(out item);
-    public bool TryDequeue(out (T Waiter, ValueTask WaiterTask) entry) => _store.TryDequeue(out entry);
+    public bool TryDequeue(out (T Item, ValueTask PipelineTask) entry) => _store.TryDequeue(out entry);
     public bool DecrementCount() => _store.DecrementCount();
 }

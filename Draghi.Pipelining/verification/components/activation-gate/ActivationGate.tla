@@ -104,7 +104,7 @@ PassTryClaimHead(t) ==
            THEN \* count reached zero: perform the locked empty-edge handoff (contents out of scope here).
                 /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeHandoff"]
                 /\ UNCHANGED <<retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending, passHead>>
-         ELSE \* PHANTOM EDGE observed (counted but not yet storePublished). The BAIL's
+         ELSE \* Phantom edge observed (counted but not yet storePublished). The bail's
               \* release is a SEPARATE step (the real instruction boundary - the
               \* committer's publish+word-read can land inside the gap; that gap is
               \* exactly what the two-sided protocol must survive).
@@ -362,7 +362,7 @@ EdgeLockOwnerValid == edgeLockOwner \in {"0", "D"} \cup RetirementPasses   \* st
 InFlightCountNonNegative == inFlightCount >= 0   \* over-promise never under-runs: no -1 skew exists
 
 \* NO-ORPHAN, by deadlock detection (the EdgeLockBail discipline): Finished is the
-\* ONLY self-loop and it requires every item retirementCompleted AND the deferred grant
+\* The only self-loop requires every item retirementCompleted and the deferred grant
 \* delivered (dispatcherPc="finished" => activationDeferralGranted). Any quiet state short of that - a completionPublished
 \* head nobody will claim, an undelivered visible place with the chain drained -
 \* has no enabled action and TLC reports DEADLOCK. A state-predicate NoOrphan

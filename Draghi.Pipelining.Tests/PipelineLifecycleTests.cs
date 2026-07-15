@@ -113,11 +113,11 @@ public class PipelineLifecycleTests
         }
     }
 
-    /// Exception propagation reaches items in BOTH buckets: items already in _waiters with pending
+    /// Exception propagation reaches items in BOTH buckets: items already in _inFlight with pending
     /// pipeline tasks, and items still in _queue that the executor hadn't dequeued yet.
-    /// DrainOnCompletionAsync iterates both queues and calls CompleteWaiter(_, exception) for each.
+    /// DrainOnCompletionAsync iterates both queues and calls RetireItem(_, exception) for each.
     [TestMethod]
-    public async Task CompleteAsync_WithException_PropagatesToItemsInQueueAndWaiters()
+    public async Task CompleteAsync_WithException_PropagatesToQueuedAndInFlightItems()
     {
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
@@ -125,7 +125,7 @@ public class PipelineLifecycleTests
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        // Phase 1: enqueue async items + wait for the executor to suspend. These end up in _waiters.
+        // Phase 1: enqueue async items + wait for the executor to suspend. These end up in _inFlight.
         var waitersItems = new TestPipelineItem[3];
         for (var i = 0; i < waitersItems.Length; i++)
         {
@@ -151,9 +151,9 @@ public class PipelineLifecycleTests
 
         foreach (var item in waitersItems)
         {
-            Assert.IsTrue(item.IsCompleted, "Waiter-bucket item should be completed.");
+            Assert.IsTrue(item.IsCompleted, "In-flight item should be completed.");
             Assert.IsInstanceOfType<OperationCanceledException>(item.Exception,
-                "Waiter-bucket item settles via the shutdown token (item-side escalation).");
+                "In-flight item settles via the shutdown token (item-side escalation).");
         }
         foreach (var item in queueItems)
         {
@@ -227,7 +227,7 @@ public class PipelineLifecycleTests
 
         const int count = 5;
         // CompleteAsync holds each item's pipeline task pending, so every item dispatches and stays
-        // in-flight (becomes a tail-waiter) without completing - in-flight Depth climbs to count. Under
+        // in-flight (becomes the pending tail) without completing - in-flight Depth climbs to count. Under
         // in-flight depth the default sync-completing item drains before the next dispatches (Depth
         // caps at 1); holding the tasks pins all count items in-flight at once so the reported sequence
         // is deterministic.
@@ -350,11 +350,11 @@ public class PipelineLifecycleTests
         await item.WaitForCompleteAsync();
     }
 
-    /// CompleteAsync fires with a pending tail waiter (item stored as _tailWaiter, pipeline task
-    /// still pending). CommitTailWaiter at line 238 must commit the tail before DrainOnCompletionAsync,
+    /// CompleteAsync fires with a pending tail waiter (item stored as _pendingTail, pipeline task
+    /// still pending). CommitPendingTail at line 238 must commit the tail before DrainOnCompletionAsync,
     /// and the drain exception must reach the committed tail.
     [TestMethod]
-    public async Task CompleteAsync_WithPendingTailWaiter_DrainsTail()
+    public async Task CompleteAsync_WithPendingPendingTail_DrainsTail()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
@@ -362,7 +362,7 @@ public class PipelineLifecycleTests
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Execute();
         await item.WaitForExecutedAsync();
-        // Item is now _tailWaiter with a pending pipeline task.
+        // Item is now _pendingTail with a pending pipeline task.
 
         var ex = new InvalidOperationException("drain tail");
         await pipeline.CompleteAsync(ex).AsTask().WaitAsync(TimeSpan.FromSeconds(5));
@@ -522,7 +522,7 @@ public class PipelineLifecycleTests
 
         public DepthCapturingPolicy(List<int> depths) => _depths = depths;
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             // Carry the item's pipeline task so CompleteAsync items pend (held in-flight) until
@@ -573,7 +573,7 @@ public class PipelineLifecycleTests
         readonly Action _onExecute;
         public ReentrantCompletePolicy(Action onExecute) => _onExecute = onExecute;
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             _onExecute();
@@ -603,7 +603,7 @@ public class PipelineLifecycleTests
             _executeTokenSink = executeTokenSink;
         }
 
-        public async ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public async ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
             item.SignalExecuted();
             if (_executeTokenSink is not null)

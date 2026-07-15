@@ -12,7 +12,7 @@ namespace Draghi.Pipelining.Tests;
 //   - sets it in ActivateHeadItem.
 //   - nulls it in CompleteItem.
 //   - reads it (and asserts non-null) at a configurable check site.
-// Then drives the pipeline with hundreds of items so the framework's CommitWaiter and
+// Then drives the pipeline with hundreds of items so the framework's CommitInFlightItem and
 // DrainSlotInline preferAsync=true paths fire.
 //
 // Two variants: INLINE activation and TP-dispatched activation. If only the second reproduces the
@@ -142,7 +142,7 @@ public class ActivatedItemReductionTests
             _holdRelease = holdRelease;
         }
 
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(SyntheticItem item, bool waiterExecution, CancellationToken cancellationToken)
+        public ValueTask<PipelineItemResult> ExecuteItemAsync(SyntheticItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
             => new(new PipelineItemResult(default, item.GetPipelineTask()));
 
         public void ActivateHeadItem(SyntheticItem item, bool preferAsync = true)
@@ -195,7 +195,7 @@ public class ActivatedItemReductionTests
             }
             else if (_holder is not null)
             {
-                // Tenure-reuse mode, inline activation (the executor's _waiters.Count==0 path calls
+                // Tenure-reuse mode, inline activation (the executor's _inFlight.Count==0 path calls
                 // ActivateHeadItem with preferAsync:false). Model the item shape where reads continue
                 // AFTER activation (async Read) and the pipeline task completes from an off-thread
                 // continuation, never inline in ExecuteItemAsync (async TrySetResult). A synchronous

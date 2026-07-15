@@ -59,13 +59,13 @@ VARIABLES
   recoveryAttempted,           \* [1..N -> BOOLEAN] one recovery per item (state-space bound)
   passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem,   \* the empty-edge handoff's PIN: peeked (gen, item) per retirement pass
   emptyEdgeActivationBusy,          \* an empty-edge handoff ActivateHeadItem call is IN FLIGHT (entered, not returned)
-  resolvedEmptyEdgeGeneration,   \* the stamp: written AFTER the empty-edge handoff's policy call RETURNS
+  resolvedEmptyEdgeGeneration,   \* stamp written after the empty-edge handoff's policy call returns
   faultConcurrentActivation,  \* a substitute activation overlapped an in-flight empty-edge handoff act
   deferralGranted,   \* the placed deferral received its grant
   faultDoubleActivate, faultTokenRead, lateCompletionCallback,
   \* ---- populations ----
   executorPc, executorItem,     \* committer: "incrementStoreCount"|"publishStoreItem"|"readAdvanceLicense"|"finishOwnedPass"|"next"|"off"
-  openedEmptyEdge,    \* the increment saw prev==0: THIS commit is the EDGE (gate custody
+  openedEmptyEdge,    \* the increment saw prev==0: this commit is the edge (gate custody
                 \* fact — NOT the storage tier, which can be queue while escalated)
   handoffFenceEpoch,       \* Dekker barrier epoch (ExecutorFenceDeferralPublication advances; publishes NOTHING)
   passDecrementEpoch,    \* [RetirementPasses -> epoch at their last count-decrement RMW]
@@ -120,12 +120,12 @@ Init ==
 \* obligated; inFlightCount==0: no retirement pass can exist — SELF-GRANT under the edge lock.
 ExecutorDispatch ==
   /\ executorPc = "dispatch" /\ executorItem <= N
-  \* EVERY completionDispatch places a deferral (the fast item's is eaten by the
+  \* Every completionDispatch places a deferral (the fast item's is eaten by the
   \* completion-time reclaim); only the gated (sync-body) executionKind WAITS on it.
   /\ generationCounter' = generationCounter + 1
   /\ executorGeneration' = generationCounter + 1
   /\ itemGeneration' = [itemGeneration EXCEPT ![executorItem] = generationCounter + 1]
-  \* Idle-regime ELISION (code Pipeline.cs:395-420): count 0 with no deferral
+  \* Idle-regime elision (executor dispatch): count 0 with no deferral
   \* outstanding = no concurrent activation decider; SKIP the placement and claim
   \* the activationTurn fail-if-live (lock-free). Everything else places the deferral.
   /\ IF inFlightCount = 0 /\ localDeferredGeneration = NONE
@@ -140,11 +140,11 @@ ExecutorDispatch ==
                  activationPerformed, executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
                  passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, recoveryAttempted>>
 
-\* The fail-if-live TurnExec claim (code TryClaimTurnGrant): LOCK-FREE. The gate
+\* The fail-if-live TurnExec claim (ActivationGate.TryClaimGrant) is lock-free. The gate
 \* excluded residents, but an empty-edge handoff may have granted a NON-RESIDENT (activationTurn live at
 \* count 0), so the activationTurn - not the stale gate - is the authority: decline on a
 \* live activationTurn and fall back to a normal deferral placement (the loss branch,
-\* code :415-419).
+\* the executor dispatch fallback).
 ExecutorClaimElidedTurn ==
   /\ executorPc = "claimElidedTurn"
   /\ IF activationTurn = NONE
@@ -172,7 +172,7 @@ ExecutorActivateElidedItem ==
                  executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorItem, openedEmptyEdge, passPc,
                  passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* THE BARRIER (Interlocked.MemoryBarrier, Pipeline.cs :431) - RELATIONAL, not
+\* The executor's post-handoff publication barrier is relational, not
 \* publishing: a fence does not flush the store into one
 \* universal view; it advances the epoch. An observer whose count-RMW POSTDATES
 \* this epoch is synchronized (reads truth); one whose RMW predates it may
@@ -203,7 +203,7 @@ ExecutorReadInFlightCount ==
                  activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
                  executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* Self-grant: LOCK { take the deferral, ASSIGN the activationTurn } UNLOCK; activate OUTSIDE.
+\* Self-grant: take the deferral and assign activationTurn under the lock; activate outside it.
 ExecutorAcquireSelfGrantLock ==
   /\ executorPc = "acquireSelfGrantLock"
   /\ UNCHANGED edgeLockOwner
@@ -256,7 +256,7 @@ ExecutorConsumeSelfGrant ==
                  executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
                  fifoViolation, faultTokenRead, lateCompletionCallback, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* The policy call, OUTSIDE the hold (the assign->activate gap is real).
+\* The policy call runs outside the hold (the assign-to-activate gap is real).
 ExecutorActivateSelfGrantedItem ==
   /\ executorPc = "activateSelfGrantedItem"
   /\ faultDoubleActivate' = (faultDoubleActivate \/ activationPerformed[executorItem])
@@ -267,7 +267,7 @@ ExecutorActivateSelfGrantedItem ==
                  executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorItem, openedEmptyEdge, passPc,
                  passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* THE SYNC-BODY WINDOW: the gated body blocks inside execution until the
+\* The sync-body window: the gated body blocks inside execution until the
 \* activation grant lands—the commit cannot arrive. The empty-edge handoff and self-grant are the only
 \* exits; a chain's stop CANNOT rescue this item (it is not resident yet).
 ExecutorAwaitActivationGrant ==
@@ -278,8 +278,8 @@ ExecutorAwaitActivationGrant ==
                  activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
                  executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* CommitTailWaiter's reclaim site: the PREVIOUS item's deferral is resolved at
-\* the next loop boundary - PLAIN consume of own leftover placement (skip when a
+\* CommitPendingTail's reclaim site: the PREVIOUS item's deferral is resolved at
+\* the next loop boundary - plain consume of its own leftover placement (skip when a
 \* granter completionConsumed it), release-if-mine on the -gen. The last item's leftover
 \* is resolved by the completion-time ReclaimCompletionCallback instead.
 ExecutorResolvePriorDeferral ==
@@ -288,7 +288,7 @@ ExecutorResolvePriorDeferral ==
        THEN /\ localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE
             /\ deferralGranted' = TRUE
             \* NO activationTurn release here (finding #7-rev): the owned-activationTurn release is
-            \* COMPLETION/RETIRE property (CompleteWaiter ownedTurn -> the claim's
+            \* COMPLETION/RETIRE property (RetireItem ownedTurn -> the claim's
             \* release-if-mine), not a loop-boundary one - releasing at resolve
             \* freed a STILL-LIVE gated item's grant and the stop re-granted.
             /\ UNCHANGED activationTurn
@@ -353,9 +353,9 @@ ExecutorActivateRecovery ==
   /\ UNCHANGED <<handoffFenceEpoch, passDecrementEpoch>>
   \* WIN path: a -executorGeneration still visible is an empty-edge handoff's DOOMED CLAIM (its consume
   \* must lose - the double-bail), never a grant: wait out its release, then
-  \* FAIL-IF-LIVE mint fresh. INHERIT path (post-stamp): -executorGeneration IS the
+  \* Claim fresh if free. The post-stamp inherit path uses -executorGeneration as the
   \* completionPublished grant - ClaimOrInherit transfers it in place.
-  \* BOTH arms Count==0-gated (Pipeline.cs :709): at count>0 the substitute only
+  \* Both arms are Count==0-gated (RecoverItem): at count>0 the substitute only
   \* RE-PLACES (ExecutorRepublishRecoveryDeferral) - no recovery-time activationTurn touch; a live empty-edge handoff grant
   \* is inherited later at the substitute's COMMIT (-gen -> seq). The ungated
   \* mint at count>0 was finding #10 (deadlocked PassPrepareRecoveryReplacement on a foreign -gen that
@@ -380,7 +380,7 @@ ExecutorActivateRecovery ==
 \* Inherit-path substitute at count>0 (finding #11 companion): NO act here (the
 \* empty-edge handoff activationPerformed), NO re-place (a re-mint severs the -executorGeneration grant linkage,
 \* finding #11's deadlock) - route straight to the commit chain; ExecutorAssignAtEmptyEdge's
-\* inherit converts -executorGeneration -> seq, the code's tailGen inherit at CommitWaiter.
+\* inherit converts -executorGeneration -> seq, the code's tailGen inherit at CommitInFlightItem.
 ExecutorCommitInheritedRecoveryGrant ==
   /\ UNCHANGED <<handoffFenceEpoch, passDecrementEpoch>>
   /\ executorPc = "activateInheritedRecovery" /\ inFlightCount > 0
@@ -392,9 +392,9 @@ ExecutorCommitInheritedRecoveryGrant ==
                  faultConcurrentActivation, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
                  fifoViolation, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, itemGeneration, recoveryAttempted>>
 
-\* THE RE-PLACEMENT FLAVOR (exec-recovery re-placement, ClaimOrInherit's home):
+\* Executor-recovery replacement (ClaimOrInherit's home):
 \* a win-path substitute may, instead of inline-acting, RE-PLACE a fresh
-\* deferral UNDER THE EDGE LOCK (lock-free rivals respected via the guard) and
+\* deferral under the edge lock (lock-free rivals respected via the guard) and
 \* re-enter the full completionDispatch Dekker (fence -> read -> grant protocol). This is
 \* the second-epoch mint - the last candidate opener for the pin's
 \* consume-guard face.
@@ -413,8 +413,8 @@ ExecutorRepublishRecoveryDeferral ==
                  emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, executorItem, openedEmptyEdge,
                  passPc, passSlotSeen, passQueueSeen, fifoViolation, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, recoveryAttempted>>
 
-\* OWN-DETERMINATION BEFORE THE COMMIT (CommitTailWaiter :969 + the :1252 assert):
-\* consume the own deferral now. A live own placement consumes = OWN (this strand
+\* Ownership is determined before the commit (CommitPendingTail and CommitInFlightItem's handoff assertion):
+\* consume the owned deferral now. Consuming a live owned placement retains ownership (this strand
 \* keeps the activation obligation); gone = the empty-edge handoff claimed/granted = LOST
 \* (sentinelHeld; the empty-edge handoff owns activation). Elide + race-back routes bypass
 \* this step: they ARE tailActivated (own-strand activation, deferral resolved).
@@ -431,8 +431,8 @@ ExecutorConsumeOwnDeferral ==
                  activationPerformed, executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
                  passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* DIRECT SYNCHRONOUS RETIREMENT (the naked fast path, CommitTailWaiter
-\* :975-986): a synchronously-successful OWN item at Count==0 retires WITHOUT
+\* DIRECT SYNCHRONOUS RETIREMENT (the naked fast path, CommitPendingTail
+\* CommitPendingTail's synchronous shortcut: an owned, synchronously successful item at Count==0 retires without
 \* ever entering the store - no increment, no publication, no completionCallbackRegistered, no
 \* advancer. GetResult consumes the token; the owned activationTurn (an elide/race-back
 \* -executorGeneration claim, if any) releases CAS-if-mine - which can free an empty-edge handoff's
@@ -455,7 +455,7 @@ ExecutorDirectRetire ==
 \* InFlightStore.StoreIncrementInFlightCount: increment-first.
 StoreIncrementInFlightCount ==
   /\ executorPc \in {"incrementStoreCount", "inclost"} /\ executorItem <= N
-  /\ openedEmptyEdge' = (inFlightCount = 0)     \* EDGE-ness: the increment-first read of prev
+  /\ openedEmptyEdge' = (inFlightCount = 0)     \* edge status from the increment-first read of prev
   /\ inFlightCount' = inFlightCount + 1             \* COUNT-WORD RMW (the fold): fences THIS
                                 \* strand's stores (the place), nothing foreign
   /\ visibleDeferredGeneration' = localDeferredGeneration
@@ -464,14 +464,14 @@ StoreIncrementInFlightCount ==
                  completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorItem, passPc,
                  passSlotSeen, passQueueSeen, fifoViolation, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* InFlightStore.StorePublishCommittedItem (internal tier choice, leave-head) + the EDGE ARM:
+\* InFlightStore.StorePublishCommittedItem (internal tier choice, leave-head) plus the edge arm:
 \* a wasEmpty commit is the frontier owner — it arms + registers the trampoline
 \* PRE-PUBLISH-READ (ItemTenure.ArmAndRegister, edge executionKind: arm is chain-
 \* mediated => fenced). Mid-chain commits attach NOTHING (frontier invariant).
 StorePublishCommittedItem ==
   /\ executorPc \in {"publishStoreItem", "publost"}
   /\ IF openedEmptyEdge
-       THEN \* EDGE commit (prev==0): publish belongs IN-HOLD (EdgeLockBail's
+       THEN \* Edge commit (prev==0): publish belongs inside the hold (EdgeLockBail's
             \* ELockDo: lock { attach + arm + assign + publish }; only the
             \* policy activate is outside). Nothing published here.
             /\ UNCHANGED <<slot, queuePublished, overflowQueue, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem>>
@@ -488,7 +488,7 @@ StorePublishCommittedItem ==
 
 \* Edge-lock section: LOCK { assign the activationTurn iff not already ours } UNLOCK;
 \* the policy activate runs outside; the activation turn is the authority.
-\* ACTIVATE-BEFORE-PUBLISH (code CommitWaiter :1260-1266): a never-activationPerformed
+\* Activate before publishing (CommitInFlightItem's empty-store edge): a never-activationPerformed
 \* incomplete head gets its policy call HERE, pre-publication - exclusive by
 \* INVISIBILITY (unpublished => unclaimable => no recovery substitute can exist).
 \* A completionPublished-at-commit item needs no activation at all; callback
@@ -505,14 +505,14 @@ ExecutorPrepareEmptyEdgeActivation ==
                  executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorItem, openedEmptyEdge, passPc,
                  passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* THE LICENSED OWN-EDGE COMMIT (Pipeline.cs :1270-1286, LW2_licedge lineage):
+\* Licensed owned-edge commit (CommitInFlightItem's TryAcquireIfFree branch):
 \* own + TryAcquireIfFree -> hold the ADVANCE LICENSE (not the edge lock) across
 \* assign + publish + POST-PUBLISH attach - registration after publication is
 \* safe because claims are license-serialized and we hold it (CompletionNeverReadsRetiredTenure
-\* checks that argument here). A racing fire DEPOSITS on our license
+\* checks that argument here). A racing fire deposits on our license
 \* (CompletionCallbackAcquireOrDeposit's advanceOwner#0 arm); release-or-serve consumes it and the committer
 \* advances its own sole head (identity E). Acquire MISS -> the contended
-\* edge-lock path (ExecutorAcquireEmptyEdgeLock), verbatim code :1288-1307.
+\* edge-lock path (ExecutorAcquireEmptyEdgeLock), matching CommitInFlightItem's contended edge branch.
 ExecutorAcquireAdvanceLicense ==
   /\ executorPc = "eacq"
   /\ IF advanceOwner = "0"
@@ -525,7 +525,7 @@ ExecutorAcquireAdvanceLicense ==
 
 ExecutorAssignAndPublishAtEmptyEdge ==
   /\ executorPc = "licassign"
-  /\ activationTurn \in {NONE, -executorGeneration}   \* AssignTurnAtCommit :708's assert, license executionKind
+  /\ activationTurn \in {NONE, -executorGeneration}   \* ActivationGate.AssignAtCommit premise
   /\ (IF activationTurn = -executorGeneration
         THEN /\ activationTurn' = executorItem   \* inherit: -gen -> seq
              /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
@@ -600,7 +600,7 @@ ExecutorAssignAtEmptyEdge ==
                  THEN localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE /\ deferralGranted' = TRUE
                  ELSE UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
             /\ executorPc' = "next"
-       ELSE \* AssignTurnAtCommit :708: foreign-at-edge is ASSERTED unreachable
+       ELSE \* ActivationGate.AssignAtCommit: a foreign edge turn is unreachable
             \* (release-before-decrement makes prev==0 imply the prior activationTurn is
             \* gone). Model as the assert: this branch blocks; reachability shows
             \* as deadlock, mirroring the Debug.Assert.
@@ -632,7 +632,7 @@ ExecutorReadAdvanceLicense ==
   /\ IF advanceOwner = "0"
        THEN /\ advanceOwner' = "E" /\ passPc' = [passPc EXCEPT !["E"] = "readFirstTier"]
             /\ executorPc' = "finishOwnedPass" /\ advancePending' = advancePending
-       ELSE \* acquire-or-DEPOSIT (TryAcquire, WaiterStore :412): a advanceOwner license
+       ELSE \* acquire-or-deposit (InFlightStore.TryAcquire): an advanceOwner license
             \* takes the pending bit - the holder's release-or-serve re-probes
             \* and drives this commit; the hand-off is lossless BY CONSTRUCTION.
             /\ UNCHANGED <<advanceOwner, passPc>> /\ advancePending' = TRUE /\ executorPc' = "next"
@@ -663,7 +663,7 @@ ExecutorNext ==
 \* Phase 1: publish completionPublished (status-visible / claimable). Resident items only.
 PublishCompletion(i) ==
   /\ ~completionPublished[i] /\ ((slot = i) \/ (\E j \in 1..Len(overflowQueue) : overflowQueue[j] = i)
-                       \* the WALK-recovery substitute completes OUTSIDE the store
+                       \* the retirement-pass recovery substitute completes outside the store
                        \* (position dequeued, credit advanceOwner) - scoped to a LIVE walk
                        \* episode so C-side-recoveryAttempted (store-resident) items stay
                        \* on the store-resident path.
@@ -714,18 +714,18 @@ CompletionCallbackAcquireOrDeposit(i) ==
 
 \* Background coherence for the weak clear.
 ReclaimCompletionCallback(i) ==
-  \* THE COMPLETION-TIME RECLAIM (TryConsumeExecDeferred, PLAIN): lock-free, no
+  \* Completion-time reclaim (ActivationGate.TryConsumeHandoff, plain): lock-free, no
   \* activationTurn claim (a foreign resident may hold the activationTurn). Can win the word out
   \* from under an empty-edge handoff that already CLAIMED (the double-bail); both then
   \* release the same -gen, CAS-if-mine. Completing without activation is
-  \* DOCUMENTED-LEGAL; the invariant is NEVER-TWICE, not always-once.
+  \* This is permitted: the invariant is at most once, not always once.
   \* ClearExecutingItem ordering: the reclaim PRECEDES completion-publication;
   \* a gated body cannot reach it before activation (sync body blocked).
   /\ deferredItem = i /\ localDeferredGeneration # NONE
   /\ (executionKind[i] = "self" \/ activationPerformed[i])
-  \* WORD CAS ONLY (finding #8, code TryConsumeExecDeferred :822-832): the plain
+  \* ActivationGate.TryConsumeHandoff uses only a word CAS: the plain
   \* consume never touches the activationTurn - the -gen release is a COMPLETION/RETIRE
-  \* property (CompleteWaiter ownedTurn -> the claim path's itemGeneration-matched
+  \* property (RetireItem ownedTurn -> the claim path's itemGeneration-matched
   \* release-if-mine). Bundling the release here freed a still-live gated item's
   \* grant pre-completion and the stop re-granted (the 102k-state CE).
   /\ UNCHANGED activationTurn
@@ -762,7 +762,7 @@ PassReadSecondStoreTier(t) ==
 
 \* The composed decision: InFlightStore legs + ItemTenure's gate + consume+tear.
 \* Gate placement per the code: AFTER the completionPublished check, BEFORE any mutation.
-\* An incomplete head -> the STOP: arm + register (the second frontier owner),
+\* An incomplete head is the stop: arm and register (the second frontier owner),
 \* then exit. A gated decline -> bail (release-or-serve + repeek, the two-sided
 \* protocol carried from EdgeLockBail via ActivationGate).
 PassDecideHeadClaim(t) ==
@@ -773,8 +773,8 @@ PassDecideHeadClaim(t) ==
          target == IF sSeen # NONE THEN sSeen ELSE qSeen
      IN
      IF target = NONE
-       THEN \* nothing visible: PHANTOM (inFlightCount>0: bail + repeek) vs the TRUE IDLE
-            \* EDGE (inFlightCount=0): the EMPTY-EDGE HANDOFF - composed in this round.
+       THEN \* nothing visible: phantom (inFlightCount>0: bail + repeek) versus the true idle
+            \* edge (inFlightCount=0), where the empty-edge handoff runs.
             /\ passPc' = [passPc EXCEPT ![t] = IF inFlightCount > 0 THEN "phantomReadFirstTier" ELSE "emptyEdgeLock"]
             /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch,
                            completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner,
@@ -782,7 +782,7 @@ PassDecideHeadClaim(t) ==
                            deferralGranted, edgeLockOwner, faultDoubleActivate, executionKind,
                            faultTokenRead>>
      ELSE IF ~completionPublished[target]
-       THEN \* the STOP: frontier moves here — arm + register + ASSIGN+ACTIVATE
+       THEN \* the stop: frontier moves here — arm, register, assign and activate
             \* (fused, UNLOCKED: the count-partition bet, carried) on the
             \* incomplete head. Re-check by TURN IDENTITY (never `activationPerformed`).
             /\ IF completionCallbackRegistered[target]
@@ -791,7 +791,7 @@ PassDecideHeadClaim(t) ==
                       /\ faultTokenRead' = (faultTokenRead \/ completionConsumed[target])
                       /\ localDeliveryArmItem' = target /\ visibleDeliveryArmItem' = target
             /\ IF activationTurn = NONE
-                 THEN \* FAIL-IF-LIVE: only a FREE activationTurn is assignable (write discipline:
+                 THEN \* Only a free activationTurn is assignable (write discipline:
                       \* a live activationTurn - resident seq OR a grant's -gen - declines).
                       /\ activationTurn' = target
                       /\ faultDoubleActivate' = (faultDoubleActivate \/ activationPerformed[target])
@@ -815,7 +815,7 @@ PassDecideHeadClaim(t) ==
                THEN IF slot = sSeen
                       THEN IF recover /\ sSeen = 2 /\ ~recoveryAttempted[sSeen]
                       THEN \* FAULTED claim (walk-side recovery): position dequeued,
-                           \* COUNT CREDIT HELD; the failure read is a GetResult -
+                           \* Count credit remains held; the failure read is a GetResult -
                            \* the token is completionConsumed here. -> recassign (tail keying).
                            /\ slot' = NONE /\ UNCHANGED <<overflowQueue, queuePublished>>
                            /\ headTicket' = headTicket + 1
@@ -849,8 +849,8 @@ PassDecideHeadClaim(t) ==
                            /\ fifoViolation' = (fifoViolation \/ (\E jj \in 1..N : jj < qSeen /\ (slot = jj \/ (\E kk \in 1..Len(overflowQueue) : overflowQueue[kk] = jj))))
                       ELSE /\ UNCHANGED <<slot, overflowQueue, queuePublished, headTicket, inFlightCount,
                                           completionConsumed, completionDispatchTorn, fifoViolation, edgeLockOwner, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted>>
-          \* The implementation's retirement order (Pipeline.cs :1187/
-          \* :1425/:1519): release the owned activationTurn, run CompleteItem (arbitrary
+          \* The implementation's retirement order (RetireItemDeferred): release the
+          \* owned activationTurn, run CompleteItem (arbitrary
           \* policy - the LARGE window), only then decrement the store count.
           \* Here: the claim dequeues; trel releases; tdec decrements. The
           \* trel->tdec gap IS the CompleteItem window, independently schedulable.
@@ -868,7 +868,7 @@ PassDecideHeadClaim(t) ==
        IF passPc'[t] \in {"releaseActivationTurn", "recoveryLock"} /\ overflowQueue' # overflowQueue THEN @ ELSE NONE]
   /\ UNCHANGED <<executorPc, executorItem, openedEmptyEdge, executionKind, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* LICENSED PHANTOM RE-PEEK (Pipeline.cs :1477): a count-positive peek miss
+\* Licensed phantom re-peek (Pipeline.Advance): a count-positive peek miss
 \* re-peeks WHILE STILL HOLDING the advance license - the SPSC peek is a
 \* mutating consumer op and must stay single-consumer (the release-then-repeek
 \* shape is the REJECTED protocol; the post-release repeek tail below remains
@@ -909,7 +909,7 @@ PassPhantomDecide(t) ==
                  openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The owned-activationTurn release: AFTER the claim/dequeue, BEFORE the store decrement
-\* (code order, :1187/:1425/:1519). The window everything downstream must
+\* (the RetireItemDeferred order). The window everything downstream must
 \* tolerate is activationTurn-free-while-count-high (the trel->tdec CompleteItem gap) -
 \* the benign stale-nonzero direction the code's comments name.
 PassReleaseActivationTurn(t) ==
@@ -935,11 +935,11 @@ PassDecrementInFlightCount(t) ==
   /\ visibleDeliveryArmItem' = localDeliveryArmItem
   /\ passSlotSeen' = [passSlotSeen EXCEPT ![t] = NONE]
   /\ passQueueSeen' = [passQueueSeen EXCEPT ![t] = NONE]
-  \* THE FOLDED LICENSE TRANSITION (DecrementCountAtEdge, WaiterStore :477 /
-  \* Pipeline :1532): count stays positive -> keep the license and walk on;
+  \* Folded license transition (InFlightStore.DecrementCountAtEdge /
+  \* Pipeline.AdvanceDecrement): count stays positive -> keep the license and walk on;
   \* count hits zero WITH a deposit -> consume it atomically, keep the license
-  \* (the serve); zero with NO deposit -> the license is RELEASED INSIDE the
-  \* RMW and the empty-edge handoff requires a fresh TryAcquire - the reacquire GAP is
+  \* (the serve); zero with no deposit releases the license inside the
+  \* RMW and the empty-edge handoff requires a fresh TryAcquire - the reacquire gap is
   \* contestable (another fire or committer can win or deposit in it).
   /\ IF inFlightCount' > 0
        THEN /\ UNCHANGED <<advanceOwner, advancePending>>
@@ -960,7 +960,7 @@ PassTryReacquireLicense(t) ==
   /\ passPc[t] = "reacquireLicense"
   /\ IF advanceOwner = "0"
        THEN /\ advanceOwner' = t /\ passPc' = [passPc EXCEPT ![t] = "readFirstTier"] /\ UNCHANGED advancePending
-       ELSE \* acquire-or-DEPOSIT (:1549): the loss transfers the empty-edge handoff
+       ELSE \* acquire-or-deposit: the loss transfers the empty-edge handoff
             \* obligation to the rival holder via the pending bit.
             /\ UNCHANGED advanceOwner /\ advancePending' = TRUE /\ passPc' = [passPc EXCEPT ![t] = "off"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
@@ -969,12 +969,12 @@ PassTryReacquireLicense(t) ==
                  openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* ---- Walk-side recovery (advancer side; monolith RecAssign*/RecAct/RecRetire) ----
-\* The claimed head's completion was a FAULT verdict: position already dequeued
-\* (credit HELD), token completionConsumed by the failure read. The substitution takes the
+\* The claimed head's completion was a fault verdict: position already dequeued
+\* (credit held), token completionConsumed by the failure read. The substitution takes the
 \* item over IN PLACE under the recovery lock: activationTurn to the item (inherit-or-
 \* assign fused - a FOREIGN live activationTurn PARKS this step until it clears), tenure
 \* reset (new task: token/completionDispatch/activation reset, fresh registration),
-\* recoveryAttempted stamped. Policy re-activation OUTSIDE the hold; re-completion rides
+\* recoveryAttempted stamped. Policy reactivation runs outside the hold; recompletion rides
 \* the normal tenure machinery (PublishCompletion's recovery disjunct); the second retire
 \* returns the advance-owner credit and resumes its claim loop.
 RecoveryHead(t) == IF passSlotSeen[t] # NONE THEN passSlotSeen[t] ELSE passQueueSeen[t]
@@ -1056,8 +1056,8 @@ PassDecrementRecoveredItem(t) ==
                  executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
                  openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, itemGeneration, recoveryAttempted>>
 
-\* EMPTY-EDGE HANDOFF: after the resident count reaches zero, LOCK { read the VISIBLE deferral; TAKE + assign
-\* the activationTurn } UNLOCK; the policy activate runs OUTSIDE the hold; then exit.
+\* Empty-edge handoff: after the resident count reaches zero, lock, read the visible deferral, consume and assign
+\* activationTurn under the lock; the policy activation runs outside the hold; then exit.
 PassAcquireEmptyEdgeLock(t) ==
   /\ passPc[t] = "emptyEdgeLock"
   /\ edgeLockOwner = "0" /\ edgeLockOwner' = t
@@ -1071,18 +1071,18 @@ PassAcquireEmptyEdgeLock(t) ==
 \* granularity; a fused check-and-take would hide the relevant interleaving).
 PassObserveEmptyEdgeDeferral(t) ==
   /\ passPc[t] = "emptyEdgeObserve"
-  \* RE-CHECK UNDER THE HOLD (the monolith v1 finding, reproduced by this
+  \* Recheck while holding the lock (the monolith v1 finding, reproduced by this
   \* composition as the stale-empty-edge handoff face): the idle premise (inFlightCount=0) must be
   \* re-validated inside the lock - an empty-edge handoff entered from a stale zero-count observation
   \* observation must self-neutralize, or it takes a LATER epoch's deferral
   \* and tramples a live activationTurn.
   \* OBSERVATION (relational Dekker): a retirement pass whose decrement-RMW postdates the
-  \* dispatcher's barrier epoch is SYNCHRONIZED and reads the true word; one
+  \* dispatcher's barrier epoch is synchronized and reads the true word; one
   \* whose RMW predates it reads the visible (possibly stale) copy.
   /\ LET obs == IF passDecrementEpoch[t] >= handoffFenceEpoch /\ handoffFenceEpoch > 0
                   THEN localDeferredGeneration ELSE visibleDeferredGeneration IN
      IF inFlightCount = 0 /\ obs # NONE /\ ~deferralGranted
-       THEN /\ passEmptyEdgeHandoffGeneration' = [passEmptyEdgeHandoffGeneration EXCEPT ![t] = obs]      \* THE PIN
+       THEN /\ passEmptyEdgeHandoffGeneration' = [passEmptyEdgeHandoffGeneration EXCEPT ![t] = obs]      \* generation pin
             /\ passEmptyEdgeHandoffItem' = [passEmptyEdgeHandoffItem EXCEPT ![t] = deferredItem]
             /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeTurnClaim"]
        ELSE /\ UNCHANGED <<passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem>>
@@ -1106,12 +1106,12 @@ PassReleaseEmptyEdgeLock(t) ==
 PassClaimEmptyEdgeTurn(t) ==
   /\ passPc[t] = "emptyEdgeTurnClaim"
   /\ IF activationTurn # NONE
-       THEN \* layer 2, FAIL-IF-LIVE: nothing taken, nothing trampled.
+       THEN \* Layer 2 claims only if free: nothing taken, nothing trampled.
             /\ UNCHANGED <<activationTurn, deferralGranted, localDeferredGeneration, visibleDeferredGeneration, deferredItem>>
             /\ edgeLockOwner' = "0"
             /\ passPc' = [passPc EXCEPT ![t] = "exitPass"]
        ELSE \* CLAIM the activationTurn as -(pinned gen) FIRST (the shipped order), then the
-            \* gen-pinned consume as its OWN step - the plain reclaim can interleave
+            \* generation-pinned consume as its own step - the plain reclaim can interleave
             \* between them (the double-bail class).
             /\ activationTurn' = -passEmptyEdgeHandoffGeneration[t]
             /\ UNCHANGED <<deferralGranted, localDeferredGeneration, visibleDeferredGeneration, deferredItem>>
@@ -1145,7 +1145,7 @@ PassConsumeEmptyEdgeDeferral(t) ==
 
 PassActivateEmptyEdgeItem(t) ==
   /\ passPc[t] = "emptyEdgeActivate"
-  /\ emptyEdgeActivationBusy' = TRUE          \* ActivateHeadItem ENTERED (returns in the next step)
+  /\ emptyEdgeActivationBusy' = TRUE          \* ActivateHeadItem entered (returns in the next step)
   /\ LET g == passEmptyEdgeHandoffItem[t] IN
      /\ faultDoubleActivate' = (faultDoubleActivate \/ (g # NONE /\ activationPerformed[g]))
      /\ activationPerformed' = IF g # NONE THEN [activationPerformed EXCEPT ![g] = TRUE] ELSE activationPerformed
@@ -1156,7 +1156,7 @@ PassActivateEmptyEdgeItem(t) ==
                  passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem,
                  generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* The policy call RETURNS; the resolution stamp is written afterward -
+\* The policy call returns; the resolution stamp is written afterward -
 \* "that ordering, not vacuity, is what makes the substitute's activation safe".
 PassRecordEmptyEdgeResolution(t) ==
   /\ UNCHANGED <<handoffFenceEpoch, passDecrementEpoch>>
@@ -1215,7 +1215,7 @@ Next ==
 Spec == Init /\ [][Next]_vars
 
 (* ------------------------------ properties -------------------------------- *)
-\* THE COMPOSED AOORE FACE (ItemTenure's theorem with its relies discharged).
+\* Composed AOORE property (ItemTenure's theorem with its relies discharged).
 CompletionDispatchNeverTorn == \A i \in 1..N : ~completionDispatchTorn[i]
 
 \* The composed July-9 face (InFlightStore's theorem under the real license).

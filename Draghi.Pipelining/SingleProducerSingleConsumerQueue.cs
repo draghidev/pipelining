@@ -55,12 +55,11 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     // as the old buffer. From then on, the producer will insert values into the new buffer. The consumer will first
     // empty out the old buffer and only then follow the producer into the new (larger) buffer.
     //
-    // As described above, the enqueue operation on the fast path only modifies the _first field of the current segment.
-    // However, it also needs to read _last in order to verify that there is room in the current segment. Similarly, the
-    // dequeue operation on the fast path only needs to modify _last, but also needs to read _first to verify that the
-    // queue is non-empty. This results in true cache line sharing between the producer and the consumer.
+    // The enqueue fast path modifies _last and reads _first to check for space. The dequeue fast
+    // path modifies _first and reads _last to check for data. This creates true cache-line sharing
+    // between the producer and consumer.
     //
-    // The cache line sharing issue can be mitigating by having a possibly stale copy of _first that is owned by the producer,
+    // The cache-line sharing can be mitigated with a possibly stale copy of _first owned by the producer,
     // and a possibly stale copy of _last that is owned by the consumer. So, the consumer state is described using
     // (_first, _lastCopy) and the producer state using (_firstCopy, _last). The consumer state is separated from
     // the producer state by padding, which allows fast-path enqueues and dequeues from hitting shared cache lines.
@@ -76,7 +75,7 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
     // (EnqueueSlow) up to MaxSegmentSize, so deep producers are unaffected.
     const int InitialSegmentSize = 8; // must be a power of 2
     /// <summary>The maximum size to use for segments (in number of elements).</summary>
-    const int MaxSegmentSize = 0x1000000; // this could be made as large as int.MaxValue / 2
+    const int MaxSegmentSize = 0x1000000;
 
     /// <summary>The head of the linked list of segments. Consumer-owned writes, observers use Volatile.Read.</summary>
     Segment _head;

@@ -81,41 +81,41 @@ public class PipelineBenchmarks
         last.Wait();
     }
 
-    QueuedPipeline<BareWaiterItem, BareWaiterPolicy> _waiterPipeline = null!;
-    BareWaiterItem _waiterItem = null!;
+    QueuedPipeline<BareInFlightItem, BareInFlightPolicy> _inFlightPipeline = null!;
+    BareInFlightItem _inFlightItem = null!;
 
     [GlobalSetup(Target = nameof(EnqueueCompleteEscalated))]
     public void SetupEscalated()
     {
-        _waiterPipeline = Pipeline.Create<BareWaiterItem, BareWaiterPolicy>(new BareWaiterPolicy(), runContinuationsAsynchronously: RunAsync);
+        _inFlightPipeline = Pipeline.Create<BareInFlightItem, BareInFlightPolicy>(new BareInFlightPolicy(), runContinuationsAsynchronously: RunAsync);
         // Force escalation once (it is sticky): two overlapping waiter commits move the store to
         // the queue tier and allocate the activation lock, the regime a long-lived pipeline runs
         // in permanently.
-        var a = new BareWaiterItem();
-        var b = new BareWaiterItem();
-        _waiterPipeline.Enqueue(a).Execute();
-        _waiterPipeline.Enqueue(b).Execute();
+        var a = new BareInFlightItem();
+        var b = new BareInFlightItem();
+        _inFlightPipeline.Enqueue(a).Execute();
+        _inFlightPipeline.Enqueue(b).Execute();
         a.CompletePipelineTask();
         b.CompletePipelineTask();
         a.Wait();
         b.Wait();
-        _waiterItem = new BareWaiterItem();
+        _inFlightItem = new BareInFlightItem();
     }
 
     [GlobalCleanup(Target = nameof(EnqueueCompleteEscalated))]
     public void CleanupEscalated()
-        => _waiterPipeline.CompleteAsync().AsTask().GetAwaiter().GetResult();
+        => _inFlightPipeline.CompleteAsync().AsTask().GetAwaiter().GetResult();
 
-    /// Escalated sequential per-item cost: the item takes the waiter path (its pipeline task is
+    /// Escalated sequential per-item cost: the item enters the in-flight store (its pipeline task is
     /// pending at commit, completing afterwards like a wire round-trip) on an escalated store.
     /// This is the shape that pays the dispatch, commit, and drain coordination per item, which
     /// EnqueueComplete's inline-completing items never reach.
     [Benchmark]
     public void EnqueueCompleteEscalated()
     {
-        var item = _waiterItem;
+        var item = _inFlightItem;
         item.Reset();
-        _waiterPipeline.Enqueue(item).Execute();
+        _inFlightPipeline.Enqueue(item).Execute();
         item.WaitExecuted();
         item.CompletePipelineTask();
         item.Wait();
@@ -151,7 +151,7 @@ readonly struct BareItemHandle(BareItem item)
 
 struct BareHandlePolicy : IPipelinePolicy<BareItemHandle>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItemHandle item, bool waiterExecution, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItemHandle item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         => new(new PipelineItemResult(ValueTask.CompletedTask));
 
     public void ActivateHeadItem(BareItemHandle item, bool preferAsync = true) { }
@@ -181,9 +181,9 @@ sealed class BareItem
     public void Reset() => _completed.Reset();
 }
 
-/// Waiter-path item: its pipeline task is pending at commit and completes afterwards.
+/// In-flight item whose pipeline task is pending at commit and completes afterwards.
 /// Reusable through the versioned source, zero alloc per op.
-sealed class BareWaiterItem : System.Threading.Tasks.Sources.IValueTaskSource
+sealed class BareInFlightItem : System.Threading.Tasks.Sources.IValueTaskSource
 {
     // RunContinuationsAsynchronously stays false (the default), and it is load-bearing: the
     // pipeline's commit registers its completion callback on this task, so false runs the drain
@@ -225,20 +225,20 @@ sealed class BareWaiterItem : System.Threading.Tasks.Sources.IValueTaskSource
         => _source.OnCompleted(continuation, state, token, flags);
 }
 
-struct BareWaiterPolicy : IPipelinePolicy<BareWaiterItem>
+struct BareInFlightPolicy : IPipelinePolicy<BareInFlightItem>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareWaiterItem item, bool waiterExecution, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareInFlightItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
     {
         item.SignalExecuted();
         return new(new PipelineItemResult(item.PipelineTask));
     }
 
-    public void ActivateHeadItem(BareWaiterItem item, bool preferAsync = true) { }
+    public void ActivateHeadItem(BareInFlightItem item, bool preferAsync = true) { }
 
-    public void CompleteItem(BareWaiterItem item, int remainingDepth, Exception? exception)
+    public void CompleteItem(BareInFlightItem item, int remainingDepth, Exception? exception)
         => item.SignalComplete();
 
-    public bool TryRecoverItemFailure(PipelineItemFailureContext context, BareWaiterItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareWaiterItem? recoveryItem)
+    public bool TryRecoverItemFailure(PipelineItemFailureContext context, BareInFlightItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareInFlightItem? recoveryItem)
     {
         recoveryItem = null;
         return false;
@@ -251,7 +251,7 @@ struct BareWaiterPolicy : IPipelinePolicy<BareWaiterItem>
 /// </summary>
 struct BarePolicy : IPipelinePolicy<BareItem>
 {
-    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItem item, bool waiterExecution, CancellationToken cancellationToken)
+    public ValueTask<PipelineItemResult> ExecuteItemAsync(BareItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
     {
         return new(new PipelineItemResult(ValueTask.CompletedTask));
     }

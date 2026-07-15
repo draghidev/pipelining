@@ -21,7 +21,7 @@
 EXTENDS Integers, Sequences, FiniteSets, TLC
 
 CONSTANTS
-    NumEntries,             \* number of committed waiters
+    NumEntries,             \* number of in-flight items
     SegmentCapacity         \* segment A capacity C (usable C-1 before split)
 
 ASSUME SegmentCapacity >= 2
@@ -30,12 +30,12 @@ Entries == 1..NumEntries
 
 VARIABLES
     \* Shared protocol state.
-    count,      \* WaiterStore._count (raw, may dip to -1; reads clamp)
+    count,      \* InFlightStore._countAndLicense count field (reads clamp)
     signal,     \* _drainSignal
     advanceLicense,      \* the advance-license word: "free" | "held" | "heldPending"
     \* Ground truth.
-    completed,  \* [Entries -> BOOLEAN] waiter task settled
-    retired,    \* [Entries -> BOOLEAN] CompleteWaiterDeferred ran
+    completed,  \* [Entries -> BOOLEAN] pipeline task settled
+    retired,    \* [Entries -> BOOLEAN] RetireItemDeferred ran
     \* Committer thread (the executor, single producer).
     publisherNextEntry,      \* next entry to commit (entries commit in id order)
     publisherPc,        \* "enq" | "inc" | "done"
@@ -77,7 +77,7 @@ CallbackStates == {"idle", "acq", "pass", "peek", "retire", "decr", "consRead",
 LicenseHeldStates == {"pass", "peek", "retire", "decr", "consRead", "consStore", "rel",
             "reclaimPeek", "reclaimMissRel"}
 
-ClampedCount == IF count > 0 THEN count ELSE 0   \* WaiterStore.Count (line 47)
+ClampedCount == IF count > 0 THEN count ELSE 0   \* InFlightStore.Count
 
 MaxN(x, y) == IF x >= y THEN x ELSE y
 EmptyVisibility == [a |-> 0, b |-> 0]
@@ -95,7 +95,7 @@ TrueQueue == SubSeq(segmentAItems, segmentAConsumed + 1, segmentAPublished) \o S
 
 (* ---------------------------------------------------------------------------
    The read model. ReadSetA/B: values an acquire read of the segment's _last
-   may return for agent e. NextReadSet: values the PLAIN _next read may return.
+   may return for agent e. NextReadSet: values the plain _next read may return.
    Reads range from the agent's coherence floor to the published value.
    ------------------------------------------------------------------------ *)
 
@@ -173,18 +173,18 @@ Init ==
    Synchronization-edge helpers.
    ------------------------------------------------------------------------ *)
 
-\* Every advanceLicense op is a full-fence RMW on one word (Latch.cs): release own
+\* Every advanceLicense operation is a full-fence RMW on the fused InFlightStore word: release local
 \* knowledge into the chain, acquire everything already there.
 ImportAdvanceLicenseVisibility(e) ==
     /\ advanceLicenseVisibility' = MergeVisibility(advanceLicenseVisibility, AgentVisibility(e))
     /\ segmentAReadFloor' = [segmentAReadFloor EXCEPT ![e] = MaxN(@, advanceLicenseVisibility.a)]
     /\ segmentBReadFloor' = [segmentBReadFloor EXCEPT ![e] = MaxN(@, advanceLicenseVisibility.b)]
 
-\* Latch actions never touch the other visibility state or the queue view.
+\* Advance-license actions never touch the other visibility state or the queue view.
 PreserveVisibility == UNCHANGED <<sawNextSegment, countVisibility, lockVisibility, segmentAPublicationWire, segmentBPublicationWire>> /\ UNCHANGED queueStateVars
 
 (* ---------------------------------------------------------------------------
-   ENVIRONMENT: adversarial waiter-task settlement.
+   Environment: adversarial pipeline-task settlement.
    ------------------------------------------------------------------------ *)
 
 PublishCompletion(e) ==
@@ -194,7 +194,7 @@ PublishCompletion(e) ==
     /\ UNCHANGED queueStateVars /\ UNCHANGED visibilityStateVars
 
 (* ---------------------------------------------------------------------------
-   COMMITTER (executor thread). queue.Enqueue routes per the real producer
+   Committer (executor thread). queue.Enqueue routes per the real producer
    tree: segment A while it has room under the full check (wrap-at-full lives
    here: room iff segmentAPublished - first < C-1), else EnqueueSlow allocates B (preset
    B._last = B._lastCopy = 1, first item at B[0]) and publishes A._next; once
@@ -216,8 +216,8 @@ PublisherEnqueueEntry ==
 
 \* Increment + the wiring snapshot (callback continuation starts with the
 \* producer knowledge at wiring) + the count-word release + the wasEmpty
-\* _activationLock release (CommitWaiter 1100-1122, taken when the sole
-\* committed waiter is not yet completed; modeled always-taken - max edges).
+\* _activationLock release (CommitInFlightItem 1100-1122, taken when the sole
+\* in-flight item is not yet completed; modeled always-taken - max edges).
 PublisherIncrementCount ==
     /\ publisherPc = "inc"
     /\ count' = count + 1
@@ -232,10 +232,10 @@ PublisherIncrementCount ==
     /\ UNCHANGED queueStateVars /\ UNCHANGED <<segmentAReadFloor, segmentBReadFloor, sawNextSegment, advanceLicenseVisibility>>
 
 (* ---------------------------------------------------------------------------
-   CALLBACK: OnWaiterTaskCompleted (Pipeline.cs 1166-1191).
+   Callback: the registered head-completion callback (Pipeline.OnAdvanceFire).
    ------------------------------------------------------------------------ *)
 
-\* Line 1171: `_drainSignal = true`. The agent thread starts with the wiring
+\* The callback publishes its pending-pass request. The agent thread starts with the wiring
 \* visibility (UnsafeOnCompleted registered after the entry's increment).
 CompletionCallbackPublishSignal(e) ==
     /\ callbackPc[e] = "idle"
@@ -248,7 +248,7 @@ CompletionCallbackPublishSignal(e) ==
     /\ UNCHANGED <<count, advanceLicense, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
     /\ UNCHANGED queueStateVars /\ UNCHANGED <<sawNextSegment, advanceLicenseVisibility, countVisibility, lockVisibility, segmentAPublicationWire, segmentBPublicationWire>>
 
-\* Line 1179: TryAcquireOrFlagPending wins -> run DrainReadyWaiters.
+\* InFlightStore.TryAcquire wins -> run the retirement pass.
 CompletionCallbackAcquireLicense(e) ==
     /\ callbackPc[e] = "acq"
     /\ advanceLicense = "free"
@@ -257,7 +257,7 @@ CompletionCallbackAcquireLicense(e) ==
     /\ ImportAdvanceLicenseVisibility(e) /\ PreserveVisibility
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
 
-\* Line 1179-1183: acquire loses -> obligation DEPOSITED in the advanceLicense word.
+\* A failed acquire deposits the obligation in the advance-license word.
 CompletionCallbackDepositPending(e) ==
     /\ callbackPc[e] = "acq"
     /\ advanceLicense # "free"
@@ -267,10 +267,10 @@ CompletionCallbackDepositPending(e) ==
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
 
 (* ---------------------------------------------------------------------------
-   DRAIN: DrainReadyWaiters (Pipeline.cs 1427-1631).
+   Drain: the licensed FIFO retirement pass (Pipeline.Advance).
    ------------------------------------------------------------------------ *)
 
-\* Line 1435: pass start, Interlocked.Exchange(ref _drainSignal, false). RMW
+\* Pass start consumes the pending callback signal. The RMW
 \* on the SIGNAL word: its other writers are plain stores heading no release
 \* sequence, so no visibility is harvested here (see header).
 DrainPassStart(e) ==
@@ -293,7 +293,7 @@ DrainPassStart(e) ==
    final-hit shape is the only one reaching the line-253/255 slow-tail
    dequeue, whose freshness refresh is the s3 read. *)
 
-\* Line 1439-1443: peek hit on a completed head -> TryDequeue, drainedAny.
+\* A peek hit on a completed head claims it and records that the pass retired an item.
 DrainPassReadHead(e) ==
     /\ callbackPc[e] = "peek"
     /\ \/ /\ headSegment = "A"
@@ -386,7 +386,7 @@ DrainPassReadHead(e) ==
 
 \* Shared miss body: the peek's verdict is "no completed head" - either an
 \* empty verdict or a hit on a not-(yet-)completed entry. Read side effects
-\* (refresh, floors, THE HOP) persist even on a miss.
+\* The refreshed indices, visibility floors and segment hop persist even on a miss.
 HeadReadMiss(e) ==
     \/ /\ headSegment = "A"
        /\ \/ \* fast hit, head not completed
@@ -522,7 +522,7 @@ HeadReadHit(e) ==
                   /\ segmentBReadFloor' = RaiseSegmentBReadFloor(e, s2)
              /\ UNCHANGED <<segmentAConsumed, segmentBConsumed, segmentALastSeen, segmentBLastSeen, headSegment, segmentAReadFloor, sawNextSegment>>
 
-\* Line 1448-1464: consume + CompleteWaiterDeferred (fused).
+\* Consume and RetireItemDeferred are fused into this action.
 RetireClaimedEntry(e) ==
     /\ callbackPc[e] = "retire"
     /\ retired' = [retired EXCEPT ![claimedEntry[e]] = TRUE]
@@ -530,8 +530,8 @@ RetireClaimedEntry(e) ==
     /\ UNCHANGED <<count, signal, advanceLicense, completed, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
     /\ UNCHANGED queueStateVars /\ UNCHANGED visibilityStateVars
 
-\* Line 1487: _waiters.DecrementCount() - the count-word RMW chain edge, plus
-\* the C-path _activationLock edge when the verdict is drained (line 1493's
+\* InFlightStore.DecrementCount supplies the count-word RMW chain edge, plus
+\* the empty-edge activation-lock edge when the verdict is drained (the
 \* lock is unconditional on the TRUE branch).
 DrainPassDecrementCount(e) ==
     /\ callbackPc[e] = "decr"
@@ -547,7 +547,7 @@ DrainPassDecrementCount(e) ==
     /\ UNCHANGED <<signal, advanceLicense, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount>>
     /\ UNCHANGED queueStateVars /\ UNCHANGED <<sawNextSegment, advanceLicenseVisibility, segmentAPublicationWire, segmentBPublicationWire>>
 
-\* Line 1439 exit: no completed head at the read instant (see HeadReadMiss for
+\* Exit when no completed head exists at the read instant (see HeadReadMiss for
 \* the read side effects, including a committed hop).
 DrainPassRecordHeadMiss(e) ==
     /\ callbackPc[e] = "peek"
@@ -557,7 +557,7 @@ DrainPassRecordHeadMiss(e) ==
                    publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry, advanceLicenseVisibility, countVisibility, lockVisibility,
                    segmentAPublicationWire, segmentBPublicationWire>>
 
-\* Line 1555: `var conserveCount = _waiters.Count` - Volatile.Read (acquire)
+\* Reading InFlightStore.Count conserves the observed count with acquire semantics
 \* of a value written by full-fence RMWs: a REAL edge, harvests countVisibility.
 DrainPassReadConservationCount(e) ==
     /\ callbackPc[e] = "consRead"
@@ -568,7 +568,7 @@ DrainPassReadConservationCount(e) ==
     /\ UNCHANGED <<count, signal, advanceLicense, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, claimedEntry>>
     /\ UNCHANGED queueStateVars /\ UNCHANGED <<sawNextSegment, advanceLicenseVisibility, countVisibility, lockVisibility, segmentAPublicationWire, segmentBPublicationWire>>
 
-\* Line 1557-1560: conditional restore (plain store - releases nothing).
+\* Conditional signal restoration is a plain store and releases nothing.
 DrainPassRestoreSignal(e) ==
     /\ callbackPc[e] = "consStore"
     /\ signal' = IF conservationCount[e] > 0 THEN TRUE ELSE signal
@@ -577,7 +577,7 @@ DrainPassRestoreSignal(e) ==
     /\ UNCHANGED <<count, advanceLicense, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, claimedEntry>>
     /\ UNCHANGED queueStateVars /\ UNCHANGED visibilityStateVars
 
-\* Line 1570: ReleaseAndCheckPending, no deposit.
+\* ReleaseAndCheckPending finds no deposit.
 DrainPassReleaseLicense(e) ==
     /\ callbackPc[e] = "rel"
     /\ advanceLicense = "held"
@@ -587,7 +587,7 @@ DrainPassReleaseLicense(e) ==
     /\ ImportAdvanceLicenseVisibility(e) /\ PreserveVisibility
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, conservationCount, claimedEntry>>
 
-\* Line 1570: the release consumed a deposit - the obligation is now OURS.
+\* The release consumes a deposit, transferring the obligation to this pass.
 DrainPassReleaseWithPending(e) ==
     /\ callbackPc[e] = "rel"
     /\ advanceLicense = "heldPending"
@@ -597,7 +597,7 @@ DrainPassReleaseWithPending(e) ==
     /\ ImportAdvanceLicenseVisibility(e) /\ PreserveVisibility
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, conservationCount, claimedEntry>>
 
-\* Line 1572-1575: the deposit-serve re-acquire wins.
+\* The deposit-serve reacquire wins.
 DrainPassServePendingAndReacquire(e) ==
     /\ callbackPc[e] = "relServe"
     /\ advanceLicense = "free"
@@ -606,7 +606,7 @@ DrainPassServePendingAndReacquire(e) ==
     /\ ImportAdvanceLicenseVisibility(e) /\ PreserveVisibility
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
 
-\* Line 1572-1576: the re-acquire loses - re-deposits on the winner.
+\* A lost reacquire redeposits on the winner.
 DrainPassServePendingButLose(e) ==
     /\ callbackPc[e] = "relServe"
     /\ advanceLicense # "free"
@@ -615,7 +615,7 @@ DrainPassServePendingButLose(e) ==
     /\ ImportAdvanceLicenseVisibility(e) /\ PreserveVisibility
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
 
-\* Line 1583-1586: post-release recheck of _drainSignal (plain-store word: no
+\* Post-release recheck of the drain signal (plain-store word: no
 \* harvest, see header).
 DrainPassRecheckSignal(e) ==
     /\ callbackPc[e] = "recheck"
@@ -623,7 +623,7 @@ DrainPassRecheckSignal(e) ==
     /\ UNCHANGED <<count, signal, advanceLicense, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
     /\ UNCHANGED queueStateVars /\ UNCHANGED visibilityStateVars
 
-\* Line 1607 (now 1638): TryReclaimAdvancerForWork's acquire wins.
+\* The attempt to reclaim the advance license wins.
 DrainPassReclaimLicense(e) ==
     /\ callbackPc[e] = "reclaimAcq"
     /\ advanceLicense = "free"
@@ -641,7 +641,7 @@ DrainPassReclaimDeposit(e) ==
     /\ ImportAdvanceLicenseVisibility(e) /\ PreserveVisibility
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
 
-\* Line 1645-1649: reclaim peek finds a completed head -> continue the pass.
+\* The reclaim peek finds a completed head and continues the pass.
 DrainPassReclaimHeadHit(e) ==
     /\ callbackPc[e] = "reclaimPeek"
     /\ HeadReadHit(e)
@@ -650,7 +650,7 @@ DrainPassReclaimHeadHit(e) ==
                    publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry, advanceLicenseVisibility, countVisibility, lockVisibility,
                    segmentAPublicationWire, segmentBPublicationWire>>
 
-\* Line 1645 miss verdict proceeds directly to the miss release.
+\* A reclaim-peek miss proceeds directly to the miss release.
 DrainPassReclaimHeadMiss(e) ==
     /\ callbackPc[e] = "reclaimPeek"
     /\ HeadReadMiss(e)
@@ -659,7 +659,7 @@ DrainPassReclaimHeadMiss(e) ==
                    publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry, advanceLicenseVisibility, countVisibility, lockVisibility,
                    segmentAPublicationWire, segmentBPublicationWire>>
 
-\* Line 1651/1659-1660: the miss release, no deposit -> exit.
+\* A miss release with no deposit exits.
 DrainPassReleaseAfterReclaimMiss(e) ==
     /\ callbackPc[e] = "reclaimMissRel"
     /\ advanceLicense = "held"
@@ -668,7 +668,7 @@ DrainPassReleaseAfterReclaimMiss(e) ==
     /\ ImportAdvanceLicenseVisibility(e) /\ PreserveVisibility
     /\ UNCHANGED <<count, signal, completed, retired, publisherNextEntry, publisherPc, passDrainedAny, conservationCount, claimedEntry>>
 
-\* Line 1651-1657: a bail landed against the transient hold - serve it.
+\* A bail landed against the transient hold, so serve it.
 DrainPassReleaseMissWithPending(e) ==
     /\ callbackPc[e] = "reclaimMissRel"
     /\ advanceLicense = "heldPending"

@@ -24,7 +24,7 @@ the publish CAS is itself the full-fence RMW, so no separate armed word):
              is at-or-after its own arm: always legitimate); else await.
 
 Memory-model fidelity: this spec models sequential consistency, which is
-faithful here because BOTH critical writes are Interlocked RMWs (full fences):
+faithful here because both critical writes are Interlocked RMWs (full fences):
 the completer's tcs-slot load cannot hoist above its completedCount bump, and the armer's
 recheck loads cannot hoist above its publish CAS. The remaining edges
 (producer's release store on enqueuedCount, completers' acquire loads) only need
@@ -66,7 +66,7 @@ Properties:
   DrainWaitNeverCompletesAboveZero - no completer fire delivers a pre-arm zero onto a
                       non-zero depth
   PublishedDrainWaitEventuallyCompletes - once the tcs is published and all items
-                      complete, the tcs eventually fires. THE property the
+                      complete, the tcs eventually fires. The property the
                       packed word used to give for free
                       after the arm-time recheck.
   DrainWaitPublicationEventuallyReturns - the publisher always returns once everything completes

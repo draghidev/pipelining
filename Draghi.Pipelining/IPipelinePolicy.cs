@@ -9,19 +9,18 @@ namespace Draghi.Pipelining;
 /// transition (execute, activate, complete, recover).
 /// </summary>
 /// <remarks>
-/// Exception robustness: policy callbacks other than <see cref="ExecuteItemAsync"/> (i.e.,
-/// <see cref="ActivateHeadItem"/>, <see cref="CompleteItem"/>, <see cref="TryRecoverItemFailure"/>)
-/// MUST NOT throw. The framework does not wrap them in try/catch and an escaping exception will
-/// propagate into whichever context invoked it (executor loop, advancer continuation, drain path),
-/// leaving the pipeline in an undefined state. Same contract as <c>IThreadPoolWorkItem.Execute</c>
-/// or async continuations: the runtime expects callback authors to handle their own exception
-/// domains. Exceptions from <see cref="ExecuteItemAsync"/> and from the returned pipeline/trailing
-/// tasks are first-class and flow through <see cref="TryRecoverItemFailure"/>. That is the
-/// supported way to surface failure from an item.
+/// Policy methods MUST NOT throw synchronously. They run at lifecycle transitions where a thrown
+/// exception cannot reliably describe which policy effects occurred. Some call sites incidentally
+/// preserve tenure while propagating such misuse, but that is not part of the contract. Failures from
+/// the tasks returned by <see cref="ExecuteItemAsync"/> are first-class and flow through recovery.
 /// <para>
 /// Production-side concerns (when items arrive, how the executor suspends while waiting, dispatch
 /// scheduling between enqueue and execute) live on the source, not the policy. The policy is
 /// purely about what to do with each item as it flows through the pipeline.
+/// </para>
+/// <para>
+/// Unless a method documents a stronger guarantee, policy calls for different items may overlap.
+/// Per-item activation and completion ordering is documented on <see cref="ActivateHeadItem"/>.
 /// </para>
 /// </remarks>
 public interface IPipelinePolicy<T>
@@ -31,31 +30,23 @@ public interface IPipelinePolicy<T>
     /// Cancellation contract: implementations MUST observe <paramref name="cancellationToken"/>.
     /// The token is the pipeline's shutdown signal. The executor awaits this call inline during
     /// the recovery paths (<c>RecoverItem</c>, <c>RecoverTrailingFailure</c>,
-    /// <c>RecoverCommittedTailWaiterAsync</c>). If an implementation ignores the token, the
+    /// <c>RecoverCommittedPendingTailAsync</c>). If an implementation ignores the token, the
     /// executor cannot exit its main loop and the pipeline's completion task will never complete.
     /// Idiomatic handling is to either throw <see cref="OperationCanceledException"/> on
     /// cancellation or return a faulted task.
     /// <para>
-    /// <paramref name="waiterExecution"/> identifies which side issued this dispatch. False is the
-    /// EXECUTOR side: the pump's own dispatches and the recoveries driven inline on the executor
-    /// thread (<c>RecoverItem</c>, <c>RecoverTrailingFailure</c>, <c>RecoverCommittedTailWaiterAsync</c>),
-    /// all serialized by the executor loop. True is the WAITER side: the waiter-drain recovery
-    /// (<c>RecoverWaiter</c>), dispatched off the advancer chain when a committed waiter's pipeline
-    /// task faulted. The waiter side runs off the executor thread, so it can overlap an in-flight
-    /// executor dispatch - and THAT cross-side overlap is the hazard this flag exists for.
-    /// Waiter executions do not overlap EACH OTHER even though waiters complete out of order: the
-    /// advancer latch serializes them. It is held across the recovery dispatch (a synchronous recovery
-    /// inline; an async one hands the held flag to its completion continuation, which only re-drains
-    /// via <c>AdvanceAndDrainRecovery</c> after the execute settles), so a second waiter faulting
-    /// concurrently loses <c>TryAcquireOrFlagPending</c> and defers rather than dispatching. Hence at
-    /// most one waiter execution is ever in flight, overlapping only the single executor dispatch.
+    /// <paramref name="pipelineTaskRecovery"/> is true only when recovering a
+    /// <see cref="PipelineItemFailureKind.PipelineTask"/> failure from the in-flight drain. Calls with
+    /// <c>pipelineTaskRecovery: true</c> never overlap one another, but one may overlap an ordinary
+    /// <c>pipelineTaskRecovery: false</c> execution. Calls with
+    /// <c>pipelineTaskRecovery: false</c> are serialized with one another.
     /// A policy that shares per-dispatch state across calls on the assumption of executor-loop
     /// serialization (e.g. a pooled builder/promise reused because one dispatch completes before the
-    /// next starts) MUST NOT reuse that state for a waiter execution - it would collide with the
+    /// next starts) MUST NOT reuse that state for pipeline-task recovery - it would collide with the
     /// concurrent executor dispatch on the shared state.
     /// </para>
     /// </remarks>
-    ValueTask<PipelineItemResult> ExecuteItemAsync(T item, bool waiterExecution, CancellationToken cancellationToken);
+    ValueTask<PipelineItemResult> ExecuteItemAsync(T item, bool pipelineTaskRecovery, CancellationToken cancellationToken);
 
     /// Signals the item that it is at the head of the pipeline.
     /// When <paramref name="preferAsync"/> is true, activation should be scheduled or guarded to avoid deep recursion.
@@ -75,20 +66,24 @@ public interface IPipelinePolicy<T>
     /// method is required.
     /// </para>
     /// <para>
-    /// Today this runs under the advancer latch, so slow inline work here (or in <see cref="CompleteItem"/>)
-    /// pins the drain and defers other completions. Treat <c>preferAsync: true</c> as required:
-    /// dispatch off-thread, no item-body work inline. The name stays "prefer" because the
-    /// constraint is a framework limitation, not the contract's intent.
+    /// A call with <c>preferAsync: true</c> occurs on a completion path and must return promptly;
+    /// schedule item-body work rather than running it inline. Slow work here, or in
+    /// <see cref="CompleteItem"/>, delays retirement and other completion callbacks.
     /// </para>
     /// </remarks>
     void ActivateHeadItem(T item, bool preferAsync = true);
 
-    /// Notifies the item of completion with an optional error. <paramref name="remainingDepth"/> is the pipeline depth after this item.
+    /// Notifies the item of retirement, with an optional error, exactly once. If recovery supplants
+    /// an item, the failed item does not receive this callback; its recovery item does.
+    /// <paramref name="remainingDepth"/> is the pipeline depth after retiring this item.
     void CompleteItem(T item, int remainingDepth, Exception? exception);
 
-    /// Attempts to recover from a failed item. Returns a recovery item that supplants the failed item in the pipeline,
-    /// or null if recovery is not possible. When non-null the pipeline will not complete the failed item.
-    /// NOTE: struct policies should override this to avoid DIM boxing.
+    /// Attempts to recover from a failed item. Returns a recovery item that supplants the failed item
+    /// in the same pipeline position, or false if recovery is not possible. When true, the pipeline
+    /// does not call <see cref="CompleteItem"/> for <paramref name="failedItem"/>; the recovery item
+    /// assumes that lifecycle position. A consultation for
+    /// <see cref="PipelineItemFailureKind.PipelineTask"/> may overlap ordinary item execution.
+    /// Struct policies should override this default implementation to avoid boxing.
     bool TryRecoverItemFailure(in PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out T? recoveryItem)
     {
         recoveryItem = default;
@@ -100,7 +95,7 @@ public interface IPipelinePolicy<T>
 /// Returned by <see cref="IPipelinePolicy{T}.ExecuteItemAsync"/> to describe the work an item produces.
 /// </summary>
 /// <remarks>
-/// The two tasks are returned together so the pipeline can enqueue the item as a waiter (keyed on
+/// The two tasks are returned together so the pipeline can commit the item in flight (keyed on
 /// <see cref="PipelineTask"/>) before awaiting <see cref="TrailingExecutionTask"/>. This allows the
 /// item to be activated and begin its pipelined phase concurrently with trailing execution, which is
 /// critical when the transport can backpressure: if both sides block on I/O and neither can make progress,
@@ -111,11 +106,11 @@ public interface IPipelinePolicy<T>
 /// to start reading responses. Only by enqueuing the item before awaiting trailing writes can activation
 /// of the response-reading phase proceed and unblock the connection.
 /// <para>
-/// Each result must carry distinct task instances. An <see cref="IValueTaskSource"/>-backed
-/// <see cref="ValueTask"/> shared across items would be double-consumed by the pipeline (once
-/// for the trailing/pipelined inspection on the executor, once on the waiter completion path),
-/// corrupting the source's token and producing undefined behavior. Distinct <see cref="Task"/>-backed
-/// or <see cref="ValueTask.CompletedTask"/>/<c>default</c> instances are always safe.
+/// The two values must not refer to the same single-consumption
+/// <see cref="IValueTaskSource"/> operation. Such an operation would be consumed twice (once
+/// for the trailing/pipelined inspection on the executor, once on the in-flight completion path),
+/// corrupting its token and producing undefined behavior. Task-backed values and synchronously
+/// completed values may safely be reused.
 /// </para>
 /// <para>
 /// Both phases retain their ordinary liveness obligation when the other phase faults. In particular,
@@ -133,7 +128,7 @@ public readonly struct PipelineItemResult(ValueTask trailingExecutionTask, Value
     /// </summary>
     /// <remarks>
     /// Items returning a non-default <see cref="TrailingExecutionTask"/> are routed through the
-    /// tail-waiter path unconditionally. The framework guarantees that
+    /// pending-tail path unconditionally. The framework guarantees that
     /// <see cref="IPipelinePolicy{T}.CompleteItem"/> for such an item will fire only after this
     /// task has been observed (success or fault), regardless of when <see cref="PipelineTask"/>
     /// completes. Policy authors can return a sync-complete pipeline task while their trailing
