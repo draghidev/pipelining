@@ -8,7 +8,7 @@ namespace Draghi.Pipelining.Tests;
 /// registered (continuation, state) pair and invokes it (phase 2 - unlicensed, on the completer's
 /// thread). The window hooks park the completer between phase 1 and phase 2's state read, making
 /// the retire-vs-dispatch race deterministic with no pipeline-side hooks: the pipeline's own
-/// RegisterAdvanceFire performs the real BCL ValueTaskAwaiter registration on this source, and the
+/// RegisterAdvanceCallback performs the real BCL ValueTaskAwaiter registration on this source, and the
 /// real Advance performs the racing GetResult.
 ///
 /// GetResult consumes AND resets the tenure (nulls the pair), as the production promise does on

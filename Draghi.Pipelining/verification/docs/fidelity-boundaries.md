@@ -10,7 +10,7 @@
 | `ItemTaskGates` | Pipeline-task retirement gate, trailing-task successor gate, recovery/output tenure. | Atomic task-state publication. | Activation, store, ROB mechanics, and wakeups. |
 | `QueueDrainObligation` | Detailed queue visibility, drain-obligation conservation, reclaim behavior, and eventual retirement of completed FIFO prefixes. | Its encoded SPSC visibility model. | Activation policy and shutdown. |
 | `StoreEscalation` | Leave-head topology, slot-before-overflow order, activation safety, FIFO and exactly-once retirement. | Abstract task completion and fair execution. | Full advance-license protocol. |
-| `DepthDrain` | Split depth-counter waiter arm and zero revalidation. | Atomic counter/TCS operations. | Item order and activation. |
+| `DepthDrain` | Split depth-counter empty-wait arm and zero revalidation. | Atomic counter/TCS operations. | Item order and activation. |
 | `WakeHandshake` | Symmetric store/load lost-wake theorem. | The chosen fence strength. | Feature-specific state outside the handshake. |
 
 ## Liveness
@@ -22,7 +22,7 @@
 The models represent only load-bearing weak-memory relations:
 
 - local versus visible delivery-arm clear;
-- activation-deferral publication versus the empty-edge count observation;
+- activation-handoff publication versus the empty-edge count observation;
 - symmetric store/load wake handshakes;
 - selected SPSC cached-view reads.
 

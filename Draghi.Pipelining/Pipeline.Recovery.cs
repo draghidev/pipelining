@@ -9,12 +9,12 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     where TEnumerator : struct, IPipelineEnumerator<T>
 {
     /// Recovers execution or pipeline-task failure. <paramref name="activated"/> distinguishes an
-    /// executor-owned turn from an equal-looking grant held by an empty-edge pass; only the latter
+    /// executor-owned turn from an equal-looking provisional turn held by an empty-edge pass; only the latter
     /// requires waiting for that pass before touching the failed item or its substitute.
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask RecoverItem(T item, bool activated, PipelineItemFailureContext context, long failedTurn, CancellationToken cancellationToken)
     {
-        // A foreign live grant belongs to the matching empty-edge pass. Wait until its activation returns.
+        // A foreign provisional turn belongs to the matching empty-edge pass. Wait for activation to return.
         if (!activated && failedTurn != 0)
             WaitForRecoveryHandoff(-failedTurn, cancellationToken);
 
@@ -50,32 +50,32 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Republish the substitute and mirror normal activation gating. Prior in-flight work keeps
         // activation deferred so the substitute cannot overlap its shared resource tenure.
         SetExecutingItem(recoveryItem);
-        Volatile.Write(ref _hasInFlightItem, true);
+        Volatile.Write(ref _executingItemVisible, true);
         var recoveryActivated = false;
-        long recoveryGen = 0;
+        long recoveryGeneration = 0;
         if (_inFlight.Count is 0)
         {
-            // Inherit the failed position's grant or claim a fresh one. A foreign turn defers the
-            // substitute. As with every count-zero grant, decide under the edge lock and activate outside it.
-            var inheritGen = failedTurn < 0 ? -failedTurn : _activationGate.NextGrantGeneration();
+            // Inherit the failed position's provisional turn or claim a fresh one. A foreign turn
+            // hands off the substitute. Decide under the edge lock and activate outside it.
+            var candidateGeneration = failedTurn < 0 ? -failedTurn : _activationGate.NextGeneration();
             var recoveryLock = _activationGate.EdgeLock;
             recoveryLock.Enter();
-            recoveryGen = _activationGate.ClaimOrInherit(inheritGen);
+            recoveryGeneration = _activationGate.ClaimOrInheritProvisionalTurn(candidateGeneration);
             recoveryLock.Exit();
-            if (recoveryGen != 0)
+            if (recoveryGeneration != 0)
             {
                 ActivateHeadItem(recoveryItem, preferAsync: false);
                 recoveryActivated = true;
             }
             else
             {
-                recoveryGen = _activationGate.PlaceHandoff(recoveryItem);
+                recoveryGeneration = _activationGate.PublishHandoff(recoveryItem);
             }
         }
         else
         {
             // Handoff publication orders the executor slot before an empty-edge consumer observes it.
-            recoveryGen = _activationGate.PlaceHandoff(recoveryItem);
+            recoveryGeneration = _activationGate.PublishHandoff(recoveryItem);
         }
 
         try
@@ -90,23 +90,23 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                 if (ClearExecutingItem(recoveryActivated))
                 {
                     result.PipelineTask.GetAwaiter().GetResult();
-                    RetireItem(recoveryItem, null, ownedTurn: GetActivationOwner(recoveryActivated, owned: true, recoveryGen));
+                    RetireItem(recoveryItem, null, ownedTurn: GetActivationOwner(recoveryActivated, ownsTurn: true, recoveryGeneration));
                 }
                 else
                 {
-                    // A mid-recovery edge grant routes through the store; guard against recursive recovery.
-                    CommitInFlightItem(recoveryItem, sentinelHeld: true, own: false, grantGen: recoveryGen, GuardRecoveryTask(result.PipelineTask));
+                    // A provisional turn claimed during recovery routes through the store.
+                    CommitInFlightItem(recoveryItem, activateAtCommit: false, ownsTurn: false, turnGeneration: recoveryGeneration, GuardRecoveryTask(result.PipelineTask));
                 }
             }
             else
             {
                 // Re-enter the normal pending-tail lifecycle without exposing the item twice. Guard its
                 // late task fault from recursively entering recovery.
-                Volatile.Write(ref _hasInFlightItem, false);
+                Volatile.Write(ref _executingItemVisible, false);
                 _pendingTail = recoveryItem;
                 _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
                 _pendingTailActivated = recoveryActivated;
-                _pendingTailGen = recoveryGen;
+                _pendingTailGeneration = recoveryGeneration;
                 Volatile.Write(ref _hasPendingTail, true);
             }
         }
@@ -116,13 +116,13 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             // is in the trailing pending branch, which doesn't throw.
             var ownedEx = ClearExecutingItem(recoveryActivated);
             RetireItem(recoveryItem, recoveryEx,
-                ownedTurn: GetActivationOwner(recoveryActivated, ownedEx, recoveryGen));
+                ownedTurn: GetActivationOwner(recoveryActivated, ownedEx, recoveryGeneration));
         }
     }
 
     /// Handles trailing execution task failures, including pending-tail recovery.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async ValueTask RecoverTrailingFailure(T item, bool activated, long failedGen, Exception ex, CancellationToken cancellationToken)
+    async ValueTask RecoverTrailingFailure(T item, bool activated, long failedGeneration, Exception ex, CancellationToken cancellationToken)
     {
         // Preserve the pipeline task: the framework re-uses the materialized Task locally below
         // (no-recovery branch's CommitInFlightItem), so we want a stable handle that outlives this
@@ -144,8 +144,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             _pendingTailActivated = false;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _pendingTail = default!;
-            var own = activated || _activationGate.TryConsumeHandoff();
-            CommitInFlightItem(item, sentinelHeld: !own || activated, own, grantGen: failedGen, pipelineTask);
+            var ownsTurn = activated || _activationGate.TryTakeHandoff();
+            CommitInFlightItem(item, activateAtCommit: ownsTurn && !activated, ownsTurn: ownsTurn, turnGeneration: failedGeneration, pipelineTask);
             throw;
         }
 
@@ -158,11 +158,11 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             _pendingTailActivated = false;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _pendingTail = default!;
-            // Resolve the parked deferral before the commit (the commit invariant): the one-winner
-            // consume decides ownership; a lost item commits sentinel-held (the empty-edge pass granted it).
+            // Resolve the parked handoff before the commit (the commit invariant): the one-winner
+            // take decides ownership; a loss commits under the empty-edge pass's provisional turn.
             // Plain consume (see ClearExecutingItem's doc) - residents may be live here.
-            var own = activated || _activationGate.TryConsumeHandoff();
-            CommitInFlightItem(item, sentinelHeld: !own || activated, own, grantGen: failedGen, pipelineTask);
+            var ownsTurn = activated || _activationGate.TryTakeHandoff();
+            CommitInFlightItem(item, activateAtCommit: ownsTurn && !activated, ownsTurn: ownsTurn, turnGeneration: failedGeneration, pipelineTask);
             return;
         }
         var recoveryItem = recoveryCandidate!;
@@ -176,13 +176,13 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
 #endif
         // Losing the consume means the empty-edge pass already captured and will activate the failed
         // item. Wait for that exact generation to resolve before activating its substitute.
-        var recoverySwapWon = _activationGate.TryConsumeHandoff();
+        var recoverySwapWon = _activationGate.TryTakeHandoff();
         SetExecutingItem(recoveryItem);
         bool recoveryActivated;
-        long recoveryGen;
+        long recoveryGeneration;
         if (recoverySwapWon)
         {
-            recoveryGen = _activationGate.PlaceHandoff(recoveryItem);
+            recoveryGeneration = _activationGate.PublishHandoff(recoveryItem);
             recoveryActivated = false;
         }
         else
@@ -190,8 +190,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             // The substitute inherits the failed item's turn. A self-activated item has no handoff
             // observer to await; only a lost deferred consume requires the generation wait.
             if (!activated)
-                WaitForRecoveryHandoff(failedGen, cancellationToken);
-            recoveryGen = failedGen;
+                WaitForRecoveryHandoff(failedGeneration, cancellationToken);
+            recoveryGeneration = failedGeneration;
             ActivateHeadItem(recoveryItem, preferAsync: false);
             recoveryActivated = true;
         }
@@ -215,7 +215,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     _pendingTailTask = default;
                     var ownedTrail = ClearExecutingItem(recoveryActivated);
                     RetireItem(recoveryItem, trailingEx,
-                        ownedTurn: GetActivationOwner(recoveryActivated, ownedTrail, recoveryGen));
+                        ownedTurn: GetActivationOwner(recoveryActivated, ownedTrail, recoveryGeneration));
                     return;
                 }
             }
@@ -236,12 +236,12 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                         pipelineEx = e;
                     }
                     RetireItem(recoveryItem, pipelineEx,
-                        ownedTurn: GetActivationOwner(recoveryActivated, owned: true, recoveryGen));
+                        ownedTurn: GetActivationOwner(recoveryActivated, ownsTurn: true, recoveryGeneration));
                 }
                 else
                 {
-                    // Empty-edge pass-granted mid-recovery: route through the store (guarded), the lost-item rule.
-                    CommitInFlightItem(recoveryItem, sentinelHeld: true, own: false, grantGen: recoveryGen, GuardRecoveryTask(result.PipelineTask));
+                    // The empty-edge pass owns the provisional turn, so route through the store.
+                    CommitInFlightItem(recoveryItem, activateAtCommit: false, ownsTurn: false, turnGeneration: recoveryGeneration, GuardRecoveryTask(result.PipelineTask));
                 }
                 return;
             }
@@ -251,7 +251,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             _pendingTail = recoveryItem;
             _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
             _pendingTailActivated = recoveryActivated;
-            _pendingTailGen = recoveryGen;
+            _pendingTailGeneration = recoveryGeneration;
         }
         catch (Exception recoveryEx)
         {
@@ -261,7 +261,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                 _pendingTail = default!;
             var ownedRec = ClearExecutingItem(recoveryActivated);
             RetireItem(recoveryItem, recoveryEx,
-                ownedTurn: GetActivationOwner(recoveryActivated, ownedRec, recoveryGen));
+                ownedTurn: GetActivationOwner(recoveryActivated, ownedRec, recoveryGeneration));
         }
     }
 
@@ -285,37 +285,37 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         var tailActivated = _pendingTailActivated;
         _pendingTailActivated = false;
-        var tailGen = _pendingTailGen;
-        _pendingTailGen = 0;
+        var tailGeneration = _pendingTailGeneration;
+        _pendingTailGeneration = 0;
         // Reclaim an executor-owned activation or an ungranted handoff. If the edge pass won, route
         // through the store so advance-license ordering places activation before retirement.
-        var own = tailActivated || _activationGate.TryConsumeHandoff();
+        var ownsTurn = tailActivated || _activationGate.TryTakeHandoff();
         // A winning edge pass captured the item before consuming its handoff, so either arm may clear it.
         SetExecutingItem(default!);
 
-        if (task.IsCompleted && own)
+        if (task.IsCompleted && ownsTurn)
         {
             // Inline retirement may bypass the reorder buffer only when this item is the head.
             if (task.IsCompletedSuccessfully && _inFlight.Count is 0)
             {
                 task.GetAwaiter().GetResult();
-                RetireItem(item, null, ownedTurn: GetActivationOwner(tailActivated, owned: true, tailGen));
+                RetireItem(item, null, ownedTurn: GetActivationOwner(tailActivated, ownsTurn: true, tailGeneration));
                 return null;
             }
 
             if (!task.IsCompletedSuccessfully)
-                return RecoverCommittedPendingTailAsync(item, task, tailActivated, tailGen).AsTask();
+                return RecoverCommittedPendingTailAsync(item, task, tailActivated, tailGeneration).AsTask();
         }
 
         // An edge-owned fault also routes through the store and is surfaced by the advancer.
-        CommitInFlightItem(item, sentinelHeld: !own || tailActivated, own, grantGen: tailGen, task);
+        CommitInFlightItem(item, activateAtCommit: ownsTurn && !tailActivated, ownsTurn: ownsTurn, turnGeneration: tailGeneration, task);
         return null;
     }
 
     // Awaited on the executor strand to preserve the store's single-producer contract and FIFO commit.
     // Entry requires a successfully reclaimed turn, so no empty-edge handoff remains to await.
     [MethodImpl(MethodImplOptions.NoInlining)]
-    async ValueTask RecoverCommittedPendingTailAsync(T item, ValueTask task, bool tailActivated, long tailGen)
+    async ValueTask RecoverCommittedPendingTailAsync(T item, ValueTask task, bool tailActivated, long tailGeneration)
     {
         Exception exception;
         try
@@ -331,7 +331,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // A recovery item's own guarded tail faulting between SetTail and this commit (the
         // recovery substitutes re-enter the normal tail lifecycle; see GuardRecoveryTask).
         // Complete directly with the real fault - never re-recovered, never consulted.
-        var failedTurn = GetActivationOwner(tailActivated, owned: true, tailGen);
+        var failedTurn = GetActivationOwner(tailActivated, ownsTurn: true, tailGeneration);
         if (exception is Pipeline.RecoveryItemFaultException recoveryFault)
         {
             RetireItem(item, recoveryFault.InnerException, failedTurn);
@@ -362,21 +362,21 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // unconditionally while prior items are in flight would put a second active reader on the
         // wire.
         SetExecutingItem(recoveryItem);
-        Volatile.Write(ref _hasInFlightItem, true);
+        Volatile.Write(ref _executingItemVisible, true);
         var recoveryActivated = false;
-        long recoveryGen = 0;
+        long recoveryGeneration = 0;
         if (_inFlight.Count is 0)
         {
-            // Recovery substitutes - inherit the failed item's grant in place, or fail-if-live claim
-            // a fresh one; a live foreign turn defers (full argument at RecoverItem's twin arm).
-            var inheritGen = failedTurn < 0 ? -failedTurn : _activationGate.NextGrantGeneration();
+            // Recovery substitutes inherit the failed provisional turn or claim a fresh one;
+            // a live foreign turn requires a handoff (full argument at RecoverItem's twin arm).
+            var candidateGeneration = failedTurn < 0 ? -failedTurn : _activationGate.NextGeneration();
             var recoveryLock = _activationGate.EdgeLock;
             recoveryLock.Enter();
-            recoveryGen = _activationGate.ClaimOrInherit(inheritGen);
+            recoveryGeneration = _activationGate.ClaimOrInheritProvisionalTurn(candidateGeneration);
             recoveryLock.Exit();
-            if (recoveryGen == 0)
+            if (recoveryGeneration == 0)
             {
-                recoveryGen = _activationGate.PlaceHandoff(recoveryItem);
+                recoveryGeneration = _activationGate.PublishHandoff(recoveryItem);
             }
             else
             {
@@ -387,7 +387,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         else
         {
             // Republish - see RecoverItem's twin: the empty-edge pass captures before its take.
-            recoveryGen = _activationGate.PlaceHandoff(recoveryItem);
+            recoveryGeneration = _activationGate.PublishHandoff(recoveryItem);
         }
 
         PipelineItemResult result;
@@ -399,7 +399,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         {
             var ownedRec = ClearExecutingItem(recoveryActivated);
             RetireItem(recoveryItem, recoveryEx,
-                ownedTurn: GetActivationOwner(recoveryActivated, ownedRec, recoveryGen));
+                ownedTurn: GetActivationOwner(recoveryActivated, ownedRec, recoveryGeneration));
             return;
         }
 
@@ -413,7 +413,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             {
                 var ownedTrail = ClearExecutingItem(recoveryActivated);
                 RetireItem(recoveryItem, ex,
-                    ownedTurn: GetActivationOwner(recoveryActivated, ownedTrail, recoveryGen));
+                    ownedTurn: GetActivationOwner(recoveryActivated, ownedTrail, recoveryGeneration));
                 return;
             }
         }
@@ -422,7 +422,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (pipelineTask.IsCompleted)
         {
             // Inline completion, ownership-gated like every executor-side completion: a lost
-            // (empty-edge pass-granted) substitute routes through the store instead.
+            // A substitute owned by the empty-edge pass routes through the store instead.
             if (ClearExecutingItem(recoveryActivated))
             {
                 Exception? pipelineException = null;
@@ -435,11 +435,11 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     pipelineException = ex;
                 }
                 RetireItem(recoveryItem, pipelineException,
-                    ownedTurn: GetActivationOwner(recoveryActivated, owned: true, recoveryGen));
+                    ownedTurn: GetActivationOwner(recoveryActivated, ownsTurn: true, recoveryGeneration));
             }
             else
             {
-                CommitInFlightItem(recoveryItem, sentinelHeld: true, own: false, grantGen: recoveryGen, GuardRecoveryTask(pipelineTask));
+                CommitInFlightItem(recoveryItem, activateAtCommit: false, ownsTurn: false, turnGeneration: recoveryGeneration, GuardRecoveryTask(pipelineTask));
             }
         }
         else if (_enumerator.CompletionToken.IsCancellationRequested)
@@ -449,18 +449,18 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             // has likely already passed. Complete directly so depth tracking and CompleteItem still fire.
             var ownedShut = ClearExecutingItem(recoveryActivated);
             RetireItem(recoveryItem, _completionException,
-                ownedTurn: GetActivationOwner(recoveryActivated, ownedShut, recoveryGen));
+                ownedTurn: GetActivationOwner(recoveryActivated, ownedShut, recoveryGeneration));
         }
         else
         {
             // The recovery enters the store as an ordinary item; its identity travels in the task
             // (the guard wrapper rethrows late faults as RecoveryItemFaultException, see the marker
             // type), not in pipeline state - no fields, no value-T-unsound item comparisons.
-            // Resolve the deferral before the commit (the commit invariant), one-winner.
-            var ownCommit = recoveryActivated || _activationGate.TryConsumeHandoff();
+            // Resolve the handoff before the commit (the commit invariant), one-winner.
+            var ownsTurnAtCommit = recoveryActivated || _activationGate.TryTakeHandoff();
             SetExecutingItem(default!);
-            Volatile.Write(ref _hasInFlightItem, false);
-            CommitInFlightItem(recoveryItem, sentinelHeld: !ownCommit || recoveryActivated, ownCommit, grantGen: recoveryGen, GuardRecoveryTask(pipelineTask));
+            Volatile.Write(ref _executingItemVisible, false);
+            CommitInFlightItem(recoveryItem, activateAtCommit: ownsTurnAtCommit && !recoveryActivated, ownsTurn: ownsTurnAtCommit, turnGeneration: recoveryGeneration, GuardRecoveryTask(pipelineTask));
         }
     }
 
@@ -525,53 +525,53 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// Commits a counted item after its activation handoff has resolved. A zero preceding count is
     /// the frontier: under the edge lock, assign or inherit its turn before publishing, then arm its
     /// completion. Mid-chain commits publish and arm without touching the held frontier turn.
-    // A self-activated or edge-granted item owns the negative generation; an ungranted reclaim owns none.
-    static long GetActivationOwner(bool activated, bool owned, long gen)
-        => activated || !owned ? -gen : 0;
+    // A self-activated item or empty-edge pass owns the negative generation; a failed reclaim owns none.
+    static long GetActivationOwner(bool activated, bool ownsTurn, long generation)
+        => activated || !ownsTurn ? -generation : 0;
 
-    void CommitInFlightItem(T item, bool sentinelHeld, bool own, long grantGen, ValueTask pipelineTask)
+    void CommitInFlightItem(T item, bool activateAtCommit, bool ownsTurn, long turnGeneration, ValueTask pipelineTask)
     {
-        Debug.Assert(!_activationGate.HandoffVisible, "Commit with an unresolved activation handoff.");
+        Debug.Assert(!_activationGate.HasHandoff, "Commit with an unresolved activation handoff.");
         var prev = _inFlight.IncrementCommitCount();
 
         if (prev == 0)
         {
             // The edge guarantees a sole head; the executor still owns the item and its token
             // (unpublished), so the status read and the registration below are contract-clean.
-            if (!sentinelHeld && !pipelineTask.IsCompleted)
+            if (activateAtCommit && !pipelineTask.IsCompleted)
             {
                 // An incomplete head activates while still exclusively unpublished. A completed head
                 // needs only callback delivery to drive advancement.
                 ActivateHeadItem(item, preferAsync: false);
             }
             // Sole head: no claim can run before our publish, so the ordinal read is stable.
-            var mySeq = _itemTenure.HeadSeq;
-            if (own && _inFlight.TryAcquireIfFree())
+            var sequence = _itemTenure.HeadSequence;
+            if (ownsTurn && _inFlight.TryAcquireAdvanceIfFree())
             {
                 // Hold advance ownership through turn assignment, publication, and callback attachment.
-                _activationGate.AssignAtCommit(grantGen, mySeq);
+                _activationGate.CommitTurn(turnGeneration, sequence);
                 _inFlight.PublishCommitted(item, pipelineTask, out _);
-                RegisterAdvanceFire(pipelineTask, mySeq);
-                if (_inFlight.Release())
+                RegisterAdvanceCallback(pipelineTask, sequence);
+                if (_inFlight.ReleaseAdvance())
                     Advance();
                 return;
             }
             // With a contended or edge-owned frontier, attach before publication, serialize assignment
             // with the edge pass, then acquire or deposit work for the current license holder.
-            RegisterAdvanceFire(pipelineTask, mySeq);
+            RegisterAdvanceCallback(pipelineTask, sequence);
             // A pass may still hold the edge after its generation became stale; serialize with its exit.
             var edgeLock = _activationGate.EdgeLock;
             edgeLock.Enter();
             try
             {
-                _activationGate.AssignAtCommit(grantGen, mySeq);
+                _activationGate.CommitTurn(turnGeneration, sequence);
                 _inFlight.PublishCommitted(item, pipelineTask, out _);
             }
             finally
             {
                 edgeLock.Exit();
             }
-            if (_inFlight.TryAcquire())
+            if (_inFlight.TryAcquireAdvanceOrRequest())
                 Advance();
             return;
         }
@@ -580,7 +580,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // release; otherwise this caller wins the license and drives. The count-word CAS also
         // supplies the StoreLoad edge between publication and the license decision.
         _inFlight.PublishCommitted(item, pipelineTask, out _);
-        if (_inFlight.TryAcquire())
+        if (_inFlight.TryAcquireAdvanceOrRequest())
             Advance();
     }
 
@@ -589,14 +589,14 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     [MethodImpl(MethodImplOptions.NoInlining)]
     // The caller consumed the pipeline task (the consume-before-decrement ordering, see Advance) and hands
     // over the extracted exception.
-    bool RecoverInFlightItem(T failedItem, Exception ex, long claimedSeq, out bool emptyReached)
+    bool RecoverInFlightItem(T failedItem, Exception ex, long claimedSequence, out bool emptyReached)
     {
         emptyReached = false;
 
         // Recovery-item faults complete directly; policy is never asked to recover its own substitute.
         if (ex is Pipeline.RecoveryItemFaultException recoveryFault)
         {
-            emptyReached = RetireItemDeferred(failedItem, recoveryFault.InnerException, ownedTurn: claimedSeq);
+            emptyReached = RetireItemDeferred(failedItem, recoveryFault.InnerException, ownedTurn: claimedSequence);
             return true;
         }
 
@@ -609,13 +609,13 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         catch (Exception recoveryPolicyException)
         {
-            emptyReached = RetireItemDeferred(failedItem, recoveryPolicyException, ownedTurn: claimedSeq);
+            emptyReached = RetireItemDeferred(failedItem, recoveryPolicyException, ownedTurn: claimedSequence);
             throw;
         }
 
         if (!recovered)
         {
-            emptyReached = RetireItemDeferred(failedItem, ex, ownedTurn: claimedSeq);
+            emptyReached = RetireItemDeferred(failedItem, ex, ownedTurn: claimedSequence);
             return true;
         }
         var recoveryItem = recoveryCandidate!;
@@ -623,9 +623,9 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Recover in place while this position retains its count credit, excluding a concurrent
         // frontier activation. Transfer the claimed tenure directly to the substitute; deferring it
         // behind the failed head would create a liveness cycle.
-        _activationGate.AssignAtRecovery(claimedSeq);
+        _activationGate.AssignTurnForRecovery(claimedSequence);
         ActivateHeadItem(recoveryItem, preferAsync: true);
-        _inFlightRecoverySeq = claimedSeq;
+        _inFlightRecoverySequence = claimedSequence;
 
         ValueTask<PipelineItemResult> executeTask;
         try
@@ -636,7 +636,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         catch (Exception recoveryEx)
         {
-            emptyReached = RetireItemDeferred(recoveryItem, recoveryEx, ownedTurn: claimedSeq);
+            emptyReached = RetireItemDeferred(recoveryItem, recoveryEx, ownedTurn: claimedSequence);
             return true;
         }
 
@@ -799,7 +799,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         var recoveryItem = _inFlightRecoveryItem;
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _inFlightRecoveryItem = default!;
-        RetireItem(recoveryItem, _completionException, ownedTurn: _inFlightRecoverySeq);
+        RetireItem(recoveryItem, _completionException, ownedTurn: _inFlightRecoverySequence);
         // Shutdown owns completion; settle the suspended recovery position's retained count credit.
         _ = _inFlight.DecrementCount();
         SignalDrainWakeupIfWaiting();
@@ -809,7 +809,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// being cached or hoisted; .NET has no relaxed atomic load for this weaker requirement.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void SignalDrainWakeupIfWaiting()
-        => Volatile.Read(ref _drainWakeupTcs)?.TrySetResult();
+        => Volatile.Read(ref _advanceDrainWaiter)?.TrySetResult();
 
     /// Completes the recovery item on the normal (non-shutdown) recovery path. The continuation
     /// owns completion uncontested. Drain (DrainOnCompletionAsync) only waits for the advancer
@@ -818,7 +818,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _inFlightRecoveryItem = default!;
-        RetireItem(recoveryItem, exception, ownedTurn: _inFlightRecoverySeq);
+        RetireItem(recoveryItem, exception, ownedTurn: _inFlightRecoverySequence);
     }
 
     /// Completes recovery while deferring the empty signal until the advance exits.
@@ -826,7 +826,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _inFlightRecoveryItem = default!;
-        return RetireItemDeferred(recoveryItem, exception, ownedTurn: _inFlightRecoverySeq);
+        return RetireItemDeferred(recoveryItem, exception, ownedTurn: _inFlightRecoverySequence);
     }
 
 }

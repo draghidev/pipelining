@@ -1,6 +1,6 @@
 --------------------------- MODULE DepthDrain ---------------------------
 (*
-Split-counter depth + drain-waiter protocol for Pipeline.DepthState v2.
+Split-counter depth and empty-wait protocol for DepthState.
 
 The packed-word DepthState made the armer's depth-recheck and the DrainBit set
 atomic in a single CAS. The split design separates:
@@ -184,7 +184,7 @@ SignalRestoreWaiterAtNonzeroDepth(c) ==
 \* The put-back is itself an arm: a completer that hit zero while the slot was
 \* held read it as unavailable and skipped, so re-check depth after the
 \* put-back and loop back to a re-take if zero materialized (the same
-\* publish-then-recheck discipline as GetIdleTask's arm).
+\* publish-then-recheck discipline as WaitForEmptyAsync's arm).
 RestoredWaiterRecheckZeroDepth(c) ==
   /\ completerPc[c] = "putback"
   /\ completedCount = enqueuedCount

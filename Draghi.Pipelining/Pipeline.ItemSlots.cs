@@ -39,7 +39,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     // Atomic types use the zero-cost plain store; other structs use an odd/even seqlock bracket.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static void PublishSlot(ref T slot, ref uint gen, T value)
+    static void PublishSlot(ref T slot, ref uint generation, T value)
     {
         if (!typeof(T).IsValueType || WriteAtomic)
         {
@@ -47,15 +47,15 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         else
         {
-            Interlocked.Increment(ref gen); // odd: store in progress
+            Interlocked.Increment(ref generation); // odd: store in progress
             slot = value;
-            Interlocked.Increment(ref gen); // even: store complete
+            Interlocked.Increment(ref generation); // even: store complete
         }
     }
 
     // A stale snapshot is permitted; a snapshot overlapping a struct write is retried.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    static T ReadSlot(ref T slot, ref uint gen)
+    static T ReadSlot(ref T slot, ref uint generation)
     {
         if (!typeof(T).IsValueType || WriteAtomic)
             return slot;
@@ -63,12 +63,12 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         var spin = new SpinWait();
         while (true)
         {
-            var g1 = Volatile.Read(ref gen);
+            var g1 = Volatile.Read(ref generation);
             if ((g1 & 1) == 0) // even: no write in progress at the sample point
             {
                 var value = slot; // acquire on g1 orders this read after the generation sample
                 Interlocked.MemoryBarrier(); // the copy must complete before the re-sample (LoadLoad)
-                if (Volatile.Read(ref gen) == g1)
+                if (Volatile.Read(ref generation) == g1)
                     return value;
             }
             spin.SpinOnce();
@@ -76,10 +76,10 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    void SetExecutingItem(T value) => PublishSlot(ref _executingItem, ref _executingItemGen, value);
+    void SetExecutingItem(T value) => PublishSlot(ref _executingItem, ref _executingItemGeneration, value);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    void SetActivatedItem(T value) => PublishSlot(ref _activatedItem, ref _activatedItemGen, value);
+    void SetActivatedItem(T value) => PublishSlot(ref _activatedItem, ref _activatedItemGeneration, value);
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void ActivateHeadItem(T item, bool preferAsync = true)
@@ -96,8 +96,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     bool ClearExecutingItem(bool wasActivated)
     {
         // Executor-owned; release the enumeration-visible flag.
-        Volatile.Write(ref _hasInFlightItem, false);
-        var owned = wasActivated || _activationGate.TryConsumeHandoff();
+        Volatile.Write(ref _executingItemVisible, false);
+        var owned = wasActivated || _activationGate.TryTakeHandoff();
         // A winning empty-edge pass captured the item before consuming the handoff.
         SetExecutingItem(default!);
         return owned;

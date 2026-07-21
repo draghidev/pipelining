@@ -10,10 +10,10 @@ public class ItemTenureTests
     {
         var tenure = new ItemTenure();
 
-        Assert.AreEqual(1, tenure.HeadSeq);
+        Assert.AreEqual(1, tenure.HeadSequence);
         Assert.AreEqual(1, tenure.ClaimHead());
-        Assert.AreEqual(1, tenure.LastClaimedSeq);
-        Assert.AreEqual(2, tenure.HeadSeq);
+        Assert.AreEqual(1, tenure.LastClaimedSequence);
+        Assert.AreEqual(2, tenure.HeadSequence);
         Assert.AreEqual(2, tenure.ClaimHead());
     }
 
@@ -22,7 +22,7 @@ public class ItemTenureTests
     {
         var tenure = new ItemTenure();
 
-        tenure.ArmCompletionCallback(tenure.HeadSeq);
+        tenure.ArmCompletionCallback(tenure.HeadSequence);
         Assert.IsTrue(tenure.IsCompletionCallbackPendingForHead());
 
         tenure.MarkCompletionCallbackDelivered();

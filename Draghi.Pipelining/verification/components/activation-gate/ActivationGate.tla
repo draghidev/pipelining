@@ -1,16 +1,16 @@
 -------------------------- MODULE ActivationGate --------------------------
 (* Activation-turn component contract.
 
-   The dispatcher publishes an activation deferral, fences that publication,
+   The dispatcher publishes an activation handoff, fences that publication,
    then reads the in-flight count. A retirement pass that reaches the transition
-   to zero resident items observes the deferral from the other side. Exactly one
+   to zero resident items observes the handoff from the other side. Exactly one
    side resolves it:
 
-     dispatcher:      publish deferral -> fence -> read resident count
+     dispatcher:      publish handoff -> fence -> read resident count
      retirement pass: decrement count  -> claim empty-edge handoff
 
-   If the dispatcher observes zero it may self-grant under the edge lock. If the
-   final retirement pass observes the deferral it resolves the empty-edge handoff
+   If the dispatcher observes zero it may self-claim under the edge lock. If the
+   final retirement pass observes the handoff it resolves the empty-edge handoff
    under the same lock. Generation/turn arbitration prevents both paths from
    activating the item.
 
@@ -38,15 +38,15 @@ VARIABLES
     publisherItem,         \* the item the executor is committing
     passPc,         \* [RetirementPasses -> "off" | "claimHead" | "activateResident" | "emptyEdgeHandoff" | "recheckAfterRelease"]
     passHead,       \* [RetirementPasses -> item] the stop's target
-    doubleActivationGrant,
-    localActivationDeferral,    \* dispatcher-local placement (writer view)
-    visibleActivationDeferral,  \* globally visible placement (weak until fence/propagate)
-    activationDeferralGranted,  \* the deferred item received its grant
-    dispatcherPc          \* dispatcher: "idle"|"deferralPublished"|"readInFlightCount"|"acquireSelfGrantLock"|"observeSelfGrant"|"finished"
+    duplicateActivation,
+    localActivationHandoff,    \* dispatcher-local placement (writer view)
+    visibleActivationHandoff,  \* globally visible placement (weak until fence/propagate)
+    handoffClaimed,  \* the published handoff was taken
+    dispatcherPc          \* dispatcher: "idle"|"handoffPublished"|"readInFlightCount"|"acquireSelfClaimLock"|"observeSelfClaim"|"finished"
 
 vars == <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
-          edgeLockOwner, publisherPc, publisherItem, passPc, passHead, doubleActivationGrant,
-          localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+          edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation,
+          localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 InFlightHead == IF store = <<>> THEN NONE ELSE store[1]
 
@@ -58,8 +58,8 @@ Init ==
     /\ store = <<>> /\ inFlightCount = 0 /\ advanceOwner = "0" /\ advancePending = FALSE /\ edgeLockOwner = "0"
     /\ publisherPc = "next" /\ publisherItem = 0
     /\ passPc = [t \in RetirementPasses |-> "off"] /\ passHead = [t \in RetirementPasses |-> NONE]
-    /\ doubleActivationGrant = FALSE
-    /\ localActivationDeferral = FALSE /\ visibleActivationDeferral = FALSE /\ activationDeferralGranted = FALSE /\ dispatcherPc = "idle"
+    /\ duplicateActivation = FALSE
+    /\ localActivationHandoff = FALSE /\ visibleActivationHandoff = FALSE /\ handoffClaimed = FALSE /\ dispatcherPc = "idle"
 
 -------------------------------------------------------------------------------
 (* Task completions and fires. *)
@@ -69,7 +69,7 @@ PublishTaskCompletion(i) ==
     /\ (executionKind[i] = "gated") => activationPerformed[i]
     /\ completionPublished' = [completionPublished EXCEPT ![i] = TRUE]
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
-                   edgeLockOwner, publisherPc, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 RunCompletionCallback(t, i) ==
     /\ t \in {"W","P"} /\ passPc[t] = "off"
@@ -81,7 +81,7 @@ RunCompletionCallback(t, i) ==
          ELSE /\ advancePending' = TRUE /\ advanceOwner' = advanceOwner
               /\ UNCHANGED passPc
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, store, inFlightCount,
-                   edgeLockOwner, publisherPc, publisherItem, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   edgeLockOwner, publisherPc, publisherItem, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 -------------------------------------------------------------------------------
 (* The walk (licensed). Claim fuses dequeue + retire + decrement (the count is
@@ -110,7 +110,7 @@ PassTryClaimHead(t) ==
               \* exactly what the two-sided protocol must survive).
               /\ passPc' = [passPc EXCEPT ![t] = "releasePhantomEdge"]
               /\ UNCHANGED <<retirementCompleted, completionCallbackRegistered, store, inFlightCount, passHead, advanceOwner, advancePending>>
-    /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, edgeLockOwner, publisherPc, publisherItem, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+    /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, edgeLockOwner, publisherPc, publisherItem, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 \* The bail's release-or-serve: a served deposit re-probes (licensed); a true
 \* release proceeds to the one-shot re-peek.
@@ -122,16 +122,16 @@ PassReleasePhantomEdge(t) ==
          ELSE /\ advanceOwner' = "0" /\ advancePending' = advancePending
               /\ passPc' = [passPc EXCEPT ![t] = "off"]
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   edgeLockOwner, publisherPc, publisherItem, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   edgeLockOwner, publisherPc, publisherItem, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 \* The stop: lock-scoped activation of the incomplete head. The lock section
-\* rechecks activation before granting it.
+\* rechecks activation before assigning the turn.
 PassAcquireResidentActivationLock(t) ==
     /\ passPc[t] = "activateResident"
     /\ edgeLockOwner = "0" /\ edgeLockOwner' = t
     /\ passPc' = [passPc EXCEPT ![t] = "activateResidentUnderLock"]
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, publisherPc, publisherItem, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   advanceOwner, advancePending, publisherPc, publisherItem, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 PassActivateResidentHead(t) ==
     /\ passPc[t] = "activateResidentUnderLock"
@@ -139,23 +139,23 @@ PassActivateResidentHead(t) ==
        /\ IF InFlightHead # H \/ retirementCompleted[H]
             THEN \* claimed through under the stop: whoever took it carries. Exit.
                  /\ passPc' = [passPc EXCEPT ![t] = "exit"]
-                 /\ UNCHANGED <<activationPerformed, completionCallbackRegistered, doubleActivationGrant>>
+                 /\ UNCHANGED <<activationPerformed, completionCallbackRegistered, duplicateActivation>>
           ELSE IF completionPublished[H]
             THEN \* completed UNDER the stop (the CompletedWhileResident recheck): a
                  \* completed head is the walk's to claim - back to the loop top.
                  /\ passPc' = [passPc EXCEPT ![t] = "claimHead"]
-                 /\ UNCHANGED <<activationPerformed, completionCallbackRegistered, doubleActivationGrant>>
+                 /\ UNCHANGED <<activationPerformed, completionCallbackRegistered, duplicateActivation>>
           ELSE IF ~activationPerformed[H]
-            THEN /\ doubleActivationGrant' = (doubleActivationGrant \/ activationPerformed[H])
+            THEN /\ duplicateActivation' = (duplicateActivation \/ activationPerformed[H])
                  /\ activationPerformed' = [activationPerformed EXCEPT ![H] = TRUE]
                  /\ completionCallbackRegistered' = [completionCallbackRegistered EXCEPT ![H] = TRUE]
                  /\ passPc' = [passPc EXCEPT ![t] = "exit"]
           ELSE \* already activationPerformed (a prior tenure's completionCallbackRegistered may be consumed): re-bind.
                  /\ completionCallbackRegistered' = [completionCallbackRegistered EXCEPT ![H] = TRUE]
                  /\ passPc' = [passPc EXCEPT ![t] = "exit"]
-                 /\ UNCHANGED <<activationPerformed, doubleActivationGrant>>
+                 /\ UNCHANGED <<activationPerformed, duplicateActivation>>
        /\ edgeLockOwner' = "0"
-       /\ UNCHANGED <<executionKind, storePublished, completionPublished, retirementCompleted, store, inFlightCount, advanceOwner, advancePending, publisherPc, publisherItem, passHead, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+       /\ UNCHANGED <<executionKind, storePublished, completionPublished, retirementCompleted, store, inFlightCount, advanceOwner, advancePending, publisherPc, publisherItem, passHead, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 \* Empty-edge handoff: under the edge lock, read the visible placement and take it.
 PassAcquireEmptyEdgeHandoffLock(t) ==
@@ -163,27 +163,27 @@ PassAcquireEmptyEdgeHandoffLock(t) ==
     /\ edgeLockOwner = "0" /\ edgeLockOwner' = t
     /\ passPc' = [passPc EXCEPT ![t] = "observeEmptyEdgeHandoff"]
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, publisherPc, publisherItem, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   advanceOwner, advancePending, publisherPc, publisherItem, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
-\* Empty-edge handoff, step 1: OBSERVE the visible place (instruction granularity: the grant
-\* is a separate step - the lock, when taken, spans both; bare, they interleave).
+\* Empty-edge handoff, step 1: OBSERVE the visible placement. Claiming its turn is
+\* a separate step; the lock spans both, while bare operations may interleave.
 PassObserveEmptyEdgeHandoff(t) ==
     /\ passPc[t] = "observeEmptyEdgeHandoff"
-    /\ IF visibleActivationDeferral
+    /\ IF visibleActivationHandoff
          THEN /\ passPc' = [passPc EXCEPT ![t] = "resolveEmptyEdgeHandoff"]
               /\ UNCHANGED edgeLockOwner
          ELSE /\ passPc' = [passPc EXCEPT ![t] = "exit"]
               /\ edgeLockOwner' = "0"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, publisherPc, publisherItem, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral,
-                   activationDeferralGranted, dispatcherPc>>
+                   advanceOwner, advancePending, publisherPc, publisherItem, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff,
+                   handoffClaimed, dispatcherPc>>
 
-\* Empty-edge handoff, step 2: the TAKE (grant + clear), then unlock.
+\* Empty-edge handoff, step 2: claim and clear the handoff, then unlock.
 PassResolveEmptyEdgeHandoff(t) ==
     /\ passPc[t] = "resolveEmptyEdgeHandoff"
-    /\ doubleActivationGrant' = (doubleActivationGrant \/ activationDeferralGranted)
-    /\ activationDeferralGranted' = TRUE
-    /\ localActivationDeferral' = FALSE /\ visibleActivationDeferral' = FALSE
+    /\ duplicateActivation' = (duplicateActivation \/ handoffClaimed)
+    /\ handoffClaimed' = TRUE
+    /\ localActivationHandoff' = FALSE /\ visibleActivationHandoff' = FALSE
     /\ edgeLockOwner' = "0"
     /\ passPc' = [passPc EXCEPT ![t] = "exit"]
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
@@ -201,7 +201,7 @@ PassExit(t) ==
          ELSE /\ UNCHANGED <<advanceOwner, advancePending>>
               /\ passPc' = [passPc EXCEPT ![t] = "off"]
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   edgeLockOwner, publisherPc, publisherItem, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   edgeLockOwner, publisherPc, publisherItem, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 -------------------------------------------------------------------------------
 (* The executor strand: increment-first commits. *)
@@ -214,7 +214,7 @@ PublisherIncrementInFlightCount ==
          /\ inFlightCount' = inFlightCount + 1
          /\ publisherPc' = IF inFlightCount = 0 THEN "acquireEmptyEdgeLock" ELSE "publishResidentItem"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store,
-                   advanceOwner, advancePending, edgeLockOwner, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   advanceOwner, advancePending, edgeLockOwner, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 \* prev == 0: the edge-lock section - publish, activate own, attach, unlock.
 PublisherAcquireEmptyEdgeLock ==
@@ -222,18 +222,18 @@ PublisherAcquireEmptyEdgeLock ==
     /\ edgeLockOwner' = "E"
     /\ publisherPc' = "publishAtEmptyEdge"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   advanceOwner, advancePending, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 PublisherPublishAtEmptyEdge ==
     /\ publisherPc = "publishAtEmptyEdge"
     /\ storePublished' = [storePublished EXCEPT ![publisherItem] = TRUE]
     /\ store' = Append(store, publisherItem)
-    /\ doubleActivationGrant' = (doubleActivationGrant \/ activationPerformed[publisherItem])
+    /\ duplicateActivation' = (duplicateActivation \/ activationPerformed[publisherItem])
     /\ activationPerformed' = [activationPerformed EXCEPT ![publisherItem] = TRUE]
     /\ completionCallbackRegistered' = [completionCallbackRegistered EXCEPT ![publisherItem] = TRUE]
     /\ edgeLockOwner' = "0"
     /\ publisherPc' = "next"
-    /\ UNCHANGED <<executionKind, completionPublished, retirementCompleted, inFlightCount, advanceOwner, advancePending, publisherItem, passPc, passHead, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+    /\ UNCHANGED <<executionKind, completionPublished, retirementCompleted, inFlightCount, advanceOwner, advancePending, publisherItem, passPc, passHead, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 \* prev > 0: publish outside the lock...
 PublisherPublishResidentItem ==
@@ -242,7 +242,7 @@ PublisherPublishResidentItem ==
     /\ store' = Append(store, publisherItem)
     /\ publisherPc' = "readAdvanceLicense"
     /\ UNCHANGED <<executionKind, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, inFlightCount, advanceOwner, advancePending,
-                   edgeLockOwner, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   edgeLockOwner, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 \* ...then acquire-or-deposit: a bailed-out (or absent) retirement pass lets the
 \* publisher acquire; a live owner receives a pending re-probe obligation.
@@ -256,73 +256,73 @@ PublisherReadAdvanceLicense ==
               /\ advancePending' = TRUE
               /\ publisherPc' = "next"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   edgeLockOwner, publisherItem, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   edgeLockOwner, publisherItem, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 PublisherFinishRetirementPass ==
     /\ publisherPc = "ewalk" /\ passPc["E"] = "off"
     /\ publisherPc' = "next"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, edgeLockOwner, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   advanceOwner, advancePending, edgeLockOwner, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 PublisherFinish ==
     /\ publisherPc = "next" /\ publisherItem = N
     /\ publisherPc' = "finished"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, edgeLockOwner, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   advanceOwner, advancePending, edgeLockOwner, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
 
 -------------------------------------------------------------------------------
 
 -------------------------------------------------------------------------------
-(* The dispatcher: the deferred-grant Dekker (place -> fence -> count read). *)
+(* The dispatcher: the handoff-turn Dekker (place -> fence -> count read). *)
 
-DispatcherPublishActivationDeferral ==
+DispatcherPublishHandoff ==
     /\ dispatcherPc = "idle"
-    /\ localActivationDeferral' = TRUE /\ visibleActivationDeferral' = visibleActivationDeferral      \* WEAK place
-    /\ dispatcherPc' = "deferralPublished"
+    /\ localActivationHandoff' = TRUE /\ visibleActivationHandoff' = visibleActivationHandoff      \* WEAK place
+    /\ dispatcherPc' = "handoffPublished"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, edgeLockOwner, publisherPc, publisherItem, passPc, passHead, doubleActivationGrant, activationDeferralGranted>>
+                   advanceOwner, advancePending, edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation, handoffClaimed>>
 
-DispatcherFenceDeferralPublication ==
-    /\ dispatcherPc = "deferralPublished"
-    /\ visibleActivationDeferral' = localActivationDeferral /\ dispatcherPc' = "readInFlightCount"
+DispatcherFenceHandoffPublication ==
+    /\ dispatcherPc = "handoffPublished"
+    /\ visibleActivationHandoff' = localActivationHandoff /\ dispatcherPc' = "readInFlightCount"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount,
-                   advanceOwner, advancePending, edgeLockOwner, publisherPc, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, activationDeferralGranted>>
+                   advanceOwner, advancePending, edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, handoffClaimed>>
 
-PropagateActivationDeferral ==
-    /\ visibleActivationDeferral # localActivationDeferral
-    /\ visibleActivationDeferral' = localActivationDeferral
+PropagateHandoff ==
+    /\ visibleActivationHandoff # localActivationHandoff
+    /\ visibleActivationHandoff' = localActivationHandoff
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
-                   edgeLockOwner, publisherPc, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, activationDeferralGranted, dispatcherPc>>
+                   edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, handoffClaimed, dispatcherPc>>
 
 DispatcherReadInFlightCount ==
     /\ dispatcherPc = "readInFlightCount"
-    /\ dispatcherPc' = IF inFlightCount = 0 THEN "acquireSelfGrantLock" ELSE "finished"
+    /\ dispatcherPc' = IF inFlightCount = 0 THEN "acquireSelfClaimLock" ELSE "finished"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
-                   edgeLockOwner, publisherPc, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted>>
+                   edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed>>
 
-DispatcherAcquireSelfGrantLock ==
-    /\ dispatcherPc = "acquireSelfGrantLock"
+DispatcherAcquireSelfClaimLock ==
+    /\ dispatcherPc = "acquireSelfClaimLock"
     /\ edgeLockOwner = "0" /\ edgeLockOwner' = "D"
-    /\ dispatcherPc' = "observeSelfGrant"
+    /\ dispatcherPc' = "observeSelfClaim"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
-                   publisherPc, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted>>
+                   publisherPc, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed>>
 
-\* Self-grant, step 1: OBSERVE own placement (empty-edge handoff may have taken it).
-DispatcherObserveSelfGrant ==
-    /\ dispatcherPc = "observeSelfGrant"
-    /\ IF localActivationDeferral
-         THEN /\ dispatcherPc' = "resolveSelfGrant" /\ UNCHANGED edgeLockOwner
+\* Self-claim, step 1: OBSERVE own placement (empty-edge handoff may have taken it).
+DispatcherObserveSelfClaim ==
+    /\ dispatcherPc = "observeSelfClaim"
+    /\ IF localActivationHandoff
+         THEN /\ dispatcherPc' = "resolveSelfClaim" /\ UNCHANGED edgeLockOwner
          ELSE /\ dispatcherPc' = "finished"
               /\ edgeLockOwner' = "0"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
-                   publisherPc, publisherItem, passPc, passHead, doubleActivationGrant, localActivationDeferral, visibleActivationDeferral, activationDeferralGranted>>
+                   publisherPc, publisherItem, passPc, passHead, duplicateActivation, localActivationHandoff, visibleActivationHandoff, handoffClaimed>>
 
-\* Self-grant, step 2: the TAKE, then unlock.
-DispatcherResolveSelfGrant ==
-    /\ dispatcherPc = "resolveSelfGrant"
-    /\ doubleActivationGrant' = (doubleActivationGrant \/ activationDeferralGranted)
-    /\ activationDeferralGranted' = TRUE
-    /\ localActivationDeferral' = FALSE /\ visibleActivationDeferral' = FALSE
+\* Self-claim, step 2: the TAKE, then unlock.
+DispatcherResolveSelfClaim ==
+    /\ dispatcherPc = "resolveSelfClaim"
+    /\ duplicateActivation' = (duplicateActivation \/ handoffClaimed)
+    /\ handoffClaimed' = TRUE
+    /\ localActivationHandoff' = FALSE /\ visibleActivationHandoff' = FALSE
     /\ edgeLockOwner' = "0"
     /\ dispatcherPc' = "finished"
     /\ UNCHANGED <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
@@ -331,7 +331,7 @@ DispatcherResolveSelfGrant ==
 -------------------------------------------------------------------------------
 
 AllRetired == (\A i \in Items : retirementCompleted[i])
-              /\ (dispatcherPc \in {"idle", "finished"}) /\ (dispatcherPc = "finished" => activationDeferralGranted)
+              /\ (dispatcherPc \in {"idle", "finished"}) /\ (dispatcherPc = "finished" => handoffClaimed)
 Finished == AllRetired /\ UNCHANGED vars
 
 Next ==
@@ -341,7 +341,7 @@ Next ==
          PassTryClaimHead(t) \/ PassReleasePhantomEdge(t) \/ PassAcquireResidentActivationLock(t) \/ PassActivateResidentHead(t)
          \/ PassAcquireEmptyEdgeHandoffLock(t) \/ PassObserveEmptyEdgeHandoff(t) \/ PassResolveEmptyEdgeHandoff(t) \/ PassExit(t)
     \/ PublisherIncrementInFlightCount \/ PublisherAcquireEmptyEdgeLock \/ PublisherPublishAtEmptyEdge \/ PublisherPublishResidentItem \/ PublisherReadAdvanceLicense \/ PublisherFinishRetirementPass \/ PublisherFinish
-    \/ DispatcherPublishActivationDeferral \/ DispatcherFenceDeferralPublication \/ PropagateActivationDeferral \/ DispatcherReadInFlightCount \/ DispatcherAcquireSelfGrantLock \/ DispatcherObserveSelfGrant \/ DispatcherResolveSelfGrant
+    \/ DispatcherPublishHandoff \/ DispatcherFenceHandoffPublication \/ PropagateHandoff \/ DispatcherReadInFlightCount \/ DispatcherAcquireSelfClaimLock \/ DispatcherObserveSelfClaim \/ DispatcherResolveSelfClaim
     \/ Finished
 
 Spec == Init /\ [][Next]_vars
@@ -349,7 +349,7 @@ Spec == Init /\ [][Next]_vars
 -------------------------------------------------------------------------------
 (* INVARIANTS *)
 
-ActivationGrantedAtMostOnce == ~doubleActivationGrant
+ActivationOccursAtMostOnce == ~duplicateActivation
 
 AtMostOneActivatedItemResident ==
     \A i, j \in Items :
@@ -362,8 +362,8 @@ EdgeLockOwnerValid == edgeLockOwner \in {"0", "D"} \cup RetirementPasses   \* st
 InFlightCountNonNegative == inFlightCount >= 0   \* over-promise never under-runs: no -1 skew exists
 
 \* NO-ORPHAN, by deadlock detection (the EdgeLockBail discipline): Finished is the
-\* The only self-loop requires every item retirementCompleted and the deferred grant
-\* delivered (dispatcherPc="finished" => activationDeferralGranted). Any quiet state short of that - a completionPublished
+\* The only self-loop requires every item retirementCompleted and the handoff turn
+\* delivered (dispatcherPc="finished" => handoffClaimed). Any quiet state short of that - a completionPublished
 \* head nobody will claim, an undelivered visible place with the chain drained -
 \* has no enabled action and TLC reports DEADLOCK. A state-predicate NoOrphan
 \* (the NoOrphanWalk form) is unsound at this scope: "all actors quiet" is not

@@ -232,7 +232,7 @@ PublisherIncrementCount ==
     /\ UNCHANGED queueStateVars /\ UNCHANGED <<segmentAReadFloor, segmentBReadFloor, sawNextSegment, advanceLicenseVisibility>>
 
 (* ---------------------------------------------------------------------------
-   Callback: the registered head-completion callback (Pipeline.OnAdvanceFire).
+   Callback: the registered head-completion callback (Pipeline.OnAdvanceCallback).
    ------------------------------------------------------------------------ *)
 
 \* The callback publishes its pending-pass request. The agent thread starts with the wiring

@@ -9,27 +9,27 @@ public class ActivationGateTests
     public void EmptyEdgeHandoff_IsGenerationPinned()
     {
         var gate = new ActivationGate<int>();
-        var generation = gate.PlaceHandoff(7);
+        var generation = gate.PublishHandoff(7);
 
         Assert.IsTrue(gate.TryPeekHandoff(out var observedGeneration, out var item));
         Assert.AreEqual(generation, observedGeneration);
         Assert.AreEqual(7, item);
-        Assert.IsTrue(gate.TryClaimGrant(generation));
-        Assert.IsTrue(gate.TryConsumeHandoff(generation));
+        Assert.IsTrue(gate.TryClaimProvisionalTurn(generation));
+        Assert.IsTrue(gate.TryTakeHandoff(generation));
         Assert.IsTrue(gate.Release(-generation));
         Assert.IsFalse(gate.HasTurn);
-        Assert.IsFalse(gate.HandoffVisible);
+        Assert.IsFalse(gate.HasHandoff);
     }
 
     [TestMethod]
     public void RecycledHandoff_RejectsStaleGeneration()
     {
         var gate = new ActivationGate<int>();
-        var first = gate.PlaceHandoff(1);
-        Assert.IsTrue(gate.TryConsumeHandoff());
-        var second = gate.PlaceHandoff(2);
+        var first = gate.PublishHandoff(1);
+        Assert.IsTrue(gate.TryTakeHandoff());
+        var second = gate.PublishHandoff(2);
 
-        Assert.IsFalse(gate.TryConsumeHandoff(first));
+        Assert.IsFalse(gate.TryTakeHandoff(first));
         Assert.IsTrue(gate.TryPeekHandoff(out var observedGeneration, out var item));
         Assert.AreEqual(second, observedGeneration);
         Assert.AreEqual(2, item);
@@ -41,14 +41,14 @@ public class ActivationGateTests
         var gate = new ActivationGate<int>();
         var edgeLock = gate.EdgeLock;
 
-        var oldGeneration = gate.PlaceHandoff(1);
+        var oldGeneration = gate.PublishHandoff(1);
         edgeLock.Enter();
-        Assert.IsTrue(gate.TryClaimGrant(oldGeneration));
+        Assert.IsTrue(gate.TryClaimProvisionalTurn(oldGeneration));
 
         // The executor consumes after the empty-edge pass claimed but before its pinned consume.
-        Assert.IsTrue(gate.TryConsumeHandoff());
-        var currentGeneration = gate.PlaceHandoff(2);
-        Assert.IsTrue(gate.TryConsumeHandoff());
+        Assert.IsTrue(gate.TryTakeHandoff());
+        var currentGeneration = gate.PublishHandoff(2);
+        Assert.IsTrue(gate.TryTakeHandoff());
 
         var commitStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var commit = Task.Run(() =>
@@ -57,7 +57,7 @@ public class ActivationGateTests
             edgeLock.Enter();
             try
             {
-                return gate.AssignAtCommit(currentGeneration, tenure: 1);
+                return gate.CommitTurn(currentGeneration, tenure: 1);
             }
             finally
             {
@@ -84,13 +84,13 @@ public class ActivationGateTests
         var tenure = new ItemTenure();
         var gate = new ActivationGate<int>();
 
-        var recoveryGeneration = gate.PlaceHandoff(7);
-        Assert.IsTrue(gate.TryClaimGrant(recoveryGeneration));
-        Assert.IsTrue(gate.TryConsumeHandoff(recoveryGeneration));
+        var recoveryGeneration = gate.PublishHandoff(7);
+        Assert.IsTrue(gate.TryClaimProvisionalTurn(recoveryGeneration));
+        Assert.IsTrue(gate.TryTakeHandoff(recoveryGeneration));
 
         Assert.AreEqual(0, store.IncrementCommitCount());
-        Assert.IsTrue(gate.AssignAtCommit(recoveryGeneration, tenure.HeadSeq),
-            "The recovery commit must carry its generation so the grant converts to resident ownership.");
+        Assert.IsTrue(gate.CommitTurn(recoveryGeneration, tenure.HeadSequence),
+            "The recovery commit must carry its generation so the provisional turn becomes resident ownership.");
         store.PublishCommitted(7, default, out _);
 
         Assert.IsTrue(store.TryClaimCompletedHead(ref tenure, out var item, out _, out var claimedSequence, out _));

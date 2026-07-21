@@ -24,6 +24,20 @@ public class InFlightStoreTests
     }
 
     [TestMethod]
+    public void AdvanceOwnership_RemainsVisibleUntilRelease()
+    {
+        var store = new InFlightStore<int>();
+
+        Assert.IsTrue(store.TryAcquireAdvanceIfFree());
+        Assert.IsTrue(store.HasAdvanceOwner);
+        Assert.IsFalse(store.TryAcquireAdvanceOrRequest());
+        Assert.IsTrue(store.ReleaseAdvance(), "A deposited pass retains ownership.");
+        Assert.IsTrue(store.HasAdvanceOwner);
+        Assert.IsFalse(store.ReleaseAdvance(), "The following release makes advancement quiescent.");
+        Assert.IsFalse(store.HasAdvanceOwner);
+    }
+
+    [TestMethod]
     public void Commit_ThenClaim_ReturnsCommittedPair()
     {
         var store = new InFlightStore<int>();

@@ -132,7 +132,7 @@ sealed class TestPipelineItem
     //    synchronously-driven source is by definition dispatched on the driving thread, and nothing
     //    escapes the bracket without unwinding past the test's finally.
     //  - BeforeExecute: this item's own ExecuteItemAsync had not yet started. Within an executor
-    //    drive this splits the dispatch activation (elision or a self-resolved deferral - always
+    //    drive this splits the dispatch activation (elision or a self-resolved handoff - always
     //    precedes it, must be preferAsync:false: nothing has suspended yet, no continuation exists
     //    to defer) from the post-execute commit's walk (a legitimate preferAsync:true).
     // See InlineActivation_NeverPrefersAsync.

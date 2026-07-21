@@ -4,19 +4,19 @@
      PipelineSource - ordered delivery and source-to-executor ownership transfer
      InFlightStore  - membership, tiered storage, FIFO observation and count
      ItemTenure     - completion dispatch, delivery arm, claim and retirement
-     ActivationGate - activation turn, edge lock and activation deferrals
+     ActivationGate - activation turn, edge lock and activation handoffs
 
    The model includes direct and resident retirement, dispatcher-side and
    retirement-pass recovery, the advance license, and the two-sided empty-edge
    handoff. The empty-edge handoff resolves a dispatcher's published activation
-   deferral when the last resident item retires.
+   handoff when the last resident item retires.
 
-   Instruction boundaries are intentional. In particular, deferral publication,
+   Instruction boundaries are intentional. In particular, handoff publication,
    its fence, the in-flight-count read, head observations, turn claims, callback
    delivery, license release, count decrement and license reacquisition are
    separate actions.
 
-   Weak-memory scope is limited to the delivery-arm clear and activation-deferral
+   Weak-memory scope is limited to the delivery-arm clear and activation-handoff
    visibility required by the implementation's ordering arguments.
 
    Source delivery is passive: the bounded source always has its next item ready.
@@ -49,29 +49,29 @@ VARIABLES
   \* ---- ActivationGate custody ----
   advanceOwner, advancePending,   \* the license (acquire-or-deposit / release-or-serve)
   edgeLockOwner,        \* the edge lock: "0" | "E" | retirement pass id (chain-boundary assigns only)
-  activationTurn,         \* NONE | item: the grant (ONE field, owner identity)
+  activationTurn,         \* NONE | owner identity (resident sequence or negative generation)
   activationPerformed,    \* [1..N -> BOOLEAN] the policy EFFECT (set outside every hold)
   executionKind,       \* [1..N -> {"self","gated"}] gated completes only once activationPerformed
-  localDeferredGeneration, visibleDeferredGeneration,  \* the deferral word's GEN (weak local/visible; 0 = none)
-  deferredItem,             \* the item riding the CURRENT placement (versioned-word capture shape)
-  generationCounter, executorGeneration,      \* grant-gen mint; the committer's own placement gen
-  itemGeneration,             \* [1..N -> gen] each item's grant-gen identity (0 = none)
+  localHandoffGeneration, visibleHandoffGeneration,  \* the handoff word's GEN (weak local/visible; 0 = none)
+  handoffItem,             \* the item riding the CURRENT placement (versioned-word capture shape)
+  generationCounter, executorGeneration,      \* generation mint; the committer's own placement gen
+  itemGeneration,             \* [1..N -> gen] each item's generation identity (0 = none)
   recoveryAttempted,           \* [1..N -> BOOLEAN] one recovery per item (state-space bound)
   passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem,   \* the empty-edge handoff's PIN: peeked (gen, item) per retirement pass
   emptyEdgeActivationBusy,          \* an empty-edge handoff ActivateHeadItem call is IN FLIGHT (entered, not returned)
   resolvedEmptyEdgeGeneration,   \* stamp written after the empty-edge handoff's policy call returns
   faultConcurrentActivation,  \* a substitute activation overlapped an in-flight empty-edge handoff act
-  deferralGranted,   \* the placed deferral received its grant
+  handoffClaimed,   \* the published handoff was taken
   faultDoubleActivate, faultTokenRead, lateCompletionCallback,
   \* ---- populations ----
   executorPc, executorItem,     \* committer: "incrementStoreCount"|"publishStoreItem"|"readAdvanceLicense"|"finishOwnedPass"|"next"|"off"
   openedEmptyEdge,    \* the increment saw prev==0: this commit is the edge (gate custody
                 \* fact — NOT the storage tier, which can be queue while escalated)
-  handoffFenceEpoch,       \* Dekker barrier epoch (ExecutorFenceDeferralPublication advances; publishes NOTHING)
+  handoffFenceEpoch,       \* Dekker barrier epoch (ExecutorFenceHandoffPublication advances; publishes NOTHING)
   passDecrementEpoch,    \* [RetirementPasses -> epoch at their last count-decrement RMW]
   passPc,          \* [RetirementPasses -> "off"|"readFirstTier"|"readSecondTier"|"decideHeadClaim"|"armHeadDelivery"|"releasePhantomEdge"|"exitPass"
                 \*  |"releaseActivationTurn"|"decrementInFlightCount"|"reacquireLicense"|"phantomReadFirstTier"|"phantomReadSecondTier"|"phantomDecide"
-                \*  |"emptyEdgeLock"|"emptyEdgeObserve"|"emptyEdgeUnlock"|"emptyEdgeTurnClaim"|"emptyEdgeDeferralConsume"
+                \*  |"emptyEdgeLock"|"emptyEdgeObserve"|"emptyEdgeUnlock"|"emptyEdgeTurnClaim"|"emptyEdgeHandoffTake"
                 \*  |"emptyEdgeActivate"|"emptyEdgeRecordResolution"
                 \*  |"recoveryLock"|"recoveryPrepare"|"recoveryActivate"|"awaitEmptyEdgeResolution"|"recoveryDecrement"]
   passSlotSeen, passQueueSeen,   \* the claim's two read snapshots (per retirement pass)
@@ -79,8 +79,8 @@ VARIABLES
 
 vars == <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn,
           completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn, activationPerformed,
-          executionKind, localDeferredGeneration, visibleDeferredGeneration, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem,
-          deferralGranted, faultDoubleActivate, faultTokenRead, itemGeneration, recoveryAttempted,
+          executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem,
+          handoffClaimed, faultDoubleActivate, faultTokenRead, itemGeneration, recoveryAttempted,
           lateCompletionCallback, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch,
           executorPc, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation>>
 
@@ -102,10 +102,10 @@ Init ==
   /\ advanceOwner = "0" /\ advancePending = FALSE /\ edgeLockOwner = "0"
   /\ activationTurn = NONE /\ activationPerformed = [i \in 1..N |-> FALSE]
   /\ executionKind \in [1..N -> {"self","gated"}]
-  /\ localDeferredGeneration = NONE /\ visibleDeferredGeneration = NONE /\ deferredItem = NONE /\ generationCounter = 0 /\ executorGeneration = 0
+  /\ localHandoffGeneration = NONE /\ visibleHandoffGeneration = NONE /\ handoffItem = NONE /\ generationCounter = 0 /\ executorGeneration = 0
   /\ passEmptyEdgeHandoffGeneration = [t \in RetirementPasses |-> NONE] /\ passEmptyEdgeHandoffItem = [t \in RetirementPasses |-> NONE]
   /\ itemGeneration = [i \in 1..N |-> 0] /\ recoveryAttempted = [i \in 1..N |-> FALSE]
-  /\ deferralGranted = FALSE
+  /\ handoffClaimed = FALSE
   /\ faultDoubleActivate = FALSE /\ faultTokenRead = FALSE /\ lateCompletionCallback = FALSE
   /\ emptyEdgeActivationBusy = FALSE /\ resolvedEmptyEdgeGeneration = 0 /\ faultConcurrentActivation = FALSE
   /\ executorPc = "dispatch" /\ SourceInit(executorItem) /\ openedEmptyEdge = FALSE
@@ -115,46 +115,46 @@ Init ==
   /\ fifoViolation = FALSE
 
 (* ------------------------- committer (E strand) --------------------------- *)
-\* Dispatch: place the exec-deferral (weak), fence, read the count — the
+\* Dispatch: place the exec-handoff (weak), fence, read the count — the
 \* composed ActivationGate Dekker. inFlightCount>0: a chain exists, its empty-edge handoff/stop is
 \* obligated; inFlightCount==0: no retirement pass can exist — SELF-GRANT under the edge lock.
 ExecutorDispatch ==
   /\ executorPc = "dispatch" /\ executorItem <= N
-  \* Every completionDispatch places a deferral (the fast item's is eaten by the
+  \* Every completionDispatch places a handoff (the fast item's is eaten by the
   \* completion-time reclaim); only the gated (sync-body) executionKind WAITS on it.
   /\ generationCounter' = generationCounter + 1
   /\ executorGeneration' = generationCounter + 1
   /\ itemGeneration' = [itemGeneration EXCEPT ![executorItem] = generationCounter + 1]
-  \* Idle-regime elision (executor dispatch): count 0 with no deferral
+  \* Idle-regime elision (executor dispatch): count 0 with no handoff
   \* outstanding = no concurrent activation decider; SKIP the placement and claim
-  \* the activationTurn fail-if-live (lock-free). Everything else places the deferral.
-  /\ IF inFlightCount = 0 /\ localDeferredGeneration = NONE
-       THEN /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
+  \* the activationTurn fail-if-live (lock-free). Everything else places the handoff.
+  /\ IF inFlightCount = 0 /\ localHandoffGeneration = NONE
+       THEN /\ UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>
             /\ executorPc' = "claimElidedTurn"
-       ELSE /\ localDeferredGeneration' = generationCounter + 1 /\ visibleDeferredGeneration' = visibleDeferredGeneration   \* WEAK place (gen)
-            /\ deferredItem' = executorItem
-            /\ deferralGranted' = FALSE
-            /\ executorPc' = IF executionKind[executorItem] = "gated" THEN "fenceDeferral" ELSE "consumeOwnDeferral"
+       ELSE /\ localHandoffGeneration' = generationCounter + 1 /\ visibleHandoffGeneration' = visibleHandoffGeneration   \* WEAK place (gen)
+            /\ handoffItem' = executorItem
+            /\ handoffClaimed' = FALSE
+            /\ executorPc' = IF executionKind[executorItem] = "gated" THEN "fenceHandoff" ELSE "takeOwnHandoff"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
                  activationPerformed, executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
                  passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, recoveryAttempted>>
 
-\* The fail-if-live TurnExec claim (ActivationGate.TryClaimGrant) is lock-free. The gate
-\* excluded residents, but an empty-edge handoff may have granted a NON-RESIDENT (activationTurn live at
+\* The fail-if-live TurnExec claim (ActivationGate.TryClaimProvisionalTurn) is lock-free. The gate
+\* excluded residents, but an empty-edge pass may own a NON-RESIDENT turn (activationTurn live at
 \* count 0), so the activationTurn - not the stale gate - is the authority: decline on a
-\* live activationTurn and fall back to a normal deferral placement (the loss branch,
+\* live activationTurn and fall back to a normal handoff publication (the loss branch,
 \* the executor dispatch fallback).
 ExecutorClaimElidedTurn ==
   /\ executorPc = "claimElidedTurn"
   /\ IF activationTurn = NONE
        THEN /\ activationTurn' = -executorGeneration
-            /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
+            /\ UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>
             /\ executorPc' = "activateElidedItem"
-       ELSE /\ localDeferredGeneration' = executorGeneration /\ visibleDeferredGeneration' = visibleDeferredGeneration
-            /\ deferredItem' = executorItem /\ deferralGranted' = FALSE
+       ELSE /\ localHandoffGeneration' = executorGeneration /\ visibleHandoffGeneration' = visibleHandoffGeneration
+            /\ handoffItem' = executorItem /\ handoffClaimed' = FALSE
             /\ UNCHANGED activationTurn
-            /\ executorPc' = IF executionKind[executorItem] = "gated" THEN "fenceDeferral" ELSE "consumeOwnDeferral"
+            /\ executorPc' = IF executionKind[executorItem] = "gated" THEN "fenceHandoff" ELSE "takeOwnHandoff"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner,
                  activationPerformed, executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
@@ -169,130 +169,130 @@ ExecutorActivateElidedItem ==
   /\ executorPc' = "incrementStoreCount"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorItem, openedEmptyEdge, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, executorItem, openedEmptyEdge, passPc,
+                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The executor's post-handoff publication barrier is relational, not
 \* publishing: a fence does not flush the store into one
 \* universal view; it advances the epoch. An observer whose count-RMW POSTDATES
 \* this epoch is synchronized (reads truth); one whose RMW predates it may
 \* still read the stale view. Only the true both-miss is thereby excluded.
-ExecutorFenceDeferralPublication ==
-  /\ executorPc = "fenceDeferral"
+ExecutorFenceHandoffPublication ==
+  /\ executorPc = "fenceHandoff"
   /\ handoffFenceEpoch' = handoffFenceEpoch + 1
-  /\ UNCHANGED visibleDeferredGeneration
+  /\ UNCHANGED visibleHandoffGeneration
   /\ executorPc' = "readInFlightCount"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, deferralGranted, faultDoubleActivate, executorItem,
-                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 activationPerformed, executionKind, localHandoffGeneration, handoffClaimed, faultDoubleActivate, executorItem,
+                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-PropagateDeferredActivation ==
-  /\ visibleDeferredGeneration # localDeferredGeneration
-  /\ visibleDeferredGeneration' = localDeferredGeneration
+PropagateHandoff ==
+  /\ visibleHandoffGeneration # localHandoffGeneration
+  /\ visibleHandoffGeneration' = localHandoffGeneration
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc,
-                 executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 activationPerformed, executionKind, localHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc,
+                 executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 ExecutorReadInFlightCount ==
   /\ executorPc = "readInFlightCount"
-  /\ executorPc' = IF inFlightCount = 0 THEN "acquireSelfGrantLock" ELSE "awaitActivationGrant"
+  /\ executorPc' = IF inFlightCount = 0 THEN "acquireSelfClaimLock" ELSE "awaitHandoffResolution"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
-                 executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate,
+                 executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* Self-grant: take the deferral and assign activationTurn under the lock; activate outside it.
-ExecutorAcquireSelfGrantLock ==
-  /\ executorPc = "acquireSelfGrantLock"
+\* Self-claim: take the handoff and assign activationTurn under the lock; activate outside it.
+ExecutorAcquireSelfClaimLock ==
+  /\ executorPc = "acquireSelfClaimLock"
   /\ UNCHANGED edgeLockOwner
-  /\ executorPc' = "observeSelfGrant"
+  /\ executorPc' = "observeSelfClaim"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorItem,
-                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorItem,
+                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-ExecutorObserveSelfGrant ==
-  /\ executorPc = "observeSelfGrant"
-  /\ IF localDeferredGeneration = executorGeneration /\ ~deferralGranted   \* own placement (by GEN) still there
-       THEN /\ UNCHANGED <<activationTurn, deferralGranted, localDeferredGeneration, visibleDeferredGeneration>>
-            /\ executorPc' = "claimSelfGrantTurn"
+ExecutorObserveSelfClaim ==
+  /\ executorPc = "observeSelfClaim"
+  /\ IF localHandoffGeneration = executorGeneration /\ ~handoffClaimed   \* own placement (by GEN) still there
+       THEN /\ UNCHANGED <<activationTurn, handoffClaimed, localHandoffGeneration, visibleHandoffGeneration>>
+            /\ executorPc' = "claimProvisionalTurn"
             /\ UNCHANGED edgeLockOwner
-       ELSE /\ UNCHANGED <<activationTurn, deferralGranted, localDeferredGeneration, visibleDeferredGeneration>>
-            /\ executorPc' = "awaitActivationGrant"              \* empty-edge handoff granted (or will); wait it out
+       ELSE /\ UNCHANGED <<activationTurn, handoffClaimed, localHandoffGeneration, visibleHandoffGeneration>>
+            /\ executorPc' = "awaitHandoffResolution"              \* another strand owns or will resolve the handoff
             /\ UNCHANGED edgeLockOwner
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationPerformed,
                  executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
-                 fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* TURN-CLAIM-FIRST (code TryReclaimExecDeferred): the fail-if-live TURN claim is
 \* the shared authority (the empty-edge handoff's take-claim uses the same word) - a live activationTurn
-\* (empty-edge handoff or recovery grant) declines, leaving the deferral
-\* for its granter; only the claim winner consumes.
-ExecutorClaimSelfGrantTurn ==
-  /\ executorPc = "claimSelfGrantTurn"
+\* (empty-edge handoff or recovery turn) declines, leaving the handoff
+\* for its owner; only the claim winner takes it.
+ExecutorClaimProvisionalTurn ==
+  /\ executorPc = "claimProvisionalTurn"
   /\ IF activationTurn = NONE
        THEN /\ activationTurn' = -executorGeneration
-            /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted, edgeLockOwner>>
-            /\ executorPc' = "consumeSelfGrant"
-       ELSE /\ UNCHANGED <<activationTurn, localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted, edgeLockOwner>>
-            /\ executorPc' = "awaitActivationGrant"
+            /\ UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed, edgeLockOwner>>
+            /\ executorPc' = "takeSelfHandoff"
+       ELSE /\ UNCHANGED <<activationTurn, localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed, edgeLockOwner>>
+            /\ executorPc' = "awaitHandoffResolution"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationPerformed,
                  executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
                  fifoViolation, faultTokenRead, lateCompletionCallback, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* Claim-winner's consume: the deferral is exclusively ours (the empty-edge handoff bails its
+\* Claim-winner's consume: the handoff is exclusively ours (the empty-edge handoff bails its
 \* take on the live activationTurn we now hold), so a plain clear, then the policy call.
-ExecutorConsumeSelfGrant ==
-  /\ executorPc = "consumeSelfGrant"
-  /\ localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE /\ deferralGranted' = TRUE
+ExecutorTakeSelfHandoff ==
+  /\ executorPc = "takeSelfHandoff"
+  /\ localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE /\ handoffClaimed' = TRUE
   /\ UNCHANGED edgeLockOwner
-  /\ executorPc' = "activateSelfGrantedItem"
+  /\ executorPc' = "activateSelfClaimedItem"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, activationPerformed,
                  executionKind, faultDoubleActivate, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
                  fifoViolation, faultTokenRead, lateCompletionCallback, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The policy call runs outside the hold (the assign-to-activate gap is real).
-ExecutorActivateSelfGrantedItem ==
-  /\ executorPc = "activateSelfGrantedItem"
+ExecutorActivateSelfClaimedItem ==
+  /\ executorPc = "activateSelfClaimedItem"
   /\ faultDoubleActivate' = (faultDoubleActivate \/ activationPerformed[executorItem])
   /\ activationPerformed' = [activationPerformed EXCEPT ![executorItem] = TRUE]
   /\ executorPc' = "incrementStoreCount"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorItem, openedEmptyEdge, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, executorItem, openedEmptyEdge, passPc,
+                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The sync-body window: the gated body blocks inside execution until the
-\* activation grant lands—the commit cannot arrive. The empty-edge handoff and self-grant are the only
+\* activation occurs—the commit cannot arrive. The empty-edge handoff and self-claim are the only
 \* exits; a chain's stop CANNOT rescue this item (it is not resident yet).
-ExecutorAwaitActivationGrant ==
-  /\ executorPc = "awaitActivationGrant" /\ activationPerformed[executorItem]
-  /\ executorPc' = "consumeOwnDeferral"
+ExecutorAwaitHandoffResolution ==
+  /\ executorPc = "awaitHandoffResolution" /\ activationPerformed[executorItem]
+  /\ executorPc' = "takeOwnHandoff"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
-                 executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate,
+                 executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* CommitPendingTail's reclaim site: the PREVIOUS item's deferral is resolved at
+\* CommitPendingTail's reclaim site: the PREVIOUS item's handoff is resolved at
 \* the next loop boundary - plain consume of its own leftover placement (skip when a
-\* granter completionConsumed it), release-if-mine on the -gen. The last item's leftover
+\* another strand took it), release-if-mine on the -gen. The last item's leftover
 \* is resolved by the completion-time ReclaimCompletionCallback instead.
-ExecutorResolvePriorDeferral ==
-  /\ executorPc = "resolvePriorDeferral"
-  /\ IF localDeferredGeneration # NONE /\ localDeferredGeneration = executorGeneration
-       THEN /\ localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE
-            /\ deferralGranted' = TRUE
+ExecutorResolvePriorHandoff ==
+  /\ executorPc = "resolvePriorHandoff"
+  /\ IF localHandoffGeneration # NONE /\ localHandoffGeneration = executorGeneration
+       THEN /\ localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE
+            /\ handoffClaimed' = TRUE
             \* NO activationTurn release here (finding #7-rev): the owned-activationTurn release is
             \* COMPLETION/RETIRE property (RetireItem ownedTurn -> the claim's
             \* release-if-mine), not a loop-boundary one - releasing at resolve
-            \* freed a STILL-LIVE gated item's grant and the stop re-granted.
+            \* freed a still-live gated item's turn and let the stop assign it again.
             /\ UNCHANGED activationTurn
-       ELSE UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted, activationTurn>>
+       ELSE UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed, activationTurn>>
   /\ executorPc' = "dispatch"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationPerformed,
@@ -302,33 +302,33 @@ ExecutorResolvePriorDeferral ==
 
 \* TRAILING-FAILURE RECOVERY: the gated tail's body faults instead of
 \* completing; the executor swaps a substitute. Its reclaim of the original
-\* deferral: WIN = owned (activate substitute inline); LOSE = an empty-edge handoff won
+\* handoff: WIN = owned (activate substitute inline); LOSE = an empty-edge handoff won
 \* EXACTLY this gen - park on the generation-keyed resolution stamp.
 \* before the substitute's activation.
 ExecutorDiscoverRecovery ==
   /\ UNCHANGED <<handoffFenceEpoch, passDecrementEpoch>>
-  /\ executorPc = "awaitActivationGrant" /\ executorItem <= N /\ ~activationPerformed[executorItem] /\ ~recoveryAttempted[executorItem]
+  /\ executorPc = "awaitHandoffResolution" /\ executorItem <= N /\ ~activationPerformed[executorItem] /\ ~recoveryAttempted[executorItem]
   /\ recoveryAttempted' = [recoveryAttempted EXCEPT ![executorItem] = TRUE]   \* ONE recovery per item (bound)
-  /\ executorPc' = "reclaimFailedDeferral"
+  /\ executorPc' = "reclaimFailedHandoff"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
+                 activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate,
                  faultTokenRead, lateCompletionCallback, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration,
                  faultConcurrentActivation, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
-                 fifoViolation, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, itemGeneration>>
+                 fifoViolation, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, itemGeneration>>
 
-ExecutorReclaimFailedDeferral ==
-  /\ executorPc = "reclaimFailedDeferral"
-  /\ IF localDeferredGeneration = executorGeneration
+ExecutorReclaimFailedHandoff ==
+  /\ executorPc = "reclaimFailedHandoff"
+  /\ IF localHandoffGeneration = executorGeneration
        THEN \* reclaim WINS: owned. Release an empty-edge handoff's stale claim of MY gen
             \* (CAS-if-mine - the double-bail's dual release); substitute mints
             \* fresh at act.
-            /\ localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE
-            /\ deferralGranted' = TRUE
+            /\ localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE
+            /\ handoffClaimed' = TRUE
             /\ activationTurn' = IF activationTurn = -executorGeneration THEN NONE ELSE activationTurn
             /\ executorPc' = "activateOwnedRecovery"
        ELSE \* LOST: an empty-edge handoff won this exact gen
-            /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted, activationTurn>>
+            /\ UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed, activationTurn>>
             /\ executorPc' = "awaitEmptyEdgeResolution"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationPerformed,
@@ -342,21 +342,21 @@ ExecutorAwaitEmptyEdgeResolution ==
   /\ executorPc' = "activateInheritedRecovery"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
+                 activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate,
                  faultTokenRead, lateCompletionCallback, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration,
                  faultConcurrentActivation, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
-                 fifoViolation, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, itemGeneration, recoveryAttempted>>
+                 fifoViolation, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, itemGeneration, recoveryAttempted>>
 
-\* The substitute's activation: UNSAFE while the original grant's policy call
+\* The substitute's activation is unsafe while the original turn's policy call
 \* is still in flight (the cross-strand overlap the stamp exists to prevent).
 ExecutorActivateRecovery ==
   /\ UNCHANGED <<handoffFenceEpoch, passDecrementEpoch>>
   \* WIN path: a -executorGeneration still visible is an empty-edge handoff's DOOMED CLAIM (its consume
-  \* must lose - the double-bail), never a grant: wait out its release, then
+  \* must lose - the double-bail), never ownership: wait out its release, then
   \* Claim fresh if free. The post-stamp inherit path uses -executorGeneration as the
-  \* completionPublished grant - ClaimOrInherit transfers it in place.
+  \* completionPublished turn - ClaimOrInheritProvisionalTurn transfers it in place.
   \* Both arms are Count==0-gated (RecoverItem): at count>0 the substitute only
-  \* RE-PLACES (ExecutorRepublishRecoveryDeferral) - no recovery-time activationTurn touch; a live empty-edge handoff grant
+  \* RE-PLACES (ExecutorRepublishRecoveryHandoff) - no recovery-time activationTurn touch; a live empty-edge provisional turn
   \* is inherited later at the substitute's COMMIT (-gen -> seq). The ungated
   \* mint at count>0 was finding #10 (deadlocked PassPrepareRecoveryReplacement on a foreign -gen that
   \* could never release: FIFO put its item behind the recovering head).
@@ -374,39 +374,39 @@ ExecutorActivateRecovery ==
   /\ faultConcurrentActivation' = (faultConcurrentActivation \/ emptyEdgeActivationBusy)
   /\ activationPerformed' = [activationPerformed EXCEPT ![executorItem] = TRUE]
   /\ faultDoubleActivate' = faultDoubleActivate   \* substitute re-tenure: act is its own
-  /\ executorPc' = "consumeOwnDeferral"
-  /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultTokenRead, lateCompletionCallback, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, deferredItem, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, recoveryAttempted>>
+  /\ executorPc' = "takeOwnHandoff"
+  /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultTokenRead, lateCompletionCallback, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, handoffItem, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, recoveryAttempted>>
 
 \* Inherit-path substitute at count>0 (finding #11 companion): NO act here (the
-\* empty-edge handoff activationPerformed), NO re-place (a re-mint severs the -executorGeneration grant linkage,
+\* empty-edge handoff activationPerformed), NO re-place (a re-mint severs the -executorGeneration turn linkage,
 \* finding #11's deadlock) - route straight to the commit chain; ExecutorAssignAtEmptyEdge's
-\* inherit converts -executorGeneration -> seq, the code's tailGen inherit at CommitInFlightItem.
-ExecutorCommitInheritedRecoveryGrant ==
+\* inherit converts -executorGeneration to the resident sequence at CommitInFlightItem.
+ExecutorCommitInheritedRecoveryTurn ==
   /\ UNCHANGED <<handoffFenceEpoch, passDecrementEpoch>>
   /\ executorPc = "activateInheritedRecovery" /\ inFlightCount > 0
-  /\ executorPc' = "consumeOwnDeferral"
+  /\ executorPc' = "takeOwnHandoff"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
+                 activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate,
                  faultTokenRead, lateCompletionCallback, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration,
                  faultConcurrentActivation, executorItem, openedEmptyEdge, passPc, passSlotSeen, passQueueSeen,
-                 fifoViolation, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, itemGeneration, recoveryAttempted>>
+                 fifoViolation, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, itemGeneration, recoveryAttempted>>
 
-\* Executor-recovery replacement (ClaimOrInherit's home):
+\* Executor-recovery replacement (ClaimOrInheritProvisionalTurn's home):
 \* a win-path substitute may, instead of inline-acting, RE-PLACE a fresh
-\* deferral under the edge lock (lock-free rivals respected via the guard) and
-\* re-enter the full completionDispatch Dekker (fence -> read -> grant protocol). This is
+\* handoff under the edge lock (lock-free rivals respected via the guard) and
+\* re-enter the full completionDispatch Dekker (fence -> read -> turn-claim protocol). This is
 \* the second-epoch mint - the last candidate opener for the pin's
 \* consume-guard face.
-ExecutorRepublishRecoveryDeferral ==
+ExecutorRepublishRecoveryHandoff ==
   /\ executorPc = "activateOwnedRecovery"
   /\ edgeLockOwner = "0"                  \* the re-placement is an edge-lock section
   /\ generationCounter' = generationCounter + 1
   /\ executorGeneration' = generationCounter + 1
   /\ itemGeneration' = [itemGeneration EXCEPT ![executorItem] = generationCounter + 1]
-  /\ localDeferredGeneration' = generationCounter + 1 /\ visibleDeferredGeneration' = visibleDeferredGeneration   \* weak re-place
-  /\ deferredItem' = executorItem /\ deferralGranted' = FALSE
-  /\ executorPc' = "fenceDeferral"              \* re-enter the Dekker: fence -> read -> grant
+  /\ localHandoffGeneration' = generationCounter + 1 /\ visibleHandoffGeneration' = visibleHandoffGeneration   \* weak re-place
+  /\ handoffItem' = executorItem /\ handoffClaimed' = FALSE
+  /\ executorPc' = "fenceHandoff"              \* re-enter the Dekker: fence -> read -> claim
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
                  activationPerformed, executionKind, faultDoubleActivate, faultTokenRead, lateCompletionCallback,
@@ -414,17 +414,17 @@ ExecutorRepublishRecoveryDeferral ==
                  passPc, passSlotSeen, passQueueSeen, fifoViolation, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, recoveryAttempted>>
 
 \* Ownership is determined before the commit (CommitPendingTail and CommitInFlightItem's handoff assertion):
-\* consume the owned deferral now. Consuming a live owned placement retains ownership (this strand
-\* keeps the activation obligation); gone = the empty-edge handoff claimed/granted = LOST
-\* (sentinelHeld; the empty-edge handoff owns activation). Elide + race-back routes bypass
-\* this step: they ARE tailActivated (own-strand activation, deferral resolved).
-ExecutorConsumeOwnDeferral ==
-  /\ executorPc = "consumeOwnDeferral"
-  /\ IF localDeferredGeneration = executorGeneration /\ localDeferredGeneration # NONE
-       THEN /\ localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE
-            /\ deferralGranted' = TRUE
+\* consume the owned handoff now. Consuming a live owned placement retains ownership (this strand
+\* keeps the activation obligation); gone = the empty-edge pass took ownership
+\* (the empty-edge handoff owns activation). Elision and race-back routes bypass
+\* this step: they ARE tailActivated (own-strand activation, handoff resolved).
+ExecutorTakeOwnHandoff ==
+  /\ executorPc = "takeOwnHandoff"
+  /\ IF localHandoffGeneration = executorGeneration /\ localHandoffGeneration # NONE
+       THEN /\ localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE
+            /\ handoffClaimed' = TRUE
             /\ executorPc' = "incrementStoreCount"
-       ELSE /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
+       ELSE /\ UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>
             /\ executorPc' = "inclost"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
@@ -449,8 +449,8 @@ ExecutorDirectRetire ==
   /\ executorPc' = "next"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionDispatch,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorItem,
-                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorItem,
+                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* InFlightStore.StoreIncrementInFlightCount: increment-first.
 StoreIncrementInFlightCount ==
@@ -458,11 +458,11 @@ StoreIncrementInFlightCount ==
   /\ openedEmptyEdge' = (inFlightCount = 0)     \* edge status from the increment-first read of prev
   /\ inFlightCount' = inFlightCount + 1             \* COUNT-WORD RMW (the fold): fences THIS
                                 \* strand's stores (the place), nothing foreign
-  /\ visibleDeferredGeneration' = localDeferredGeneration
+  /\ visibleHandoffGeneration' = localHandoffGeneration
   /\ executorPc' = IF executorPc = "incrementStoreCount" THEN "publishStoreItem" ELSE "publost"
   /\ UNCHANGED <<slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn,
                  completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorItem, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 passSlotSeen, passQueueSeen, fifoViolation, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* InFlightStore.StorePublishCommittedItem (internal tier choice, leave-head) plus the edge arm:
 \* a wasEmpty commit is the frontier owner — it arms + registers the trampoline
@@ -484,7 +484,7 @@ StorePublishCommittedItem ==
             /\ UNCHANGED <<completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem>>
             /\ executorPc' = "readAdvanceLicense"
   /\ UNCHANGED <<inFlightCount, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn, advanceOwner, advancePending,
-                 executorItem, passPc, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executorItem, passPc, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Edge-lock section: LOCK { assign the activationTurn iff not already ours } UNLOCK;
 \* the policy activate runs outside; the activation turn is the authority.
@@ -502,8 +502,8 @@ ExecutorPrepareEmptyEdgeActivation ==
   /\ executorPc' = "eacq"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorItem, openedEmptyEdge, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, executorItem, openedEmptyEdge, passPc,
+                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Licensed owned-edge commit (CommitInFlightItem's TryAcquireIfFree branch):
 \* own + TryAcquireIfFree -> hold the ADVANCE LICENSE (not the edge lock) across
@@ -520,19 +520,19 @@ ExecutorAcquireAdvanceLicense ==
        ELSE /\ UNCHANGED advanceOwner /\ executorPc' = "acquireEmptyEdgeLock"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advancePending, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
+                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 ExecutorAssignAndPublishAtEmptyEdge ==
   /\ executorPc = "licassign"
-  /\ activationTurn \in {NONE, -executorGeneration}   \* ActivationGate.AssignAtCommit premise
+  /\ activationTurn \in {NONE, -executorGeneration}   \* ActivationGate.CommitTurn premise
   /\ (IF activationTurn = -executorGeneration
         THEN /\ activationTurn' = executorItem   \* inherit: -gen -> seq
-             /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
+             /\ UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>
         ELSE /\ activationTurn' = executorItem
-             /\ IF localDeferredGeneration = executorGeneration /\ executorGeneration # 0
-                  THEN localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE /\ deferralGranted' = TRUE
-                  ELSE UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>)
+             /\ IF localHandoffGeneration = executorGeneration /\ executorGeneration # 0
+                  THEN localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE /\ handoffClaimed' = TRUE
+                  ELSE UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>)
   /\ (IF slot = NONE /\ ~queuePublished
         THEN slot' = executorItem /\ UNCHANGED <<queuePublished, overflowQueue>>
         ELSE queuePublished' = TRUE /\ overflowQueue' = Append(overflowQueue, executorItem) /\ UNCHANGED slot)
@@ -552,8 +552,8 @@ ExecutorAttachEmptyEdgeCallback ==
   /\ executorPc' = "licrel"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, advanceOwner, advancePending, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorItem, openedEmptyEdge, passPc,
+                 passSlotSeen, passQueueSeen, fifoViolation, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 ExecutorReleaseAdvanceLicense ==
   /\ executorPc = "licrel"
@@ -566,8 +566,8 @@ ExecutorReleaseAdvanceLicense ==
             /\ executorPc' = "next"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorItem, openedEmptyEdge,
-                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorItem, openedEmptyEdge,
+                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 ExecutorAcquireEmptyEdgeLock ==
   /\ executorPc = "acquireEmptyEdgeLock"
@@ -575,8 +575,8 @@ ExecutorAcquireEmptyEdgeLock ==
   /\ executorPc' = "assignAtEmptyEdge"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorItem,
-                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorItem,
+                 openedEmptyEdge, passPc, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 ExecutorAssignAtEmptyEdge ==
   /\ executorPc = "assignAtEmptyEdge"
@@ -590,22 +590,22 @@ ExecutorAssignAtEmptyEdge ==
   \* The prev==0 commit CONVERTS -(its own gen) -> seq (inherit), else assigns
   \* fresh on a free activationTurn; a FOREIGN live activationTurn defers to a later stop.
   /\ IF activationTurn = -executorGeneration
-       THEN \* INHERIT own grant: convert to resident seq, no re-activate.
+       THEN \* INHERIT own turn: convert to resident sequence, no re-activation.
             /\ activationTurn' = executorItem
-            /\ UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
+            /\ UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>
             /\ executorPc' = "next"
        ELSE IF activationTurn = NONE
        THEN /\ activationTurn' = executorItem
-            /\ IF localDeferredGeneration = executorGeneration /\ executorGeneration # 0
-                 THEN localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE /\ deferralGranted' = TRUE
-                 ELSE UNCHANGED <<localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
+            /\ IF localHandoffGeneration = executorGeneration /\ executorGeneration # 0
+                 THEN localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE /\ handoffClaimed' = TRUE
+                 ELSE UNCHANGED <<localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>
             /\ executorPc' = "next"
-       ELSE \* ActivationGate.AssignAtCommit: a foreign edge turn is unreachable
+       ELSE \* ActivationGate.CommitTurn: a foreign edge turn is unreachable
             \* (release-before-decrement makes prev==0 imply the prior activationTurn is
             \* gone). Model as the assert: this branch blocks; reachability shows
             \* as deadlock, mirroring the Debug.Assert.
             /\ FALSE
-            /\ UNCHANGED <<activationTurn, localDeferredGeneration, visibleDeferredGeneration, deferredItem, deferralGranted>>
+            /\ UNCHANGED <<activationTurn, localHandoffGeneration, visibleHandoffGeneration, handoffItem, handoffClaimed>>
             /\ executorPc' = executorPc
   /\ edgeLockOwner' = "0"
   /\ UNCHANGED <<inFlightCount, headTicket, completionPublished, completionDispatch, completionConsumed,
@@ -620,44 +620,44 @@ ExecutorActivateEmptyEdgeItem ==
   /\ executorPc' = "next"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorItem, openedEmptyEdge, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, executorItem, openedEmptyEdge, passPc,
+                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* EdgeLockBail: the committer's post-publish word-read — advanceOwner==0 means any
 \* retirement pass has bailed or never was; the committer WALKS ITSELF (identity E,
 \* verbatim EdgeLockBail: executorPc waits in "finishOwnedPass" until E's walk exits).
 ExecutorReadAdvanceLicense ==
   /\ executorPc = "readAdvanceLicense"
-  /\ visibleDeferredGeneration' = localDeferredGeneration
+  /\ visibleHandoffGeneration' = localHandoffGeneration
   /\ IF advanceOwner = "0"
        THEN /\ advanceOwner' = "E" /\ passPc' = [passPc EXCEPT !["E"] = "readFirstTier"]
             /\ executorPc' = "finishOwnedPass" /\ advancePending' = advancePending
        ELSE \* acquire-or-deposit (InFlightStore.TryAcquire): an advanceOwner license
             \* takes the pending bit - the holder's release-or-serve re-probes
-            \* and drives this commit; the hand-off is lossless BY CONSTRUCTION.
+            \* and drives this commit; the handoff is lossless BY CONSTRUCTION.
             /\ UNCHANGED <<advanceOwner, passPc>> /\ advancePending' = TRUE /\ executorPc' = "next"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
-                 completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 ExecutorFinishOwnedPass ==
   /\ executorPc = "finishOwnedPass" /\ passPc["E"] = "off"
   /\ executorPc' = "next"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorItem, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 ExecutorNext ==
   /\ executorPc = "next"
   /\ openedEmptyEdge' = openedEmptyEdge
   /\ IF SourceHasSuccessor(executorItem)
        THEN /\ SourceDeliverSuccessor(executorItem)
-            /\ executorPc' = "resolvePriorDeferral"
+            /\ executorPc' = "resolvePriorHandoff"
        ELSE /\ SourceIsExhausted(executorItem)
             /\ UNCHANGED executorItem
             /\ executorPc' = "off"
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 passSlotSeen, passQueueSeen, fifoViolation, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 (* --------------------- ItemTenure: two-phase completion ------------------- *)
 \* Phase 1: publish completionPublished (status-visible / claimable). Resident items only.
@@ -671,12 +671,12 @@ PublishCompletion(i) ==
                            /\ \E t \in RetirementPasses : passPc[t] \in {"recoveryActivate", "awaitEmptyEdgeResolution"}
                                 /\ (passSlotSeen[t] = i \/ passQueueSeen[t] = i)))
   /\ (executionKind[i] = "gated") => activationPerformed[i]     \* the sync-body structure
-  /\ (deferredItem # i \/ localDeferredGeneration = NONE)  \* completion AFTER deferral resolution
+  /\ (handoffItem # i \/ localHandoffGeneration = NONE)  \* completion AFTER handoff resolution
                                         \* (ClearExecutingItem before SetResult)
   /\ completionPublished' = [completionPublished EXCEPT ![i] = TRUE]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionDispatch, completionConsumed, completionDispatchTorn,
                  completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorPc, executorItem, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Phase 2 entry: the completer of a REGISTERED tenure begins the unlicensed
 \* pair-read. Unregistered tenures never completionDispatch (immune).
@@ -685,7 +685,7 @@ BeginCompletionDispatch(i) ==
   /\ completionDispatch' = [completionDispatch EXCEPT ![i] = "inflight"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionConsumed, completionDispatchTorn,
                  completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorPc, executorItem, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Phase 2 delivery = the FIRE (ItemTenure.DeliverCompletionCallback fused with the gate's
 \* Fire): clear the arm FIRST (weak), consume the registration, then the
@@ -697,7 +697,7 @@ DeliverCompletionCallback(i) ==
   /\ visibleDeliveryArmItem' = visibleDeliveryArmItem
   /\ completionDispatch' = [completionDispatch EXCEPT ![i] = "done"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionConsumed, completionDispatchTorn,
-                 advanceOwner, advancePending, executorPc, executorItem, passPc, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 advanceOwner, advancePending, executorPc, executorItem, passPc, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The fire's acquire-or-deposit (count-word RMW = full fence: clear propagates).
 CompletionCallbackAcquireOrDeposit(i) ==
@@ -710,27 +710,27 @@ CompletionCallbackAcquireOrDeposit(i) ==
          THEN advanceOwner' = t /\ advancePending' = advancePending /\ passPc' = [passPc EXCEPT ![t] = "readFirstTier"]
          ELSE advanceOwner' = advanceOwner /\ advancePending' = TRUE /\ passPc' = passPc
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionConsumed, completionDispatchTorn,
-                 completionCallbackRegistered, localDeliveryArmItem, executorPc, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 completionCallbackRegistered, localDeliveryArmItem, executorPc, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Background coherence for the weak clear.
 ReclaimCompletionCallback(i) ==
-  \* Completion-time reclaim (ActivationGate.TryConsumeHandoff, plain): lock-free, no
+  \* Completion-time reclaim (ActivationGate.TryTakeHandoff, plain): lock-free, no
   \* activationTurn claim (a foreign resident may hold the activationTurn). Can win the word out
   \* from under an empty-edge handoff that already CLAIMED (the double-bail); both then
   \* release the same -gen, CAS-if-mine. Completing without activation is
   \* This is permitted: the invariant is at most once, not always once.
   \* ClearExecutingItem ordering: the reclaim PRECEDES completion-publication;
   \* a gated body cannot reach it before activation (sync body blocked).
-  /\ deferredItem = i /\ localDeferredGeneration # NONE
+  /\ handoffItem = i /\ localHandoffGeneration # NONE
   /\ (executionKind[i] = "self" \/ activationPerformed[i])
-  \* ActivationGate.TryConsumeHandoff uses only a word CAS: the plain
+  \* ActivationGate.TryTakeHandoff uses only a word CAS: the plain
   \* consume never touches the activationTurn - the -gen release is a COMPLETION/RETIRE
   \* property (RetireItem ownedTurn -> the claim path's itemGeneration-matched
   \* release-if-mine). Bundling the release here freed a still-live gated item's
-  \* grant pre-completion and the stop re-granted (the 102k-state CE).
+  \* turn before completion and let the stop assign it again (the 102k-state CE).
   /\ UNCHANGED activationTurn
-  /\ localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE
-  /\ deferralGranted' = TRUE
+  /\ localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE
+  /\ handoffClaimed' = TRUE
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationPerformed,
                  executionKind, faultDoubleActivate, executorPc, executorItem, openedEmptyEdge, passPc, passSlotSeen,
@@ -742,7 +742,7 @@ PropagateDeliveryArmClear ==
   /\ visibleDeliveryArmItem' = localDeliveryArmItem
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, advanceOwner, advancePending, executorPc, executorItem, passPc,
-                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 (* ------------------- the walk: licensed claim (composed) ------------------ *)
 \* InFlightStore's queue-first, slot-second observation boundary.
@@ -751,14 +751,14 @@ PassReadFirstStoreTier(t) ==
   /\ passQueueSeen' = [passQueueSeen EXCEPT ![t] = QueueHead] /\ UNCHANGED passSlotSeen
   /\ passPc' = [passPc EXCEPT ![t] = "readSecondTier"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
-                 completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorPc, executorItem, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorPc, executorItem, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 PassReadSecondStoreTier(t) ==
   /\ passPc[t] = "readSecondTier"
   /\ passSlotSeen' = [passSlotSeen EXCEPT ![t] = slot] /\ UNCHANGED passQueueSeen
   /\ passPc' = [passPc EXCEPT ![t] = "decideHeadClaim"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
-                 completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorPc, executorItem, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, executorPc, executorItem, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The composed decision: InFlightStore legs + ItemTenure's gate + consume+tear.
 \* Gate placement per the code: AFTER the completionPublished check, BEFORE any mutation.
@@ -778,8 +778,8 @@ PassDecideHeadClaim(t) ==
             /\ passPc' = [passPc EXCEPT ![t] = IF inFlightCount > 0 THEN "phantomReadFirstTier" ELSE "emptyEdgeLock"]
             /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch,
                            completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner,
-                           advancePending, fifoViolation, activationTurn, activationPerformed, localDeferredGeneration, visibleDeferredGeneration,
-                           deferralGranted, edgeLockOwner, faultDoubleActivate, executionKind,
+                           advancePending, fifoViolation, activationTurn, activationPerformed, localHandoffGeneration, visibleHandoffGeneration,
+                           handoffClaimed, edgeLockOwner, faultDoubleActivate, executionKind,
                            faultTokenRead>>
      ELSE IF ~completionPublished[target]
        THEN \* the stop: frontier moves here — arm, register, assign and activate
@@ -792,22 +792,22 @@ PassDecideHeadClaim(t) ==
                       /\ localDeliveryArmItem' = target /\ visibleDeliveryArmItem' = target
             /\ IF activationTurn = NONE
                  THEN \* Only a free activationTurn is assignable (write discipline:
-                      \* a live activationTurn - resident seq OR a grant's -gen - declines).
+                      \* a live activationTurn - resident sequence or provisional generation - declines).
                       /\ activationTurn' = target
                       /\ faultDoubleActivate' = (faultDoubleActivate \/ activationPerformed[target])
                       /\ activationPerformed' = [activationPerformed EXCEPT ![target] = TRUE]
                  ELSE UNCHANGED <<activationTurn, activationPerformed, faultDoubleActivate>>
             /\ passPc' = [passPc EXCEPT ![t] = "exitPass"]
             /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch,
-                           completionConsumed, completionDispatchTorn, advanceOwner, advancePending, fifoViolation, localDeferredGeneration, visibleDeferredGeneration,
-                           deferralGranted, edgeLockOwner, executionKind>>
+                           completionConsumed, completionDispatchTorn, advanceOwner, advancePending, fifoViolation, localHandoffGeneration, visibleHandoffGeneration,
+                           handoffClaimed, edgeLockOwner, executionKind>>
      ELSE IF HeadDeliveryPending
        THEN \* gated decline: no mutation; bail out (lossless via deposit/serve).
             /\ passPc' = [passPc EXCEPT ![t] = "releasePhantomEdge"]
             /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch,
                            completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner,
-                           advancePending, fifoViolation, activationTurn, activationPerformed, localDeferredGeneration, visibleDeferredGeneration,
-                           deferralGranted, edgeLockOwner, faultDoubleActivate, executionKind,
+                           advancePending, fifoViolation, activationTurn, activationPerformed, localHandoffGeneration, visibleHandoffGeneration,
+                           handoffClaimed, edgeLockOwner, faultDoubleActivate, executionKind,
                            faultTokenRead>>
      ELSE \* CLAIM + CONSUME (GetResult + reset): the tear fact if phase 2 is
           \* in flight or a registered-completionPublished tenure has not begun it.
@@ -819,36 +819,36 @@ PassDecideHeadClaim(t) ==
                            \* the token is completionConsumed here. -> recassign (tail keying).
                            /\ slot' = NONE /\ UNCHANGED <<overflowQueue, queuePublished>>
                            /\ headTicket' = headTicket + 1
-                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleDeferredGeneration, completionDispatchTorn>>
+                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleHandoffGeneration, completionDispatchTorn>>
                            /\ completionConsumed' = [completionConsumed EXCEPT ![sSeen] = TRUE]
                            /\ fifoViolation' = (fifoViolation \/ (\E jj \in 1..N : jj < sSeen /\ (slot = jj \/ (\E kk \in 1..Len(overflowQueue) : overflowQueue[kk] = jj))))
                       ELSE /\ slot' = NONE /\ UNCHANGED <<overflowQueue, queuePublished>>
                            /\ headTicket' = headTicket + 1
-                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleDeferredGeneration>>
+                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleHandoffGeneration>>
                            /\ completionConsumed' = [completionConsumed EXCEPT ![sSeen] = TRUE]
                            /\ completionDispatchTorn' = [completionDispatchTorn EXCEPT ![sSeen] =
                                         (completionDispatch[sSeen] = "inflight")
                                         \/ (completionCallbackRegistered[sSeen] /\ completionDispatch[sSeen] = "none")]
                            /\ fifoViolation' = (fifoViolation \/ (\E jj \in 1..N : jj < sSeen /\ (slot = jj \/ (\E kk \in 1..Len(overflowQueue) : overflowQueue[kk] = jj))))
                       ELSE /\ UNCHANGED <<slot, overflowQueue, queuePublished, headTicket, inFlightCount,
-                                          completionConsumed, completionDispatchTorn, fifoViolation, edgeLockOwner, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted>>
+                                          completionConsumed, completionDispatchTorn, fifoViolation, edgeLockOwner, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed>>
                ELSE IF QueueHead = qSeen
                       THEN IF recover /\ qSeen = 2 /\ ~recoveryAttempted[qSeen]
                       THEN /\ overflowQueue' = SubSeq(overflowQueue, 2, Len(overflowQueue)) /\ UNCHANGED <<slot, queuePublished>>
                            /\ headTicket' = headTicket + 1
-                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleDeferredGeneration, completionDispatchTorn>>
+                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleHandoffGeneration, completionDispatchTorn>>
                            /\ completionConsumed' = [completionConsumed EXCEPT ![qSeen] = TRUE]
                            /\ fifoViolation' = (fifoViolation \/ (\E jj \in 1..N : jj < qSeen /\ (slot = jj \/ (\E kk \in 1..Len(overflowQueue) : overflowQueue[kk] = jj))))
                       ELSE /\ overflowQueue' = SubSeq(overflowQueue, 2, Len(overflowQueue)) /\ UNCHANGED <<slot, queuePublished>>
                            /\ headTicket' = headTicket + 1
-                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleDeferredGeneration>>
+                           /\ UNCHANGED <<inFlightCount, visibleDeliveryArmItem, visibleHandoffGeneration>>
                            /\ completionConsumed' = [completionConsumed EXCEPT ![qSeen] = TRUE]
                            /\ completionDispatchTorn' = [completionDispatchTorn EXCEPT ![qSeen] =
                                         (completionDispatch[qSeen] = "inflight")
                                         \/ (completionCallbackRegistered[qSeen] /\ completionDispatch[qSeen] = "none")]
                            /\ fifoViolation' = (fifoViolation \/ (\E jj \in 1..N : jj < qSeen /\ (slot = jj \/ (\E kk \in 1..Len(overflowQueue) : overflowQueue[kk] = jj))))
                       ELSE /\ UNCHANGED <<slot, overflowQueue, queuePublished, headTicket, inFlightCount,
-                                          completionConsumed, completionDispatchTorn, fifoViolation, edgeLockOwner, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted>>
+                                          completionConsumed, completionDispatchTorn, fifoViolation, edgeLockOwner, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed>>
           \* The implementation's retirement order (RetireItemDeferred): release the
           \* owned activationTurn, run CompleteItem (arbitrary
           \* policy - the LARGE window), only then decrement the store count.
@@ -860,13 +860,13 @@ PassDecideHeadClaim(t) ==
                ELSE LET tgt == IF slot' # slot THEN passSlotSeen[t] ELSE passQueueSeen[t] IN
                     IF recover /\ tgt = 2 /\ ~recoveryAttempted[tgt] THEN "recoveryLock" ELSE "releaseActivationTurn"]
           /\ UNCHANGED <<completionPublished, completionDispatch, completionCallbackRegistered, localDeliveryArmItem,
-                         advanceOwner, advancePending, activationPerformed, localDeferredGeneration, deferralGranted,
+                         advanceOwner, advancePending, activationPerformed, localHandoffGeneration, handoffClaimed,
                          edgeLockOwner, faultDoubleActivate, faultTokenRead>>
   /\ passSlotSeen' = [passSlotSeen EXCEPT ![t] =
        IF passPc'[t] \in {"releaseActivationTurn", "recoveryLock"} /\ slot' # slot THEN @ ELSE NONE]
   /\ passQueueSeen' = [passQueueSeen EXCEPT ![t] =
        IF passPc'[t] \in {"releaseActivationTurn", "recoveryLock"} /\ overflowQueue' # overflowQueue THEN @ ELSE NONE]
-  /\ UNCHANGED <<executorPc, executorItem, openedEmptyEdge, executionKind, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+  /\ UNCHANGED <<executorPc, executorItem, openedEmptyEdge, executionKind, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Licensed phantom re-peek (Pipeline.Advance): a count-positive peek miss
 \* re-peeks WHILE STILL HOLDING the advance license - the SPSC peek is a
@@ -884,8 +884,8 @@ PassPhantomReadFirstTier(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "phantomReadSecondTier"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 PassPhantomReadSecondTier(t) ==
   /\ passPc[t] = "phantomReadSecondTier"
@@ -893,8 +893,8 @@ PassPhantomReadSecondTier(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "phantomDecide"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 PassPhantomDecide(t) ==
   /\ passPc[t] = "phantomDecide"
@@ -905,8 +905,8 @@ PassPhantomDecide(t) ==
   /\ passQueueSeen' = [passQueueSeen EXCEPT ![t] = NONE]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The owned-activationTurn release: AFTER the claim/dequeue, BEFORE the store decrement
 \* (the RetireItemDeferred order). The window everything downstream must
@@ -921,8 +921,8 @@ PassReleaseActivationTurn(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "decrementInFlightCount"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 
 \* The store-count decrement, AFTER the CompleteItem window (the trel->tdec
@@ -951,8 +951,8 @@ PassDecrementInFlightCount(t) ==
             /\ passPc' = [passPc EXCEPT ![t] = "reacquireLicense"]
   /\ UNCHANGED <<slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, itemGeneration, recoveryAttempted>>
 
 \* The post-release reacquire before the empty-edge handoff (the contestable gap): a rival
 \* fire/committer may have taken the license or deposited; a loss cedes the walk.
@@ -965,8 +965,8 @@ PassTryReacquireLicense(t) ==
             /\ UNCHANGED advanceOwner /\ advancePending' = TRUE /\ passPc' = [passPc EXCEPT ![t] = "off"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* ---- Walk-side recovery (advancer side; monolith RecAssign*/RecAct/RecRetire) ----
 \* The claimed head's completion was a fault verdict: position already dequeued
@@ -986,8 +986,8 @@ PassAcquireRecoveryLock(t) ==
   /\ UNCHANGED <<passSlotSeen, passQueueSeen>>
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 PassPrepareRecoveryReplacement(t) ==
   /\ passPc[t] = "recoveryPrepare"
@@ -1004,8 +1004,8 @@ PassPrepareRecoveryReplacement(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "recoveryActivate"]
   /\ UNCHANGED <<passSlotSeen, passQueueSeen>>
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionDispatchTorn, localDeliveryArmItem, visibleDeliveryArmItem,
-                 advanceOwner, advancePending, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
-                 executorPc, executorItem, openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration>>
+                 advanceOwner, advancePending, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate,
+                 executorPc, executorItem, openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration>>
 
 PassActivateRecoveryReplacement(t) ==
   /\ passPc[t] = "recoveryActivate"
@@ -1016,8 +1016,8 @@ PassActivateRecoveryReplacement(t) ==
   /\ UNCHANGED <<passSlotSeen, passQueueSeen>>
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, edgeLockOwner,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The substitute's retire: the advanceOwner credit returns.
 \* Recovery retirement mirrors the normal split: release
@@ -1032,8 +1032,8 @@ PassRetireRecoveredItem(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "recoveryDecrement"]
   /\ UNCHANGED <<slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, advanceOwner, advancePending, activationPerformed, edgeLockOwner,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The recovery decrement returns the advance-owner credit and performs the same edge fold.
 PassDecrementRecoveredItem(t) ==
@@ -1053,10 +1053,10 @@ PassDecrementRecoveredItem(t) ==
             /\ passPc' = [passPc EXCEPT ![t] = "reacquireLicense"]
   /\ UNCHANGED <<slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, edgeLockOwner, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, itemGeneration, recoveryAttempted>>
 
-\* Empty-edge handoff: after the resident count reaches zero, lock, read the visible deferral, consume and assign
+\* Empty-edge handoff: after the resident count reaches zero, lock, read the visible handoff, consume and assign
 \* activationTurn under the lock; the policy activation runs outside the hold; then exit.
 PassAcquireEmptyEdgeLock(t) ==
   /\ passPc[t] = "emptyEdgeLock"
@@ -1064,34 +1064,34 @@ PassAcquireEmptyEdgeLock(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeObserve"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Empty-edge handoff OBSERVE (the lock, when taken, spans observe+take: instruction
 \* granularity; a fused check-and-take would hide the relevant interleaving).
-PassObserveEmptyEdgeDeferral(t) ==
+PassObserveEmptyEdgeHandoff(t) ==
   /\ passPc[t] = "emptyEdgeObserve"
   \* Recheck while holding the lock (the monolith v1 finding, reproduced by this
   \* composition as the stale-empty-edge handoff face): the idle premise (inFlightCount=0) must be
   \* re-validated inside the lock - an empty-edge handoff entered from a stale zero-count observation
-  \* observation must self-neutralize, or it takes a LATER epoch's deferral
+  \* observation must self-neutralize, or it takes a LATER epoch's handoff
   \* and tramples a live activationTurn.
   \* OBSERVATION (relational Dekker): a retirement pass whose decrement-RMW postdates the
   \* dispatcher's barrier epoch is synchronized and reads the true word; one
   \* whose RMW predates it reads the visible (possibly stale) copy.
   /\ LET obs == IF passDecrementEpoch[t] >= handoffFenceEpoch /\ handoffFenceEpoch > 0
-                  THEN localDeferredGeneration ELSE visibleDeferredGeneration IN
-     IF inFlightCount = 0 /\ obs # NONE /\ ~deferralGranted
+                  THEN localHandoffGeneration ELSE visibleHandoffGeneration IN
+     IF inFlightCount = 0 /\ obs # NONE /\ ~handoffClaimed
        THEN /\ passEmptyEdgeHandoffGeneration' = [passEmptyEdgeHandoffGeneration EXCEPT ![t] = obs]      \* generation pin
-            /\ passEmptyEdgeHandoffItem' = [passEmptyEdgeHandoffItem EXCEPT ![t] = deferredItem]
+            /\ passEmptyEdgeHandoffItem' = [passEmptyEdgeHandoffItem EXCEPT ![t] = handoffItem]
             /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeTurnClaim"]
        ELSE /\ UNCHANGED <<passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem>>
             /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeUnlock"]
   /\ UNCHANGED edgeLockOwner
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 PassReleaseEmptyEdgeLock(t) ==
   /\ passPc[t] = "emptyEdgeUnlock"
@@ -1099,43 +1099,43 @@ PassReleaseEmptyEdgeLock(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "exitPass"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationTurn, activationPerformed,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate, executorPc, executorItem,
-                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* Empty-edge handoff take: TryClaimTurnGrant declines any live activation turn.
+\* Empty-edge handoff take: TryClaimProvisionalTurn declines any live activation turn.
 PassClaimEmptyEdgeTurn(t) ==
   /\ passPc[t] = "emptyEdgeTurnClaim"
   /\ IF activationTurn # NONE
        THEN \* Layer 2 claims only if free: nothing taken, nothing trampled.
-            /\ UNCHANGED <<activationTurn, deferralGranted, localDeferredGeneration, visibleDeferredGeneration, deferredItem>>
+            /\ UNCHANGED <<activationTurn, handoffClaimed, localHandoffGeneration, visibleHandoffGeneration, handoffItem>>
             /\ edgeLockOwner' = "0"
             /\ passPc' = [passPc EXCEPT ![t] = "exitPass"]
        ELSE \* CLAIM the activationTurn as -(pinned gen) FIRST (the shipped order), then the
             \* generation-pinned consume as its own step - the plain reclaim can interleave
             \* between them (the double-bail class).
             /\ activationTurn' = -passEmptyEdgeHandoffGeneration[t]
-            /\ UNCHANGED <<deferralGranted, localDeferredGeneration, visibleDeferredGeneration, deferredItem>>
+            /\ UNCHANGED <<handoffClaimed, localHandoffGeneration, visibleHandoffGeneration, handoffItem>>
             /\ UNCHANGED edgeLockOwner
-            /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeDeferralConsume"]
+            /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeHandoffTake"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, activationPerformed,
                  executionKind, faultDoubleActivate, executorPc, executorItem, openedEmptyEdge, passSlotSeen, passQueueSeen,
                  fifoViolation, faultTokenRead, lateCompletionCallback, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The empty-edge handoff's gen-pinned consume, SEPARATE from its claim (double-bail window).
-PassConsumeEmptyEdgeDeferral(t) ==
-  /\ passPc[t] = "emptyEdgeDeferralConsume"
-  /\ IF localDeferredGeneration = passEmptyEdgeHandoffGeneration[t] /\ localDeferredGeneration # NONE
+PassTakeEmptyEdgeHandoff(t) ==
+  /\ passPc[t] = "emptyEdgeHandoffTake"
+  /\ IF localHandoffGeneration = passEmptyEdgeHandoffGeneration[t] /\ localHandoffGeneration # NONE
        THEN \* consume wins for the pinned generation
-            /\ deferralGranted' = TRUE
-            /\ localDeferredGeneration' = NONE /\ visibleDeferredGeneration' = NONE /\ deferredItem' = NONE
+            /\ handoffClaimed' = TRUE
+            /\ localHandoffGeneration' = NONE /\ visibleHandoffGeneration' = NONE /\ handoffItem' = NONE
             /\ edgeLockOwner' = "0"
             /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeActivate"]
             /\ UNCHANGED activationTurn
        ELSE \* consume LOST (recycled epoch under pin, or the reclaim ate it):
             \* release the -gen claim, CAS-if-mine.
             /\ activationTurn' = IF activationTurn = -passEmptyEdgeHandoffGeneration[t] THEN NONE ELSE activationTurn
-            /\ UNCHANGED <<deferralGranted, localDeferredGeneration, visibleDeferredGeneration, deferredItem>>
+            /\ UNCHANGED <<handoffClaimed, localHandoffGeneration, visibleHandoffGeneration, handoffItem>>
             /\ edgeLockOwner' = "0"
             /\ passPc' = [passPc EXCEPT ![t] = "exitPass"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
@@ -1152,8 +1152,8 @@ PassActivateEmptyEdgeItem(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "emptyEdgeRecordResolution"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, executorPc, executorItem, openedEmptyEdge,
-                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, deferredItem,
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, executorPc, executorItem, openedEmptyEdge,
+                 passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem,
                  generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* The policy call returns; the resolution stamp is written afterward -
@@ -1166,31 +1166,31 @@ PassRecordEmptyEdgeResolution(t) ==
   /\ passPc' = [passPc EXCEPT ![t] = "exitPass"]
   /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
                  completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn,
-                 activationPerformed, executionKind, localDeferredGeneration, visibleDeferredGeneration, deferralGranted, faultDoubleActivate,
+                 activationPerformed, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate,
                  executorPc, executorItem, openedEmptyEdge, passSlotSeen, passQueueSeen, fifoViolation, faultTokenRead,
-                 lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem,
+                 lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem,
                  faultConcurrentActivation, itemGeneration, recoveryAttempted>>
 
 \* Bail: release-or-serve, then the one-shot re-peek (the two-sided protocol).
 PassReleaseAfterPhantomEdge(t) ==
   /\ passPc[t] = "releasePhantomEdge"
-  /\ visibleDeliveryArmItem' = localDeliveryArmItem /\ visibleDeferredGeneration' = localDeferredGeneration
+  /\ visibleDeliveryArmItem' = localDeliveryArmItem /\ visibleHandoffGeneration' = localHandoffGeneration
   /\ IF advancePending
        THEN /\ advancePending' = FALSE /\ advanceOwner' = advanceOwner
             /\ passPc' = [passPc EXCEPT ![t] = "readFirstTier"]
        ELSE /\ advanceOwner' = "0" /\ advancePending' = advancePending
             /\ passPc' = [passPc EXCEPT ![t] = "off"]
-  /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, executorPc, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+  /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, executorPc, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 PassExit(t) ==
   /\ passPc[t] = "exitPass"
-  /\ visibleDeliveryArmItem' = localDeliveryArmItem /\ visibleDeferredGeneration' = localDeferredGeneration
+  /\ visibleDeliveryArmItem' = localDeliveryArmItem /\ visibleHandoffGeneration' = localHandoffGeneration
   /\ IF advanceOwner = t
        THEN IF advancePending
               THEN /\ advancePending' = FALSE /\ advanceOwner' = advanceOwner /\ passPc' = [passPc EXCEPT ![t] = "readFirstTier"]
               ELSE /\ advanceOwner' = "0" /\ advancePending' = advancePending /\ passPc' = [passPc EXCEPT ![t] = "off"]
        ELSE /\ UNCHANGED <<advanceOwner, advancePending>> /\ passPc' = [passPc EXCEPT ![t] = "off"]
-  /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, executorPc, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localDeferredGeneration, deferralGranted, faultDoubleActivate, faultTokenRead, lateCompletionCallback, deferredItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+  /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed, completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, executorPc, executorItem, passSlotSeen, passQueueSeen, fifoViolation, openedEmptyEdge, edgeLockOwner, activationTurn, activationPerformed, executionKind, localHandoffGeneration, handoffClaimed, faultDoubleActivate, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 AllDone ==
   \* completionConsumed-all, not headTicket=N: direct-retired items never consume a FIFO
@@ -1198,18 +1198,18 @@ AllDone ==
   /\ (\A i \in 1..N : completionConsumed[i]) /\ executorPc = "off"
   /\ \A t \in RetirementPasses : passPc[t] = "off"
   /\ \A i \in 1..N : completionDispatch[i] \in {"none", "acquired"}
-  /\ localDeferredGeneration = NONE
+  /\ localHandoffGeneration = NONE
 Finished == AllDone /\ UNCHANGED vars
 
 Next ==
-  \/ ExecutorDispatch \/ ExecutorClaimElidedTurn \/ ExecutorActivateElidedItem \/ ExecutorConsumeOwnDeferral \/ ExecutorDirectRetire \/ ExecutorFenceDeferralPublication \/ PropagateDeferredActivation \/ ExecutorReadInFlightCount \/ ExecutorAwaitActivationGrant \/ ExecutorAcquireSelfGrantLock \/ ExecutorObserveSelfGrant \/ ExecutorClaimSelfGrantTurn \/ ExecutorConsumeSelfGrant \/ ExecutorActivateSelfGrantedItem
-  \/ ExecutorDiscoverRecovery \/ ExecutorReclaimFailedDeferral \/ ExecutorAwaitEmptyEdgeResolution \/ ExecutorActivateRecovery \/ ExecutorCommitInheritedRecoveryGrant \/ ExecutorRepublishRecoveryDeferral \/ ExecutorResolvePriorDeferral \/ StoreIncrementInFlightCount \/ StorePublishCommittedItem \/ ExecutorPrepareEmptyEdgeActivation \/ ExecutorAcquireAdvanceLicense \/ ExecutorAssignAndPublishAtEmptyEdge \/ ExecutorAttachEmptyEdgeCallback \/ ExecutorReleaseAdvanceLicense \/ ExecutorAcquireEmptyEdgeLock \/ ExecutorAssignAtEmptyEdge \/ ExecutorActivateEmptyEdgeItem \/ ExecutorReadAdvanceLicense \/ ExecutorFinishOwnedPass \/ ExecutorNext
+  \/ ExecutorDispatch \/ ExecutorClaimElidedTurn \/ ExecutorActivateElidedItem \/ ExecutorTakeOwnHandoff \/ ExecutorDirectRetire \/ ExecutorFenceHandoffPublication \/ PropagateHandoff \/ ExecutorReadInFlightCount \/ ExecutorAwaitHandoffResolution \/ ExecutorAcquireSelfClaimLock \/ ExecutorObserveSelfClaim \/ ExecutorClaimProvisionalTurn \/ ExecutorTakeSelfHandoff \/ ExecutorActivateSelfClaimedItem
+  \/ ExecutorDiscoverRecovery \/ ExecutorReclaimFailedHandoff \/ ExecutorAwaitEmptyEdgeResolution \/ ExecutorActivateRecovery \/ ExecutorCommitInheritedRecoveryTurn \/ ExecutorRepublishRecoveryHandoff \/ ExecutorResolvePriorHandoff \/ StoreIncrementInFlightCount \/ StorePublishCommittedItem \/ ExecutorPrepareEmptyEdgeActivation \/ ExecutorAcquireAdvanceLicense \/ ExecutorAssignAndPublishAtEmptyEdge \/ ExecutorAttachEmptyEdgeCallback \/ ExecutorReleaseAdvanceLicense \/ ExecutorAcquireEmptyEdgeLock \/ ExecutorAssignAtEmptyEdge \/ ExecutorActivateEmptyEdgeItem \/ ExecutorReadAdvanceLicense \/ ExecutorFinishOwnedPass \/ ExecutorNext
   \/ \E i \in 1..N : PublishCompletion(i) \/ BeginCompletionDispatch(i) \/ DeliverCompletionCallback(i) \/ CompletionCallbackAcquireOrDeposit(i) \/ ReclaimCompletionCallback(i)
   \/ PropagateDeliveryArmClear
   \/ \E t \in RetirementPasses : PassReadFirstStoreTier(t) \/ PassReadSecondStoreTier(t) \/ PassDecideHeadClaim(t) \/ PassReleaseAfterPhantomEdge(t) \/ PassPhantomReadFirstTier(t) \/ PassPhantomReadSecondTier(t) \/ PassPhantomDecide(t) \/ PassReleaseActivationTurn(t) \/ PassDecrementInFlightCount(t) \/ PassTryReacquireLicense(t) \/ PassDecrementRecoveredItem(t)
                           \/ PassAcquireRecoveryLock(t) \/ PassPrepareRecoveryReplacement(t) \/ PassActivateRecoveryReplacement(t) \/ PassRetireRecoveredItem(t)
                           \/ PassExit(t)
-                          \/ PassAcquireEmptyEdgeLock(t) \/ PassObserveEmptyEdgeDeferral(t) \/ PassReleaseEmptyEdgeLock(t) \/ PassClaimEmptyEdgeTurn(t) \/ PassConsumeEmptyEdgeDeferral(t) \/ PassActivateEmptyEdgeItem(t) \/ PassRecordEmptyEdgeResolution(t)
+                          \/ PassAcquireEmptyEdgeLock(t) \/ PassObserveEmptyEdgeHandoff(t) \/ PassReleaseEmptyEdgeLock(t) \/ PassClaimEmptyEdgeTurn(t) \/ PassTakeEmptyEdgeHandoff(t) \/ PassActivateEmptyEdgeItem(t) \/ PassRecordEmptyEdgeResolution(t)
   \/ Finished
 
 Spec == Init /\ [][Next]_vars
@@ -1253,8 +1253,8 @@ ActivationTurnNamesLiveTenure ==
          /\ passPc[t] \in {"recoveryLock", "recoveryPrepare", "recoveryActivate", "awaitEmptyEdgeResolution"}
          /\ (passSlotSeen[t] = activationTurn \/ passQueueSeen[t] = activationTurn)
 
-\* Deferral staleness (composed Dekker): local/visible divergence is one-sided.
-DeferralVisibilityCannotNameDifferentGeneration == (visibleDeferredGeneration # localDeferredGeneration) => (visibleDeferredGeneration = NONE \/ localDeferredGeneration = NONE)
+\* Handoff visibility (composed Dekker): local/visible divergence is one-sided.
+HandoffVisibilityCannotNameDifferentGeneration == (visibleHandoffGeneration # localHandoffGeneration) => (visibleHandoffGeneration = NONE \/ localHandoffGeneration = NONE)
 
 \* The task contract: no attach ever touches a completionConsumed token (v2 TaskContractRespected).
 CompletionNeverReadsRetiredTenure == ~faultTokenRead

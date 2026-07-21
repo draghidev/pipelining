@@ -38,6 +38,7 @@ struct InFlightStore<T>
 
     /// Zero is exact; a positive value may briefly precede publication of its item.
     public int Count => CountOf(Volatile.Read(ref _countWord));
+    public bool HasAdvanceOwner => IsAdvanceHeld(Volatile.Read(ref _countWord));
 
     /// Once the overflow queue is published, the store remains escalated across reuse.
     public bool IsEscalated => Volatile.Read(ref _queue) is not null;

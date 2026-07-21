@@ -132,7 +132,7 @@ PublishTaskCompletion(i) ==
    CHECKED property, never a guard.
    =========================================================================== *)
 
-\* Pre-escalation slot drain (DrainSlotInline via TryClaimSlotForDrain), modeled
+\* Pre-escalation slot drain (DrainSlotInline via TryClaimCompletedSlot), modeled
 \* as a two-step CAS.
 \* Step 1: CAS occupied -> consuming.
 ClaimSlotHead ==

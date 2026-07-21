@@ -3,43 +3,38 @@ using System.Runtime.CompilerServices;
 
 namespace Draghi.Pipelining;
 
-/// Owns the unique activation turn and the executor-to-empty-edge deferral handoff.
-struct ActivationGate<T>
+/// Owns the unique activation turn and the versioned handoff of deferred activation.
+struct ActivationGate<T>()
 {
-    const long DeferredStateMask = 1;
-    const long NoDeferral = 0;
-    const long Deferred = 1;
+    const long HandoffStateMask = 1;
+    const long NoHandoff = 0;
+    const long Handoff = 1;
 
-    readonly EdgeLock _edgeLock;
     long _turn;
-    long _grantGeneration;
+    long _generation;
     long _resolvedHandoffGeneration;
-    long _deferredWord;
-    T _deferredItem = default!;
+    long _handoffWord;
+    T _handoffItem = default!;
 
-    static long StateOf(long word) => word & DeferredStateMask;
+    static long StateOf(long word) => word & HandoffStateMask;
     static long GenerationOf(long word) => word >> 1;
 
-    public ActivationGate()
-    {
-        _edgeLock = new EdgeLock();
-    }
+    public EdgeLock EdgeLock { get; } = new();
 
-    public EdgeLock EdgeLock => _edgeLock;
     public long Turn => Volatile.Read(ref _turn);
     public bool HasTurn => Volatile.Read(ref _turn) != 0;
-    public bool HandoffVisible => StateOf(Volatile.Read(ref _deferredWord)) == Deferred;
+    public bool HasHandoff => StateOf(Volatile.Read(ref _handoffWord)) == Handoff;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public long NextGrantGeneration() => Interlocked.Increment(ref _grantGeneration);
+    public long NextGeneration() => Interlocked.Increment(ref _generation);
 
-    public bool TryClaimGrant(long generation)
+    public bool TryClaimProvisionalTurn(long generation)
     {
         Debug.Assert(generation >= 1);
         return Interlocked.CompareExchange(ref _turn, -generation, 0) == 0;
     }
 
-    public long ClaimOrInherit(long generation)
+    public long ClaimOrInheritProvisionalTurn(long generation)
     {
         Debug.Assert(generation >= 1);
         var turn = Volatile.Read(ref _turn);
@@ -48,31 +43,31 @@ struct ActivationGate<T>
         return Interlocked.CompareExchange(ref _turn, -generation, 0) == 0 ? generation : 0;
     }
 
-    public bool AssignAtCommit(long generation, long tenure)
+    public bool CommitTurn(long generation, long sequence)
     {
         var turn = Volatile.Read(ref _turn);
         if (generation != 0 && turn == -generation)
         {
-            Volatile.Write(ref _turn, tenure);
+            Volatile.Write(ref _turn, sequence);
             return true;
         }
         Debug.Assert(turn == 0,
-            $"Edge commit over a foreign activation turn: turn={turn}, generation={generation}, tenure={tenure}.");
-        Volatile.Write(ref _turn, tenure);
+            $"Edge commit over a foreign activation turn: turn={turn}, generation={generation}, sequence={sequence}.");
+        Volatile.Write(ref _turn, sequence);
         return false;
     }
 
-    public void AssignAtStop(long tenure)
+    public void AssignTurnAtStop(long sequence)
     {
         Debug.Assert(Volatile.Read(ref _turn) == 0, "Stop assigned over a live activation turn.");
-        Volatile.Write(ref _turn, tenure);
+        Volatile.Write(ref _turn, sequence);
     }
 
-    public void AssignAtRecovery(long tenure)
+    public void AssignTurnForRecovery(long sequence)
     {
         var turn = Volatile.Read(ref _turn);
-        Debug.Assert(turn == 0 || turn == tenure, "Recovery assigned over a foreign activation turn.");
-        Volatile.Write(ref _turn, tenure);
+        Debug.Assert(turn == 0 || turn == sequence, "Recovery assigned over a foreign activation turn.");
+        Volatile.Write(ref _turn, sequence);
     }
 
     public bool Release(long owner)
@@ -81,45 +76,45 @@ struct ActivationGate<T>
         return Interlocked.CompareExchange(ref _turn, 0, owner) == owner;
     }
 
-    /// Publishes an executor-owned activation deferral. The item precedes the release publication
-    /// of its versioned word, binding an empty-edge observer to this exact placement.
-    public long PlaceHandoff(T item)
+    /// Publishes an executor-owned handoff. The item is written before its versioned publication,
+    /// binding an empty-edge observer to that placement.
+    public long PublishHandoff(T item)
     {
-        Debug.Assert(StateOf(Volatile.Read(ref _deferredWord)) == NoDeferral,
+        Debug.Assert(StateOf(Volatile.Read(ref _handoffWord)) == NoHandoff,
             "Activation handoff published over an unresolved handoff.");
-        _deferredItem = item;
-        var generation = Interlocked.Increment(ref _grantGeneration);
-        Volatile.Write(ref _deferredWord, (generation << 1) | Deferred);
+        _handoffItem = item;
+        var generation = Interlocked.Increment(ref _generation);
+        Volatile.Write(ref _handoffWord, (generation << 1) | Handoff);
         return generation;
     }
 
-    public void ClearStaleHandoffItem()
+    public void ClearConsumedHandoffItem()
     {
-        if (!HandoffVisible && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-            _deferredItem = default!;
+        if (!HasHandoff && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
+            _handoffItem = default!;
     }
 
-    public bool TryConsumeHandoff()
+    public bool TryTakeHandoff()
     {
         while (true)
         {
-            var word = Volatile.Read(ref _deferredWord);
-            if (StateOf(word) != Deferred)
+            var word = Volatile.Read(ref _handoffWord);
+            if (StateOf(word) != Handoff)
                 return false;
-            if (Interlocked.CompareExchange(ref _deferredWord,
-                    GenerationOf(word) << 1 | NoDeferral, word) == word)
+            if (Interlocked.CompareExchange(ref _handoffWord,
+                    GenerationOf(word) << 1 | NoHandoff, word) == word)
                 return true;
         }
     }
 
-    /// Dispatch-time reclaim follows the same claim-before-consume order as the empty-edge pass.
+    /// Dispatch-time reclaim follows the same claim-before-take order as the empty-edge pass.
     /// Its callers establish that no resident activation turn can be live.
     public bool TryReclaimHandoff(long generation)
     {
         Debug.Assert(generation >= 1);
-        if (!TryClaimGrant(generation))
+        if (!TryClaimProvisionalTurn(generation))
             return false;
-        if (TryConsumeHandoff(generation))
+        if (TryTakeHandoff(generation))
             return true;
         Release(-generation);
         return false;
@@ -127,25 +122,25 @@ struct ActivationGate<T>
 
     public bool TryPeekHandoff(out long generation, out T item)
     {
-        var word = Volatile.Read(ref _deferredWord);
-        if (StateOf(word) != Deferred)
+        var word = Volatile.Read(ref _handoffWord);
+        if (StateOf(word) != Handoff)
         {
             generation = 0;
             item = default!;
             return false;
         }
         generation = GenerationOf(word);
-        item = _deferredItem;
+        item = _handoffItem;
         return true;
     }
 
-    public bool TryConsumeHandoff(long generation)
+    public bool TryTakeHandoff(long generation)
     {
-        var word = Volatile.Read(ref _deferredWord);
-        if (StateOf(word) != Deferred || GenerationOf(word) != generation)
+        var word = Volatile.Read(ref _handoffWord);
+        if (StateOf(word) != Handoff || GenerationOf(word) != generation)
             return false;
-        return Interlocked.CompareExchange(ref _deferredWord,
-            generation << 1 | NoDeferral, word) == word;
+        return Interlocked.CompareExchange(ref _handoffWord,
+            generation << 1 | NoHandoff, word) == word;
     }
 
     public void MarkHandoffResolved(long generation)
@@ -157,16 +152,16 @@ struct ActivationGate<T>
     public void Reset()
     {
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-            _deferredItem = default!;
+            _handoffItem = default!;
         var turn = Volatile.Read(ref _turn);
         Debug.Assert(turn == 0, $"Activation turn still live at reset: {turn}.");
-        Debug.Assert(StateOf(Volatile.Read(ref _deferredWord)) == NoDeferral);
+        Debug.Assert(StateOf(Volatile.Read(ref _handoffWord)) == NoHandoff);
     }
 
     internal string DebugWordStates()
     {
         var turn = Volatile.Read(ref _turn);
-        var deferred = Volatile.Read(ref _deferredWord);
-        return $"turn={(turn < 0 ? $"grant(g{-turn})" : turn.ToString())},handoff={(StateOf(deferred) == Deferred ? $"deferred(g{GenerationOf(deferred)})" : "none")}";
+        var handoff = Volatile.Read(ref _handoffWord);
+        return $"turn={(turn < 0 ? $"provisional(g{-turn})" : turn.ToString())},handoff={(StateOf(handoff) == Handoff ? $"published(g{GenerationOf(handoff)})" : "none")}";
     }
 }

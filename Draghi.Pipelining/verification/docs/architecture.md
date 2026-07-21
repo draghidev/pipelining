@@ -45,12 +45,12 @@ Owns the unique activation turn:
 
 - empty-edge assignment under the edge lock;
 - resident-head activation by a retirement pass;
-- dispatcher self-grant;
-- activation-deferral publication and resolution;
+- dispatcher provisional-turn claim;
+- activation-hand-off publication and resolution;
 - the empty-edge handoff between the dispatcher and the final retirement pass;
 - shared-turn arbitration and activation-before-publication ordering.
 
-The empty-edge handoff resolves a specific activation deferral at the resident-count transition to zero.
+The empty-edge handoff resolves a specific activation handoff at the resident-count transition to zero.
 
 ## ItemTaskGates
 
@@ -74,7 +74,7 @@ Composes the component contracts with:
 - dispatcher and retirement-pass activation races;
 - execution-side and pass-side recovery;
 - generation-pinned recovery arbitration;
-- weak visibility of the delivery-arm clear and activation deferral;
+- weak visibility of the delivery-arm clear and activation handoff;
 - empty-edge handoff ordering.
 
 The composition reduces concepts per component, not transition count. Its purpose is to prove that individually sensible protocols still satisfy their guarantees when their instruction boundaries interleave.
@@ -85,5 +85,5 @@ Names describe the owned fact or transition. In particular:
 
 - `PassResolveEmptyEdgeHandoff` names the zero-resident transition;
 - `completionCallbackRegistered` names the live registration;
-- `ExecutorFenceDeferralPublication` names the ordering edge;
+- `ExecutorFenceHandoffPublication` names the ordering edge;
 - `ClaimerReadFirstTier` names the observed storage tier.

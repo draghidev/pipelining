@@ -36,10 +36,10 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // being committed elsewhere. Without yielding it here, heartbeat-style
                     // consumers can't see the item during dispatch (waiting-body abort propagation
                     // needs this). Volatile.Read pairs with the executor's Volatile.Write on
-                    // _hasInFlightItem.
-                    if (Volatile.Read(ref _pipeline._hasInFlightItem) && _pipeline._executingItem is { } inFlight)
+                    // _executingItemVisible.
+                    if (Volatile.Read(ref _pipeline._executingItemVisible) && _pipeline._executingItem is { } executing)
                     {
-                        Current = inFlight;
+                        Current = executing;
                         return true;
                     }
                     goto case 1;

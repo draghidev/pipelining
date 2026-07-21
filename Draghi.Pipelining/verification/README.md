@@ -37,7 +37,7 @@ The path supplies configuration identity and category; a config paired with its 
 - **Activation turn**: the unique right to invoke the policy for an item.
 - **Delivery arm**: the item-keyed indication that a completion callback has been registered but has not completed its delivery attempt.
 - **Advance license**: the acquire-or-deposit ownership used to serialize retirement passes.
-- **Empty-edge handoff**: the two-sided resolution between a dispatcher publishing an activation deferral and a retirement pass observing the transition to zero resident items.
+- **Empty-edge handoff**: the two-sided resolution between a dispatcher publishing an activation handoff and a retirement pass observing the transition to zero resident items.
 - **Progress obligation**: work that must eventually be retried or delivered through callback registration, a pending wake, or redrive.
 
 See [architecture.md](docs/architecture.md) for component custody and [fidelity-boundaries.md](docs/fidelity-boundaries.md) for what each model does and does not establish.

@@ -1,48 +1,49 @@
-using System;
 using System.Runtime.CompilerServices;
-using System.Threading;
 
 namespace Draghi.Pipelining;
 
-/// Non-reentrant mutex for short empty-edge sections. State is 0 when free, 1 when held, and 2
-/// when held with possible waiters. Contention lazily allocates the park handle.
-internal sealed class EdgeLock
+/// Non-reentrant mutex for short empty-edge sections. Contention lazily allocates the park handle.
+sealed class EdgeLock
 {
+    const int Unlocked = 0;
+    const int Locked = 1;
+    const int Contended = 2;
+
     int _state;
     AutoResetEvent? _wake;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Enter()
     {
-        if (Interlocked.CompareExchange(ref _state, 1, 0) != 0)
+        if (Interlocked.CompareExchange(ref _state, Locked, Unlocked) != Unlocked)
             EnterSlow();
-    }
 
-    [MethodImpl(MethodImplOptions.NoInlining)]
-    void EnterSlow()
-    {
-        var wake = _wake ?? EnsureWake();
-        // A slow-path winner retains the waiter bit so its release wakes parked rivals. Auto-reset
-        // absorbs a wake delivered between the exchange and WaitOne.
-        while (Interlocked.Exchange(ref _state, 2) != 0)
-            wake.WaitOne();
-    }
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        void EnterSlow()
+        {
+            var wake = _wake ?? EnsureWake();
+            // A slow-path winner retains the waiter bit so its release wakes parked rivals. Auto-reset
+            // absorbs a wake delivered between the exchange and WaitOne.
+            while (Interlocked.Exchange(ref _state, Contended) != Unlocked)
+                wake.WaitOne();
+        }
 
-    AutoResetEvent EnsureWake()
-    {
-        var created = new AutoResetEvent(false);
-        var existing = Interlocked.CompareExchange(ref _wake, created, null);
-        if (existing is null)
-            return created;
-        created.Dispose();
-        return existing;
+        AutoResetEvent EnsureWake()
+        {
+            var created = new AutoResetEvent(false);
+            var existing = Interlocked.CompareExchange(ref _wake, created, null);
+            if (existing is null)
+                return created;
+            created.Dispose();
+            return existing;
+        }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void Exit()
     {
         // The RMW observes a racing waiter publication; a plain store could strand that waiter.
-        if (Interlocked.Exchange(ref _state, 0) == 2)
+        if (Interlocked.Exchange(ref _state, Unlocked) == Contended)
             _wake!.Set();
     }
 }
