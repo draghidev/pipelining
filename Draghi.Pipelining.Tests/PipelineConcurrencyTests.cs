@@ -59,7 +59,7 @@ public class PipelineConcurrencyTests
     // ArgumentOutOfRangeException.
     //
     // The two-phase window is owned entirely by the TEST source (TwoPhaseValueTaskSource) - no
-    // pipeline hooks: the pipeline's own RegisterAdvanceFire performs the real BCL registration
+    // pipeline hooks: the pipeline's own RegisterAdvanceCallback performs the real BCL registration
     // and the real Advance performs the racing GetResult. Deterministic, no stress.
     //
     // ASSERTS THE INVARIANT (the fix's acceptance): while a claimed-completed head's dispatch is
@@ -78,8 +78,8 @@ public class PipelineConcurrencyTests
         var completer = Task.FromResult((Exception?)null);
         try
         {
-            // A commits edge-owned at the empty edge; RegisterAdvanceFire lands the BCL pairing
-            // (s_invokeActionDelegate, _onAdvanceFire) on sourceA - the registration under threat.
+            // A commits edge-owned at the empty edge; RegisterAdvanceCallback lands the BCL pairing
+            // (s_invokeActionDelegate, _onAdvanceCallback) on sourceA - the registration under threat.
             pipeline.Enqueue(itemA).Execute();
             await itemA.WaitForExecutedAsync();
             Assert.IsTrue(sourceA.WaitForRegistration(TimeSpan.FromSeconds(10)), "advance-fire registration on A's task");
@@ -672,16 +672,14 @@ public class PipelineConcurrencyTests
     /// stress test, so recovery's activation/completion machinery gets hammered against the same
     /// elision/empty-edge pass/pending-tail interleavings the rest of the suite already covers.
     ///
-    /// FIXED (2026-07-10): ResolveEmptyEdgeHandoff peeks the deferred item's value (capturing X) before winning
-    /// its claim+consume CAS, and calls ActivateHeadItem(captured, ...) only after releasing the edge
-    /// lock. When RecoverTrailingFailure's/RecoverItem's own consume lost that CAS race to a genuine
-    /// empty-edge pass grant, the code used to activate/complete its substitute immediately, assuming the
-    /// empty-edge pass's grant was "vacuous" - it wasn't; both could fire, unordered. The fix doesn't touch the
+    /// FIXED (2026-07-10): ResolveEmptyEdgeHandoff peeks the published item before taking its
+    /// generation, then activates it after releasing the edge lock. Recovery used to activate its
+    /// substitute immediately after losing that race, allowing both activations to overlap. The fix doesn't touch the
     /// empty-edge pass (eliminating it breaks a genuine liveness case - a stuck backpressure write needs
-    /// something to grant it activation once the store drains) or the eclipse contract (R activating
+    /// activation once the store drains) or the eclipse contract (R activating
     /// while X's activation is live is correct by design). It keys a wait to a dedicated
-    /// per-grant stamp (ActivationGate.MarkHandoffResolved/IsHandoffResolved, written right after the
-    /// empty-edge pass's ActivateHeadItem call returns) so a losing recovery waits for that exact grant's
+    /// per-generation stamp (ActivationGate.MarkHandoffResolved/IsHandoffResolved, written right after the
+    /// empty-edge pass's ActivateHeadItem call returns) so a losing recovery waits for that activation to
     /// activation to have returned before proceeding - turning an unordered race into a clean,
     /// sequential eclipse transfer. See empty-edge pass_recovery_fix_spec.md for the full design history
     /// (five independent reviews) and the rejected alternatives.
@@ -1122,9 +1120,9 @@ public class PipelineConcurrencyTests
     }
 
     /// THE invariant (fixed 2026-07-08): every activation the executor's own dispatch issues -
-    /// inline elision or a self-resolved deferral - must pass preferAsync:false. It precedes
+    /// inline elision or a self-resolved handoff - must pass preferAsync:false. It precedes
     /// ExecuteItemAsync on the very next line of the same dispatch, so nothing has suspended yet
-    /// and there is no continuation to defer; only an advancer grant legitimately passes true.
+    /// and there is no continuation to defer; only an advancer activation legitimately passes true.
     /// The regression fed a downstream bug where the advancer runs a synchronous item's body
     /// inline while another thread spins waiting on it.
     ///
@@ -1133,7 +1131,7 @@ public class PipelineConcurrencyTests
     /// drive inline within the test's own bracketed Enqueue().Execute() call - any item pushed
     /// into a synchronously-driven source is by definition dispatched on the driving thread.
     /// BeforeExecute splits the dispatch activation (asserted) from the post-execute commit walk
-    /// within the same drive (a legitimate true). The self-resolved-deferral case needs the sole
+    /// within the same drive (a legitimate true). The self-resolved-handoff case needs the sole
     /// waiter's retirement to land inside the dispatch's publish-to-recheck window; the spin
     /// rendezvous puts both racers within nanoseconds of each other, which is what makes that
     /// window reachable at all from an inline drive (a bare Task.Run's µs-scale start latency
@@ -1144,7 +1142,7 @@ public class PipelineConcurrencyTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true), runContinuationsAsynchronously: false);
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
-        static void EnqueueUnderExecutorDrive(QueuedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TestPipelineItem item)
+        static void EnqueueUnderExecutorDrive(UnboundedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TestPipelineItem item)
         {
             TestPipelineItem.ExecutorDriveActive = true;
             try { pipeline.Enqueue(item).Execute(); }
@@ -1852,7 +1850,7 @@ public class PipelineConcurrencyTests
 
         static async Task HangAsync(
             int iter, string stage,
-            QueuedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline,
+            UnboundedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline,
             TestPipelineItem[] pile, TestPipelineItem? tail)
         {
             var states = new System.Text.StringBuilder();

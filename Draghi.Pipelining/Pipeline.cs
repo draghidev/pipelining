@@ -121,7 +121,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     /// <summary>Current in-flight count: items dispatched by the executor but not yet completed.
     /// Excludes the source backlog (enqueued but not yet dispatched); a queue-backed pipeline exposes
-    /// that as <see cref="QueuedPipeline{T,TPolicy}.Backlog"/>, and <c>Depth + Backlog</c> is the total
+    /// that as <see cref="UnboundedPipeline{T,TPolicy}.Backlog"/>, and <c>Depth + Backlog</c> is the total
     /// outstanding. Lock-free read, may be stale by the time the caller observes it. Use
     /// <see cref="WaitForEmptyAsync"/> to await empty (both halves zero).</summary>
     public int Depth => _depthState.Depth;
@@ -707,17 +707,17 @@ public static class Pipeline
         return instance;
     }
 
-    /// <summary>Construct a queue-backed pipeline. Returns a <see cref="QueuedPipeline{T,TPolicy}"/> that
-    /// exposes <see cref="QueuedPipeline{T,TPolicy}.Enqueue"/> directly.</summary>
+    /// <summary>Construct a queue-backed pipeline. Returns a <see cref="UnboundedPipeline{T,TPolicy}"/> that
+    /// exposes <see cref="UnboundedPipeline{T,TPolicy}.Enqueue"/> directly.</summary>
     /// <remarks>
     /// The cancellation token is passed to the internally-created source. Pipeline itself stays
     /// CT-free, and the source owns the cancellation lifecycle.
     /// </remarks>
-    public static QueuedPipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy, bool runContinuationsAsynchronously = true, PipelineScheduler? scheduler = null, CancellationToken cancellationToken = default)
+    public static UnboundedPipeline<T, TPolicy> Create<T, TPolicy>(TPolicy policy, bool runContinuationsAsynchronously = true, PipelineScheduler? scheduler = null, CancellationToken cancellationToken = default)
         where TPolicy : IPipelinePolicy<T>
     {
         var source = UnboundedQueueSource<T>.Create(runContinuationsAsynchronously, scheduler, cancellationToken);
         var pipeline = new Pipeline<T, TPolicy, UnboundedQueueSource<T>, UnboundedQueueSource<T>.Enumerator>(policy, source);
-        return new QueuedPipeline<T, TPolicy>(pipeline, source);
+        return new UnboundedPipeline<T, TPolicy>(pipeline, source);
     }
 }

@@ -1,7 +1,7 @@
 namespace Draghi.Pipelining.Tests;
 
 // Test-only convenience wrapper bundling a Pipeline over a TestObservableQueueSource<T>, mirroring
-// QueuedPipeline<T,TPolicy>'s surface (Enqueue / Depth / CompleteAsync / WaitForEmptyAsync /
+// UnboundedPipeline<T,TPolicy>'s surface (Enqueue / Depth / CompleteAsync / WaitForEmptyAsync /
 // GetEnumerator) so the wait-path tests can build pipelines with the re-homed idle/yield hooks without
 // threading the source through their own code.
 static class ObservablePipeline

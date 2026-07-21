@@ -258,7 +258,7 @@ public class PipelineBehavioralTests
     {
         var follower = new TestPipelineItem();
         var enqueued = false;
-        QueuedPipeline<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>? pipelineRef = null;
+        UnboundedPipeline<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>? pipelineRef = null;
 
         var pipeline = Pipeline.Create<TestPipelineItem, ReentrantEnqueueOnActivatePolicy>(
             new ReentrantEnqueueOnActivatePolicy(_ =>

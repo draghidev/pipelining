@@ -58,7 +58,7 @@ public class ActivatedItemReductionTests
     // into the pipeline it belongs to.
     sealed class PipelineHolder
     {
-        public QueuedPipeline<SyntheticItem, ProbePolicy>? Pipeline;
+        public UnboundedPipeline<SyntheticItem, ProbePolicy>? Pipeline;
     }
 
     enum NullPolicy

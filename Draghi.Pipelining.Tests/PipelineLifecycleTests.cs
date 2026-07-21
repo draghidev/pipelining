@@ -553,7 +553,7 @@ public class PipelineLifecycleTests
     [TestMethod]
     public async Task CompleteAsync_FromInsideExecuteItemAsync_DrainsCleanly()
     {
-        QueuedPipeline<TestPipelineItem, ReentrantCompletePolicy>? pipelineRef = null;
+        UnboundedPipeline<TestPipelineItem, ReentrantCompletePolicy>? pipelineRef = null;
         var pipeline = Pipeline.Create<TestPipelineItem, ReentrantCompletePolicy>(
             new ReentrantCompletePolicy(() => _ = pipelineRef!.CompleteAsync()));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);

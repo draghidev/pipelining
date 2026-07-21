@@ -14,7 +14,7 @@ namespace Draghi.Pipelining.Benchmarks;
 [MemoryDiagnoser]
 public class PipelineBenchmarks
 {
-    QueuedPipeline<BareItem, BarePolicy> _pipeline = null!;
+    UnboundedPipeline<BareItem, BarePolicy> _pipeline = null!;
     BareItem _item = null!;
 
     [Params(false, true)]
@@ -81,7 +81,7 @@ public class PipelineBenchmarks
         last.Wait();
     }
 
-    QueuedPipeline<BareInFlightItem, BareInFlightPolicy> _inFlightPipeline = null!;
+    UnboundedPipeline<BareInFlightItem, BareInFlightPolicy> _inFlightPipeline = null!;
     BareInFlightItem _inFlightItem = null!;
 
     [GlobalSetup(Target = nameof(EnqueueCompleteEscalated))]
@@ -121,7 +121,7 @@ public class PipelineBenchmarks
         item.Wait();
     }
 
-    QueuedPipeline<BareItemHandle, BareHandlePolicy> _structPipeline = null!;
+    UnboundedPipeline<BareItemHandle, BareHandlePolicy> _structPipeline = null!;
 
     [GlobalSetup(Target = nameof(EnqueueCompleteStructT))]
     public void SetupStructT()
