@@ -10,20 +10,16 @@ namespace Draghi.Pipelining;
 /// (an item arrived or may have arrived) and <c>false</c> when the enumeration completed.
 /// </summary>
 /// <remarks>
-/// Three shapes behind one type, so the pull seam stays a single concrete awaitable (no
-/// boxing, no interface dispatch on the wait path):
+/// A concrete union keeps the source contract allocation-free while supporting three wait forms:
 /// <list type="bullet">
-/// <item><b>Immediate</b> - the wait raced an arrival or completion and resolved synchronously;
-/// no suspension, no signal machinery.</item>
-/// <item><b>Signal</b> - the thin path: armed against a <see cref="WakeSignal"/> with the wake
-/// lock HELD from the source's miss-check through the awaiter's continuation registration
-/// (lock-through-OnCompleted), which is what makes the miss-then-arm race-free against a
-/// producer's Signal. The continuation is stored as a bare delegate and invoked directly by
-/// the wake - no value-task source, no status round-trips.</item>
-/// <item><b>Task</b> - fallback for sources whose wait is intrinsically async (observation
-/// hooks, flush-before-wait): wraps a <see cref="ValueTask{TResult}"/>.</item>
+/// <item><b>Immediate:</b> retry or completion was observed without suspension.</item>
+/// <item><b>Signal:</b> a <see cref="WakeSignal"/> owns the suspension. Its wake lock remains held
+/// from the source's failed pull through continuation registration, closing the miss-and-arm race.
+/// Registration stores the continuation directly and releases the lock.</item>
+/// <item><b>Task:</b> a <see cref="ValueTask{TResult}"/> backs sources with their own asynchronous
+/// wait work.</item>
 /// </list>
-/// Single consumer, single await per instance, like any ValueTask-shaped awaitable.
+/// Each instance has one consumer and may be awaited once.
 /// </remarks>
 public readonly struct WaitForNextAwaitable
 {
@@ -39,13 +35,11 @@ public readonly struct WaitForNextAwaitable
     readonly bool _immediate;
     readonly Kind _kind;
 
-#pragma warning disable DRAGHI001
     internal WaitForNextAwaitable(WakeSignal signal)
     {
         _signal = signal;
         _kind = Kind.Signal;
     }
-#pragma warning restore DRAGHI001
 
     WaitForNextAwaitable(bool immediate)
     {
@@ -65,7 +59,7 @@ public readonly struct WaitForNextAwaitable
     /// <summary>Synchronously-resolved wait: the enumeration completed.</summary>
     public static WaitForNextAwaitable Completed() => new(immediate: false);
 
-    /// <summary>Async-fallback wait around a task that resolves to retry (true) / completed (false).</summary>
+    /// <summary>Wraps a wait whose result is true to retry or false when completed.</summary>
     public static WaitForNextAwaitable FromTask(ValueTask<bool> task) => new(task);
 
     public Awaiter GetAwaiter() => new(this);
@@ -92,8 +86,7 @@ public readonly struct WaitForNextAwaitable
         public bool GetResult() => _wait._kind switch
         {
             Kind.Immediate => _wait._immediate,
-            // Woken by Signal (retry) or Complete (drain the source's remaining items, then its
-            // next wait resolves Completed). Either way: not done until the source says so.
+            // A signal always retries; source completion is observed by the next pull or wait.
             Kind.Signal => true,
             _ => _taskAwaiter.GetResult(),
         };

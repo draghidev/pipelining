@@ -4,41 +4,26 @@ using System.Runtime.CompilerServices;
 namespace Draghi.Pipelining.Internal;
 
 /// <summary>
-/// Single-producer single-consumer wake signal for a pipeline source's pull. Owns the wait
-/// lifecycle of the TryGetNext/WaitForNextAsync seam: the wake lock, the armed-wait flag, the
-/// bare-delegate continuation a wake invokes directly, and the scheduler-vs-inline dispatch of
-/// the wake. The consumer arms under the lock (<see cref="Arm"/>) and the lock is held through
-/// continuation registration (lock-through-OnCompleted); a producer makes its item visible and
-/// calls <see cref="Signal()"/>.
+/// Coordinates a pipeline source's failed pull with its next producer wake. The consumer checks
+/// the source and arms while holding the wake lock; continuation registration stores the callback
+/// and releases that lock. A producer publishes its item, claims the wait under the same lock, and
+/// dispatches the callback after releasing it.
 /// </summary>
 /// <remarks>
-/// A suspending wait stores the builder's cached delegate and invokes it directly, without a
-/// value-task source or version bookkeeping.
-/// <para>
-/// A spinlock guards the rendezvous because the critical section is a few field reads/writes with
-/// at most two threads contending (the consumer's wait path and a Signal caller). The protocol
-/// consists of the under-lock re-check, lock-through registration, claim-clears-suspension, and
-/// the sync-handoff rendezvous.
-/// </para>
-/// <para>
-/// Exposed under <see cref="Draghi.Pipelining.Internal"/> as a building block for callers composing
-/// their own <see cref="IPipelineSource{T,TEnumerator}"/> implementations.
-/// </para>
+/// The signal invokes the async method's cached continuation directly, avoiding a separate promise.
+/// Sources may use this internal building block when implementing <see cref="IPipelineSource{T,TEnumerator}"/>.
 /// </remarks>
 [Experimental("DRAGHI001")]
 public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineScheduler scheduler, bool enableWaitForSuspended = false)
     : IThreadPoolWorkItem
 {
-    // Suspension observation for sync-handoff producers (see WaitForSuspended). Opt-in so
-    // sources without a handoff seam don't pay the per-wait MRES traffic.
+    // Optional rendezvous for producers that must not return until the consumer is suspended.
     readonly ManualResetEventSlim? _suspendedMres = enableWaitForSuspended ? new(false) : null;
 
     readonly CancellationTokenSource _cts = new();
     bool _pending;
     int _wakeLock;
-    // The wake invokes this bare delegate directly. Cached across cycles (the async-method
-    // builder reuses the box's action), so the ReferenceEquals in WaitOnCompleted skips the
-    // write after the first wait.
+    // The async method normally supplies the same cached delegate on every wait.
     Action? _waitContinuation;
 
     public PipelineScheduler Scheduler { get; } = scheduler;
@@ -65,10 +50,8 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     public void ReleaseWakeLock() => Volatile.Write(ref _wakeLock, 0);
 
     /// <summary>
-    /// Arms the wait for the TryGetNext/WaitForNextAsync protocol. MUST be called under the wake
-    /// lock, after the source observed nothing to yield; the returned awaitable's continuation
-    /// registration is what releases the lock (lock-through-OnCompleted), which closes the
-    /// miss-then-arm race against a producer's Signal without any re-resolve machinery.
+    /// Arms after an under-lock source check found no item. The caller leaves the wake lock held;
+    /// continuation registration releases it, preventing a signal between the miss and the arm.
     /// </summary>
     public WaitForNextAwaitable Arm()
     {
@@ -77,25 +60,18 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     }
 
     /// <summary>
-    /// Continuation registration for an armed wait (called by <see cref="WaitForNextAwaitable.Awaiter"/>
-    /// with the wake lock still held). Stores the bare delegate and releases the lock; a
-    /// completion that raced the registration self-signals so the wake is not lost.
+    /// Registers an armed wait while the wake lock is still held, then releases it. Completion is
+    /// checked afterwards so one that raced registration still wakes the consumer.
     /// </summary>
     public void WaitOnCompleted(Action continuation)
     {
         if (!ReferenceEquals(_waitContinuation, continuation))
             _waitContinuation = continuation;
-        // Suspension observation set UNDER the lock (before the release), pairing with the
-        // claim's Reset which is also under the lock: the lock totally orders Set/Reset.
-        // An out-of-lock Set racing a claim's out-of-lock Reset (Set landing after) leaves a
-        // STALE TRUE, letting a later handoff producer skip its rendezvous while its inline
-        // claim finds nothing pending. The woken producer's Signal briefly spins on the lock
-        // until this release, correctness over a few ns.
+        // Set and claim-side Reset both occur under the lock, preventing a stale observation from
+        // surviving into the next wait cycle.
         _suspendedMres?.Set();
-        // Park notification for a source that must react to WHICH item the pull parked on (e.g. a
-        // FIFO sync-handoff source signalling the specific waiter whose item the executor fake-missed
-        // on). Invoked under the wake lock so the source's read of its own state + its waiter signal
-        // are ordered against a concurrent claim's Reset, same as the suspension observation above.
+        // Sources may need to notify the particular producer whose item the pull missed. Keeping
+        // this callback under the lock orders that notification against a concurrent claim.
         OnSuspended?.Invoke();
         ReleaseWakeLock();
 
@@ -103,28 +79,21 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
             SignalCore(runContinuationsAsynchronously: true);
     }
 
-    /// Invoked under the wake lock each time the consumer's wait arms (the suspension point), after
-    /// the suspension observation is set. A source sets this when it needs to react to the executor
-    /// parking - typically to signal a specific waiter that the pull fake-missed on its item.
-    /// Generalized building-block hook; null for sources without a park-reactive waiter protocol.
+    /// Invoked under the wake lock when the consumer suspends, after publishing that observation.
+    /// Sources use this to complete a producer-side handoff tied to the missed pull.
     public Action? OnSuspended { get; set; }
 
     /// <summary>
-    /// Blocks until the consumer's wait is armed and its continuation registered (the suspension
-    /// observation a sync-handoff producer rendezvouses on before claiming the wait inline with
-    /// <see cref="Signal(bool)"/>). Requires construction with <c>enableWaitForSuspended</c>.
-    /// Every claim clears the observation before dispatch so it stays accurate across resume.
-    /// A stale observation would let a later handoff producer skip its wait and return with its
-    /// item unexecuted.
+    /// Blocks until an armed consumer has registered its continuation. Requires
+    /// <c>enableWaitForSuspended</c>; claiming the wait clears the observation before dispatch.
     /// </summary>
     public void WaitForSuspended() => _suspendedMres!.Wait();
 
     public bool Signal() => SignalCore(runContinuationsAsynchronously);
 
     /// <summary>
-    /// Signal with an explicit dispatch mode, overriding the construction-time default. When false
-    /// the consumer's continuation runs inline on the calling thread (the call site takes over the
-    /// executor for one turn). Use when a producer chooses dispatch per item.
+    /// Signals using an explicit dispatch mode. False resumes the consumer inline on this thread;
+    /// true submits it through the configured scheduler.
     /// </summary>
     /// <returns><c>true</c> if a waiting pull was claimed and woken, <c>false</c> if no one was
     /// waiting (the signal was a no-op).</returns>
@@ -132,9 +101,7 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
 
     bool SignalCore(bool runContinuationsAsynchronously)
     {
-        // Claim and dispatch the bare continuation directly. The lock-through-OnCompleted
-        // discipline guarantees the continuation is stored before _pending can be claimed
-        // (a Signal blocks on the lock until registration released it).
+        // Registration releases the lock only after storing the continuation.
         AcquireWakeLock();
         bool claimed;
         try
@@ -153,30 +120,22 @@ public sealed class WakeSignal(bool runContinuationsAsynchronously, PipelineSche
     }
 
     /// <summary>
-    /// Claims an armed wait under the wake lock WITHOUT dispatching, for callers that compose
-    /// their own gate read with the claim in one lock hold (a producer whose signal must defer
-    /// while some window is open: the gate re-read and the claim must be atomic against the
-    /// window's rendezvous, or a gate verdict taken before the window opened can pair with a
-    /// claim landing after its owner committed to the armed wait - the rendezvous steal). Call between
-    /// <see cref="AcquireWakeLock"/>/<see cref="ReleaseWakeLock"/>; pair a true return with
-    /// <see cref="DispatchClaimed"/> AFTER the release.
+    /// Claims an armed wait without dispatching it. Callers use this under the wake lock when a
+    /// separate gate check must be atomic with the claim. A successful claim must be followed by
+    /// <see cref="DispatchClaimed"/> after releasing the lock.
     /// </summary>
     public bool TryClaimLocked()
     {
         if (!_pending)
             return false;
         _pending = false;
-        // Clear the suspension observation UNDER the lock (pairing with the registration's
-        // under-lock Set, the lock totally orders Set/Reset) and before dispatch, so it
-        // stays accurate across resume: a stale observation would let a sync-handoff
-        // producer skip its rendezvous.
+        // Clear before dispatch so the observation describes only the current suspension.
         _suspendedMres?.Reset();
         return true;
     }
 
-    /// <summary>Dispatches a wait claimed via <see cref="TryClaimLocked"/>. Call after
-    /// <see cref="ReleaseWakeLock"/> (an inline dispatch re-enters the protocol on this
-    /// thread; holding the lock across it would deadlock the continuation's own wait path).</summary>
+    /// <summary>Dispatches a claimed wait after releasing the wake lock. Inline dispatch may
+    /// immediately re-enter the source wait protocol.</summary>
     public void DispatchClaimed(bool runContinuationsAsynchronously)
     {
         if (runContinuationsAsynchronously)
