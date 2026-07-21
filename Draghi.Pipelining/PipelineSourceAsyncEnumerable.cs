@@ -7,23 +7,19 @@ namespace Draghi.Pipelining;
 /// pull seam directly and never needs this. It exists so the await-foreach compat loop lives in one
 /// place rather than being reimplemented on every source.
 /// </summary>
-public sealed class PipelineSourceAsyncEnumerable<T, TSource, TEnumerator> : IAsyncEnumerable<T>
+public sealed class PipelineSourceAsyncEnumerable<T, TSource, TEnumerator>(TSource source) : IAsyncEnumerable<T>
     where TSource : IPipelineSource<T, TEnumerator>
     where TEnumerator : struct, IPipelineEnumerator<T>
 {
-    readonly TSource _source;
-
-    public PipelineSourceAsyncEnumerable(TSource source) => _source = source;
+    readonly TSource _source = source;
 
     public IAsyncEnumerator<T> GetAsyncEnumerator(CancellationToken cancellationToken = default)
-        => new Enumerator(_source.GetAsyncEnumerator(cancellationToken: cancellationToken));
+        => new Enumerator(_source.CreateEnumerator(cancellationToken));
 
-    sealed class Enumerator : IAsyncEnumerator<T>
+    sealed class Enumerator(TEnumerator inner) : IAsyncEnumerator<T>
     {
-        TEnumerator _inner;
+        TEnumerator _inner = inner;
         T _current = default!;
-
-        public Enumerator(TEnumerator inner) => _inner = inner;
 
         public T Current => _current;
 

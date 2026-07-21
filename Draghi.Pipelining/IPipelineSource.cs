@@ -2,7 +2,7 @@ namespace Draghi.Pipelining;
 
 /// <summary>
 /// Native source contract for source-driven pipelines. The pipeline drives the concrete struct
-/// enumerator returned by <see cref="GetAsyncEnumerator"/> through its synchronous-pull and
+/// enumerator returned by <see cref="CreateEnumerator"/> through its synchronous-pull and
 /// asynchronous-wait seam. The source owns item storage, ordering, and idle/wake semantics.
 /// </summary>
 /// <remarks>
@@ -36,5 +36,5 @@ public interface IPipelineSource<T, TEnumerator>
     /// source at enqueue, so there is no depth-increment hook to invoke. The source only owns storage,
     /// ordering, and idle/wake.
     /// </remarks>
-    TEnumerator GetAsyncEnumerator(CancellationToken cancellationToken = default);
+    TEnumerator CreateEnumerator(CancellationToken cancellationToken = default);
 }

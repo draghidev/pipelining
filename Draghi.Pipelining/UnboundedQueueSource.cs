@@ -51,7 +51,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         if (_state.WakeSignal.IsCompleted)
             ThrowCompleted();
 
-        _state.NotEmpty = true;
+        _state.QueueNotEmpty = true;
         _state.Queue.Enqueue(item);
         return new(_state.WakeSignal);
     }
@@ -68,7 +68,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// the enumerator would wait forever on the wake signal while the pipeline considers itself
     /// shut down.
     /// </remarks>
-    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    public Enumerator CreateEnumerator(CancellationToken cancellationToken = default)
     {
         return new(_state, cancellationToken);  // Enumerator combines _state.CancellationToken internally.
     }
@@ -79,16 +79,11 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     internal sealed class State
     {
         public readonly SingleProducerSingleConsumerQueue<T> Queue = new();
-        public bool NotEmpty;
+        public bool QueueNotEmpty;
         public readonly WakeSignal WakeSignal;
-        // Source-level cancellation. Per-enumeration CT (passed to GetAsyncEnumerator) gets
+        // Source-level cancellation. Per-enumeration CT (passed to CreateEnumerator) gets
         // linked with this in the Enumerator's CTS construction.
         public readonly CancellationToken CancellationToken;
-
-        // The active enumeration's combined (source + per-call) token, published by the enumerator
-        // at construction. The wait path reads it to translate cancellation into a completed
-        // result, matching the WakeSignal.IsCompleted check.
-        public CancellationToken EnumerationToken;
 
         public State(bool runContinuationsAsynchronously, PipelineScheduler scheduler, CancellationToken cancellationToken)
         {
@@ -129,7 +124,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
             _state = state;
             var sourceCt = state.CancellationToken;
             // Combine source-level CT (set at UnboundedQueueSource.Create) and per-call CT
-            // (passed to GetAsyncEnumerator, e.g., from await foreach with WithCancellation).
+            // (passed to CreateEnumerator, e.g., from await foreach with WithCancellation).
             // Linked source forwards cancellation from either.
             _cts = (sourceCt.CanBeCanceled, perCallCt.CanBeCanceled) switch
             {
@@ -139,8 +134,6 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
                 (false, false) => new CancellationTokenSource(),
             };
             _completionToken = _cts.Token;
-            // Publish the combined token to the state so the pump can observe cancellation.
-            state.EnumerationToken = _completionToken;
             _completionToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
         }
 
@@ -165,11 +158,11 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         {
             var wakeSignal = _state.WakeSignal;
             wakeSignal.AcquireWakeLock();
-            // Best-effort window-narrower: the producer sets NotEmpty before its queue write, so
+            // Best-effort window-narrower: the producer sets QueueNotEmpty before its queue write, so
             // an in-flight enqueue whose item is not yet visible resolves to a retry instead of
             // a suspended wait. Its loss is harmless - the producer's Signal covers the armed wait.
-            _state.NotEmpty = false;
-            if (_state.Queue.IsEmpty && !_state.NotEmpty)
+            _state.QueueNotEmpty = false;
+            if (_state.Queue.IsEmpty && !_state.QueueNotEmpty)
             {
                 if (wakeSignal.IsCompleted || _completionToken.IsCancellationRequested)
                 {

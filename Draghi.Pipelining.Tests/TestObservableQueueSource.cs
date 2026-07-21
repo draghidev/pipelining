@@ -42,7 +42,7 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
         return new(_state.WakeSignal);
     }
 
-    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    public Enumerator CreateEnumerator(CancellationToken cancellationToken = default)
     {
         return new(_state, cancellationToken);
     }

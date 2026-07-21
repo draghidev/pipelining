@@ -39,7 +39,7 @@ readonly struct ThrowingSource<T> : IPipelineSource<T, ThrowingSource<T>.Enumera
     // Faults the gated empty-wait, landing a source fault while pre-loaded items are still in flight.
     public void TriggerWaitThrow(Exception ex) => _state.WaitGate!.SetException(ex);
 
-    public Enumerator GetAsyncEnumerator(CancellationToken cancellationToken = default)
+    public Enumerator CreateEnumerator(CancellationToken cancellationToken = default)
     {
         // Depth is counted by the pipeline at dispatch (each TryGetNext success), so the source no
         // longer pre-increments per pre-loaded item.

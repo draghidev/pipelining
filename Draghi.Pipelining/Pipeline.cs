@@ -107,7 +107,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Depth is counted at DISPATCH (the executor's single-consumer pull), not at enqueue, so the
         // source needs no depth-increment hook. Pipeline doesn't pass a CT here: source owns
         // its own cancellation lifecycle (caller-configured at source construction).
-        _enumerator = _source.GetAsyncEnumerator();
+        _enumerator = _source.CreateEnumerator();
         _executionTask = ExecuteSource();
 
         // Remaining transient fields were initialized or cleared by the preceding run.
@@ -678,7 +678,7 @@ public static class Pipeline
     /// <remarks>
     /// No CancellationToken parameter: the caller-supplied source owns its own cancellation
     /// lifecycle (either at source construction or by integrating their CT into the source's
-    /// GetAsyncEnumerator implementation). Threading another CT through here would be redundant.
+    /// CreateEnumerator implementation). Threading another CT through here would be redundant.
     /// <para>
     /// Instance reuse: pass a previously-completed <paramref name="instance"/> to rebind it
     /// against the new <paramref name="policy"/> + <paramref name="source"/> and restart it.
