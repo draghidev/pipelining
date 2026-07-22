@@ -4,13 +4,13 @@ using Microsoft.VisualStudio.TestTools.UnitTesting;
 namespace Draghi.Pipelining.Tests;
 
 /// <summary>
-/// Stress tests targeting WakeSignal in isolation - no Pipeline, no Enumerator CTS chain, no
+/// Stress tests targeting SourceWakeEvent in isolation - no Pipeline, no Enumerator CTS chain, no
 /// source. Mirrors the State.WaitForNextAsync arm/await/wake protocol with the minimum surface so a
-/// failure pins the defect on WakeSignal itself (or refutes that hypothesis when the wider
+/// failure pins the defect on SourceWakeEvent itself (or refutes that hypothesis when the wider
 /// PipelineConcurrencyTests stress fails but this one passes).
 /// </summary>
 [TestClass]
-public class WakeSignalConcurrencyTests
+public class SourceWakeEventConcurrencyTests
 {
     /// <summary>
     /// Races Complete() against an in-flight consumer that's mid-arm: AcquireLock, peek (empty),
@@ -30,7 +30,7 @@ public class WakeSignalConcurrencyTests
 
         for (var iter = 0; iter < iterations; iter++)
         {
-            var signal = new WakeSignal(runContinuationsAsynchronously: true, PipelineScheduler.ThreadPool);
+            var signal = new SourceWakeEvent(runContinuationsAsynchronously: true, PipelineScheduler.ThreadPool);
             var queue = new int[1]; // single-slot pseudo-queue; "has item" = volatile read != 0
             var enqueued = 0;
 
@@ -39,19 +39,17 @@ public class WakeSignalConcurrencyTests
             {
                 while (true)
                 {
-                    signal.AcquireWakeLock();
+                    using var wait = signal.BeginWait();
                     if (Volatile.Read(ref enqueued) != 0)
                     {
                         Volatile.Write(ref enqueued, 0);
-                        signal.ReleaseWakeLock();
                         return true;
                     }
                     if (signal.IsCompleted)
                     {
-                        signal.ReleaseWakeLock();
                         return false;
                     }
-                    await signal.Arm();
+                    await wait.WaitAsync();
                 }
             });
 
@@ -65,7 +63,7 @@ public class WakeSignalConcurrencyTests
                 for (var s = 0; s < spinTarget; s++)
                     Thread.SpinWait(8);
                 Volatile.Write(ref enqueued, 1);
-                signal.Signal();
+                signal.Set();
             });
 
             var cancellerTask = Task.Run(() =>
@@ -83,7 +81,7 @@ public class WakeSignalConcurrencyTests
             }
             catch (TimeoutException)
             {
-                diagnosis = $"iter {iter}: stuck - WakeSignal wedged. " +
+                diagnosis = $"iter {iter}: stuck - SourceWakeEvent wedged. " +
                     $"consumer={consumerTask.Status} producer={producerTask.Status} canceller={cancellerTask.Status}";
             }
             catch (NullReferenceException ex)
@@ -114,19 +112,18 @@ public class WakeSignalConcurrencyTests
 
         for (var iter = 0; iter < iterations; iter++)
         {
-            var signal = new WakeSignal(runContinuationsAsynchronously: true, PipelineScheduler.ThreadPool);
+            var signal = new SourceWakeEvent(runContinuationsAsynchronously: true, PipelineScheduler.ThreadPool);
 
             var consumerTask = Task.Run(async () =>
             {
                 while (true)
                 {
-                    signal.AcquireWakeLock();
+                    using var wait = signal.BeginWait();
                     if (signal.IsCompleted)
                     {
-                        signal.ReleaseWakeLock();
                         return false;
                     }
-                    await signal.Arm();
+                    await wait.WaitAsync();
                 }
             });
 

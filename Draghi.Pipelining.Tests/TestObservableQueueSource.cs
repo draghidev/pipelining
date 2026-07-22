@@ -34,12 +34,12 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
 
     public EnqueueResult Enqueue(T item)
     {
-        if (_state.WakeSignal.IsCompleted)
+        if (_state.WakeEvent.IsCompleted)
             ThrowCompleted();
 
         _state.NotEmpty = true;
         _state.Queue.Enqueue(item);
-        return new(_state.WakeSignal);
+        return new(_state.WakeEvent);
     }
 
     public Enumerator CreateEnumerator(CancellationToken cancellationToken = default)
@@ -54,7 +54,7 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
     {
         public readonly SingleProducerSingleConsumerQueue<T> Queue = new();
         public bool NotEmpty;
-        public readonly WakeSignal WakeSignal;
+        public readonly SourceWakeEvent WakeEvent;
         public readonly CancellationToken CancellationToken;
         public CancellationToken EnumerationToken;
         public readonly Func<CancellationToken, ValueTask>? OnIdle;
@@ -68,7 +68,7 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
             Func<CancellationToken, ValueTask>? onIdle,
             CancellationToken cancellationToken)
         {
-            WakeSignal = new(runContinuationsAsynchronously, scheduler);
+            WakeEvent = new(runContinuationsAsynchronously, scheduler);
             OnIdle = onIdle;
             CancellationToken = cancellationToken;
         }
@@ -84,24 +84,22 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
 
             while (true)
             {
-                var wakeSignal = WakeSignal;
-                wakeSignal.AcquireWakeLock();
+                var wakeSignal = WakeEvent;
+                using var wait = wakeSignal.BeginWait();
                 NotEmpty = false;
 
                 if (Queue.TryPeek(out _) || NotEmpty)
                 {
-                    wakeSignal.ReleaseWakeLock();
                     return true;
                 }
 
                 if (wakeSignal.IsCompleted || EnumerationToken.IsCancellationRequested)
                 {
-                    wakeSignal.ReleaseWakeLock();
                     return false;
                 }
 
                 // Lock-through registration; a wake loops back to re-peek.
-                await wakeSignal.Arm();
+                await wait.WaitAsync();
             }
         }
 
@@ -122,10 +120,10 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
 
     public readonly struct EnqueueResult
     {
-        readonly WakeSignal? _signal;
-        internal EnqueueResult(WakeSignal? signal) => _signal = signal;
+        readonly SourceWakeEvent? _signal;
+        internal EnqueueResult(SourceWakeEvent? signal) => _signal = signal;
 
-        public void Execute() => _signal?.Signal();
+        public void Execute() => _signal?.Set();
     }
 
     public struct Enumerator : IPipelineEnumerator<T>
@@ -147,7 +145,7 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
             };
             _completionToken = _cts.Token;
             _state.EnumerationToken = _completionToken;
-            _completionToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
+            _completionToken.UnsafeRegister(static state => ((State)state!).WakeEvent.Complete(), _state);
         }
 
         public CancellationToken CompletionToken => _completionToken;

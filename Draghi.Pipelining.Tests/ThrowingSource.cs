@@ -68,12 +68,12 @@ readonly struct ThrowingSource<T> : IPipelineSource<T, ThrowingSource<T>.Enumera
         public WaitForNextAwaitable WaitForNextAsync()
         {
             if (_state.Items.Count > 0)
-                return WaitForNextAwaitable.Retry();
+                return WaitForNextAwaitable.Retry;
             if (_state.WaitThrow is { } ex)
                 throw ex;
             if (_state.WaitGate is { } gate)
                 return WaitForNextAwaitable.FromTask(new ValueTask<bool>(gate.Task));
-            return WaitForNextAwaitable.Completed();
+            return WaitForNextAwaitable.Completed;
         }
 
         public ValueTask DisposeAsync()

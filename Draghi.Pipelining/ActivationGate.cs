@@ -158,10 +158,4 @@ struct ActivationGate<T>()
         Debug.Assert(StateOf(Volatile.Read(ref _handoffWord)) == NoHandoff);
     }
 
-    internal string DebugWordStates()
-    {
-        var turn = Volatile.Read(ref _turn);
-        var handoff = Volatile.Read(ref _handoffWord);
-        return $"turn={(turn < 0 ? $"provisional(g{-turn})" : turn.ToString())},handoff={(StateOf(handoff) == Handoff ? $"published(g{GenerationOf(handoff)})" : "none")}";
-    }
 }

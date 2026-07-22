@@ -48,12 +48,12 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// <exception cref="InvalidOperationException">Thrown if the source has been completed.</exception>
     public EnqueueResult Enqueue(T item)
     {
-        if (_state.WakeSignal.IsCompleted)
+        if (_state.WakeEvent.IsCompleted)
             ThrowCompleted();
 
         _state.QueueNotEmpty = true;
         _state.Queue.Enqueue(item);
-        return new(_state.WakeSignal);
+        return new(_state.WakeEvent);
     }
 
     /// <summary>Backlog: items enqueued but not yet dispatched (the queue length). With
@@ -80,14 +80,14 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     {
         public readonly SingleProducerSingleConsumerQueue<T> Queue = new();
         public bool QueueNotEmpty;
-        public readonly WakeSignal WakeSignal;
+        public readonly SourceWakeEvent WakeEvent;
         // Source-level cancellation. Per-enumeration CT (passed to CreateEnumerator) gets
         // linked with this in the Enumerator's CTS construction.
         public readonly CancellationToken CancellationToken;
 
         public State(bool runContinuationsAsynchronously, PipelineScheduler scheduler, CancellationToken cancellationToken)
         {
-            WakeSignal = new(runContinuationsAsynchronously, scheduler);
+            WakeEvent = new(runContinuationsAsynchronously, scheduler);
             CancellationToken = cancellationToken;
         }
     }
@@ -101,11 +101,11 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// </summary>
     public readonly struct EnqueueResult
     {
-        readonly WakeSignal? _signal;
-        internal EnqueueResult(WakeSignal? signal) => _signal = signal;
+        readonly SourceWakeEvent? _signal;
+        internal EnqueueResult(SourceWakeEvent? signal) => _signal = signal;
 
         /// <summary>Signals the execution loop, which may run the executor inline on the calling thread.</summary>
-        public void Execute() => _signal?.Signal();
+        public void Execute() => _signal?.Set();
     }
 
     /// <summary>The struct enumerator driven by the pipeline.</summary>
@@ -134,7 +134,7 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
                 (false, false) => new CancellationTokenSource(),
             };
             _completionToken = _cts.Token;
-            _completionToken.UnsafeRegister(static state => ((State)state!).WakeSignal.Complete(), _state);
+            _completionToken.UnsafeRegister(static state => ((State)state!).WakeEvent.Complete(), _state);
         }
 
         public CancellationToken CompletionToken => _completionToken;
@@ -156,8 +156,8 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
         /// </summary>
         public WaitForNextAwaitable WaitForNextAsync()
         {
-            var wakeSignal = _state.WakeSignal;
-            wakeSignal.AcquireWakeLock();
+            var wakeSignal = _state.WakeEvent;
+            using var wait = wakeSignal.BeginWait();
             // Best-effort window-narrower: the producer sets QueueNotEmpty before its queue write, so
             // an in-flight enqueue whose item is not yet visible resolves to a retry instead of
             // a suspended wait. Its loss is harmless - the producer's Signal covers the armed wait.
@@ -166,14 +166,12 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
             {
                 if (wakeSignal.IsCompleted || _completionToken.IsCancellationRequested)
                 {
-                    wakeSignal.ReleaseWakeLock();
-                    return WaitForNextAwaitable.Completed();
+                    return WaitForNextAwaitable.Completed;
                 }
-                return wakeSignal.Arm();
+                return wait.WaitAsync();
             }
 
-            wakeSignal.ReleaseWakeLock();
-            return WaitForNextAwaitable.Retry();
+            return WaitForNextAwaitable.Retry;
         }
 
         public ValueTask DisposeAsync()

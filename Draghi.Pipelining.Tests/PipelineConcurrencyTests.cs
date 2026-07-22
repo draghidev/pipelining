@@ -594,7 +594,6 @@ public class PipelineConcurrencyTests
                 // bookkeeping lost (test-side flags never set despite the pipeline draining).
                 Assert.Fail($"iter {iter}: PERMANENT STRAND - {stuck.Count} never completed after 15s " +
                     $"(Depth={pipeline.Depth}, Backlog={pipeline.Backlog}, emptyReturned={emptyReturned}, " +
-                    $"words=[{pipeline.Pipeline.DebugWordStates()}], " +
                     $"tpPending={tpPending}, tpThreads={tpThreads}; " +
                     $"{(resolvedLate ? $"RESOLVED LATE at +{lateSw.ElapsedMilliseconds}ms => starvation delay, not a loss" : "STILL STUCK after +30s => genuine lost obligation")}): " +
                     $"{string.Join("; ", stuck)}");
@@ -2225,7 +2224,7 @@ public class PipelineConcurrencyTests
             catch (TimeoutException)
             {
                 Assert.Fail($"iter {iter}: enqueue/cancel race did not settle in 5s - " +
-                    "WakeSignal likely wedged with stale _pending");
+                    "SourceWakeEvent likely wedged with stale _pending");
             }
 
             string? hangDiagnosis = null;
@@ -2240,7 +2239,7 @@ public class PipelineConcurrencyTests
             catch (TimeoutException)
             {
                 hangDiagnosis = $"iter {iter}: CompleteAsync hung after cancel. " +
-                    "Lost wake or corrupted _pending in WakeSignal.";
+                    "Lost wake or corrupted _pending in SourceWakeEvent.";
             }
             catch (NullReferenceException ex)
             {

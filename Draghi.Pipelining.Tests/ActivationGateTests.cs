@@ -57,7 +57,7 @@ public class ActivationGateTests
             edgeLock.Enter();
             try
             {
-                return gate.CommitTurn(currentGeneration, tenure: 1);
+                return gate.CommitTurn(currentGeneration, sequence: 1);
             }
             finally
             {

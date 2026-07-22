@@ -13,9 +13,8 @@ namespace Draghi.Pipelining;
 /// A concrete union keeps the source contract allocation-free while supporting three wait forms:
 /// <list type="bullet">
 /// <item><b>Immediate:</b> retry or completion was observed without suspension.</item>
-/// <item><b>Signal:</b> a <see cref="WakeSignal"/> owns the suspension. Its wake lock remains held
-/// from the source's failed pull through continuation registration, closing the miss-and-arm race.
-/// Registration stores the continuation directly and releases the lock.</item>
+/// <item><b>Signal:</b> a <see cref="SourceWakeEvent"/> owns the wait. Its atomic empty check
+/// remains active through continuation registration, closing the miss-and-arm race.</item>
 /// <item><b>Task:</b> a <see cref="ValueTask{TResult}"/> backs sources with their own asynchronous
 /// wait work.</item>
 /// </list>
@@ -30,34 +29,34 @@ public readonly struct WaitForNextAwaitable
         Task,
     }
 
-    readonly WakeSignal? _signal;
-    readonly ValueTask<bool> _task;
-    readonly bool _immediate;
+    readonly SourceWakeEvent? _signal;
+    readonly ValueTask<bool> _wait;
+    readonly bool _retry;
     readonly Kind _kind;
 
-    internal WaitForNextAwaitable(WakeSignal signal)
+    internal WaitForNextAwaitable(SourceWakeEvent signal)
     {
         _signal = signal;
         _kind = Kind.Signal;
     }
 
-    WaitForNextAwaitable(bool immediate)
+    WaitForNextAwaitable(bool retry)
     {
-        _immediate = immediate;
+        _retry = retry;
         _kind = Kind.Immediate;
     }
 
     WaitForNextAwaitable(ValueTask<bool> task)
     {
-        _task = task;
+        _wait = task;
         _kind = Kind.Task;
     }
 
     /// <summary>Synchronously-resolved wait: retry the pull now.</summary>
-    public static WaitForNextAwaitable Retry() => new(immediate: true);
+    public static WaitForNextAwaitable Retry => new(retry: true);
 
     /// <summary>Synchronously-resolved wait: the enumeration completed.</summary>
-    public static WaitForNextAwaitable Completed() => new(immediate: false);
+    public static WaitForNextAwaitable Completed => new(retry: false);
 
     /// <summary>Wraps a wait whose result is true to retry or false when completed.</summary>
     public static WaitForNextAwaitable FromTask(ValueTask<bool> task) => new(task);
@@ -73,7 +72,7 @@ public readonly struct WaitForNextAwaitable
         {
             _wait = wait;
             if (wait._kind == Kind.Task)
-                _taskAwaiter = wait._task.ConfigureAwait(false).GetAwaiter();
+                _taskAwaiter = wait._wait.ConfigureAwait(false).GetAwaiter();
         }
 
         public bool IsCompleted => _wait._kind switch
@@ -85,7 +84,7 @@ public readonly struct WaitForNextAwaitable
 
         public bool GetResult() => _wait._kind switch
         {
-            Kind.Immediate => _wait._immediate,
+            Kind.Immediate => _wait._retry,
             // A signal always retries; source completion is observed by the next pull or wait.
             Kind.Signal => true,
             _ => _taskAwaiter.GetResult(),

@@ -126,10 +126,6 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// <see cref="WaitForEmptyAsync"/> to await empty (both halves zero).</summary>
     public int Depth => _depthState.Depth;
 
-    /// Diagnostic readout of the store's two activation word cells, for test forensics.
-    internal string DebugWordStates()
-        => $"{_activationGate.DebugWordStates()},ticket={_itemTenure.LastClaimedSequence}";
-
     /// <summary>Completion of the current run: completes when the run has fully torn down, faults
     /// when the run breaks, the same task <see cref="CompleteAsync"/> returns. Unlike CompleteAsync
     /// this does not initiate completion, so an embedder can observe a live pipeline. Between runs
