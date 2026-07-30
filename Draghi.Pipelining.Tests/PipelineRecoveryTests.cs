@@ -504,6 +504,58 @@ public class PipelineRecoveryTests
         await completeTask.WaitAsync(TimeSpan.FromSeconds(5));
     }
 
+    [TestMethod]
+    [DataRow(RecoveryShutdownStage.Execute)]
+    [DataRow(RecoveryShutdownStage.Trailing)]
+    [DataRow(RecoveryShutdownStage.Pipeline)]
+    public async Task ShutdownDuringInFlightRecovery_AdvancesResidentSuccessor(RecoveryShutdownStage stage)
+    {
+        var recovery = new TestPipelineItem
+        {
+            ExecuteAsync = stage is RecoveryShutdownStage.Execute,
+            HasTrailingTask = stage is RecoveryShutdownStage.Trailing,
+            CompleteAsync = true
+        };
+        var recoveryOffered = 0;
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, _ => Interlocked.Exchange(ref recoveryOffered, 1) == 0 ? recovery : null),
+            onIdle: _ => { idle.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var failed = new TestPipelineItem
+        {
+            CompleteAsync = true,
+            PipelineTaskException = new InvalidOperationException("trigger recovery")
+        };
+        var successor = new TestPipelineItem { CompleteAsync = true };
+        _ = pipeline.Enqueue(failed);
+        pipeline.Enqueue(successor).Execute();
+        await successor.WaitForExecutedAsync();
+        await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        failed.CompletePipelineTask();
+        await recovery.WaitForExecutedAsync();
+
+        var completion = pipeline.CompleteAsync().AsTask();
+        if (stage is RecoveryShutdownStage.Execute)
+            recovery.CompleteExecuteTask();
+        else if (stage is RecoveryShutdownStage.Trailing)
+            recovery.CompleteTrailingTask();
+
+        await completion.WaitAsync(TimeSpan.FromSeconds(5));
+        Assert.IsTrue(recovery.IsCompleted);
+        Assert.IsTrue(successor.IsCompleted);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+    }
+
+    public enum RecoveryShutdownStage
+    {
+        Execute,
+        Trailing,
+        Pipeline
+    }
+
     /// Regression guard for double-completion of the recovery item under shutdown race.
     /// RecoverInFlightItem's executeTask continuation has a wake-check entry. If it fires while the
     /// continuation is past the check but before RetireItem, DrainOnCompletion (via

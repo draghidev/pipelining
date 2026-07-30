@@ -799,10 +799,11 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         var recoveryItem = _inFlightRecoveryItem;
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _inFlightRecoveryItem = default!;
-        RetireItem(recoveryItem, _completionException, ownedTurn: _inFlightRecoverySequence);
-        // Shutdown owns completion; settle the suspended recovery position's retained count credit.
-        _ = _inFlight.DecrementCount();
-        SignalDrainWakeupIfWaiting();
+        var emptyReached = RetireItemDeferred(
+            recoveryItem, _completionException, ownedTurn: _inFlightRecoverySequence);
+        // Shutdown still has to leave through the episode's advance license. This settles the retained
+        // count credit and continues retiring successors already resident behind the recovery.
+        ResumeAdvanceAfterRecovery(emptyReached);
     }
 
     /// Signals teardown after the advance drains. Volatile prevents the optional slot read from
