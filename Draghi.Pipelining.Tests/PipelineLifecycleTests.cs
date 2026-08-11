@@ -19,6 +19,20 @@ public class PipelineLifecycleTests
         await second;
     }
 
+    [TestMethod]
+    public async Task SuccessfulCompletion_PreservesExecutionTaskIdentity()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(runEnqueueAsynchronously: true));
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+        var execution = pipeline.Completion;
+
+        Assert.IsFalse(execution.IsCompleted);
+        await pipeline.CompleteAsync();
+
+        Assert.AreSame(execution, pipeline.Completion,
+            "completion must not publish a completed sentinel before the execution task itself retires");
+    }
+
     /// CompleteAsync() signals the wake signal's CompletionToken. Policies that observe it from
     /// ExecuteItemAsync (e.g., to abort I/O on shutdown) should see cancellation when shutdown fires.
     [TestMethod]

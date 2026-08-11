@@ -400,9 +400,6 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                 _activationGate.Reset();
                 _inFlightRecoveryItem = default!;
                 _advanceDrainWaiter = null;
-                // Preserve a faulted execution task for Completion and CompleteAsync observers.
-                if (fault is null)
-                    _executionTask = Task.CompletedTask;
             }
             catch (Exception teardownEx)
             {
