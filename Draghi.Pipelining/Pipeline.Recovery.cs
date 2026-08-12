@@ -664,10 +664,15 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // on the normal path or BailoutRecoveryOnShutdown on shutdown), so no atomic claim race
         // with teardown is needed; teardown just waits for the advance to drain.
         _inFlightRecoveryItem = recoveryItem;
+        // This recovery owns a live position outside the ordinary in-flight store.
+        Volatile.Write(ref _inFlightRecoveryVisible, true);
 
         if (executeTask.IsCompletedSuccessfully)
         {
-            return RecoverInFlightItemResult(recoveryItem, executeTask.Result, out emptyReached);
+            var completed = RecoverInFlightItemResult(recoveryItem, executeTask.Result, out emptyReached);
+            if (completed)
+                EndRecoveryTenure(claimedSequence);
+            return completed;
         }
 
         // Execute is async, hook continuation. The advance stops here; the continuation owns the position's
@@ -816,8 +821,6 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     void BailoutRecoveryOnShutdown()
     {
         var recoveryItem = _inFlightRecoveryItem;
-        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-            _inFlightRecoveryItem = default!;
         var emptyReached = RetireItemDeferred(
             recoveryItem, _completionException, ownedTurn: _inFlightRecoverySequence);
         // Shutdown still has to leave through the episode's advance license. This settles the retained
@@ -829,24 +832,35 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// being cached or hoisted; .NET has no relaxed atomic load for this weaker requirement.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void SignalDrainWakeupIfWaiting()
-        => Volatile.Read(ref _advanceDrainWaiter)?.TrySetResult();
+        // The full-fence probe is the producer half of DrainOnCompletionAsync's two-location
+        // handshake: either drain observes the completed tenure after publishing its waiter, or
+        // the completing producer observes the waiter after publishing the tenure's end.
+        => Interlocked.CompareExchange(ref _advanceDrainWaiter, null, null)?.TrySetResult();
 
     /// Completes the recovery item on the normal (non-shutdown) recovery path. The continuation
     /// owns completion uncontested. Drain (DrainOnCompletionAsync) only waits for the advancer
     /// advance to drain via ResumeAdvanceAfterRecovery's exit signal.
     void CompleteRecoveryItem(T recoveryItem, Exception? exception)
     {
-        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-            _inFlightRecoveryItem = default!;
         RetireItem(recoveryItem, exception, ownedTurn: _inFlightRecoverySequence);
     }
 
     /// Completes recovery while deferring the empty signal until the advance exits.
     bool CompleteRecoveryItemDeferred(T recoveryItem, Exception? exception)
     {
+        return RetireItemDeferred(recoveryItem, exception, ownedTurn: _inFlightRecoverySequence);
+    }
+
+    void EndRecoveryTenure(long recoverySequence)
+    {
+        // Advancing can install the next recovery before an older resume frame returns. Only the
+        // generation being completed may clear the shared recovery tenure.
+        if (_inFlightRecoverySequence != recoverySequence)
+            return;
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _inFlightRecoveryItem = default!;
-        return RetireItemDeferred(recoveryItem, exception, ownedTurn: _inFlightRecoverySequence);
+        Volatile.Write(ref _inFlightRecoveryVisible, false);
+        SignalDrainWakeupIfWaiting();
     }
 
 }

@@ -76,6 +76,9 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     internal Action? BeforeZeroEdgeSlotPublish;
 
     T _inFlightRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
+    // Publishes the recovery slot to best-effort enumeration. Store the item before true and clear
+    // the flag before clearing the item; value types retain their stale slot value while false.
+    bool _inFlightRecoveryVisible;
     long _inFlightRecoverySequence;          // The recovery position's claim ordinal - the turn identity its completion releases.
     bool _pendingTailActivated;        // The tail was activated on the executor strand and owns its turn directly.
     long _pendingTailGeneration;              // Provisional-turn generation, or zero when activation was not handed off.
@@ -402,6 +405,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                 _inFlight.Reset();
                 _itemTenure.Reset();
                 _activationGate.Reset();
+                _inFlightRecoveryVisible = false;
                 _inFlightRecoveryItem = default!;
                 _advanceDrainWaiter = null;
             }
@@ -417,17 +421,19 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         fault?.Throw();
     }
 
-    /// Waits for both store residents and the non-resident executor item to drain.
+    /// Waits for store residents, the non-resident executor item, and recovery tenure to drain.
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask DrainOnCompletionAsync()
     {
-        while (_inFlight.Count > 0 || Volatile.Read(ref _executingItemVisible) || _inFlight.HasAdvanceOwner)
+        while (_inFlight.Count > 0 || Volatile.Read(ref _executingItemVisible) ||
+               Volatile.Read(ref _inFlightRecoveryVisible) || _inFlight.HasAdvanceOwner)
         {
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             // Full-fence arm before recheck pairs with the advancer's decrement-then-signal.
             Interlocked.Exchange(ref _advanceDrainWaiter, tcs);
             // Re-check post-publish in case the last advancer exited while we were setting up.
-            if (_inFlight.Count == 0 && !Volatile.Read(ref _executingItemVisible) && !_inFlight.HasAdvanceOwner)
+            if (_inFlight.Count == 0 && !Volatile.Read(ref _executingItemVisible) &&
+                !Volatile.Read(ref _inFlightRecoveryVisible) && !_inFlight.HasAdvanceOwner)
             {
                 Volatile.Write(ref _advanceDrainWaiter, null);
                 break;
@@ -647,10 +653,20 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         // The recovery episode held the advance license across the substitute (the license is
         // episode-affine, not thread-affine); resume under it and release through the normal exits.
-        if (AdvanceDecrement(ref emptyReached, out var holdsLicense))
-            Advance(emptyReached);
-        else if (AdvanceExit(emptyReached, releaseLicense: holdsLicense))
-            Advance(emptyReached);
+        // Keep the recovery tenure visible across the zero-edge release/reacquire gap. Without it,
+        // shutdown can observe a false quiescent instant and reset the store while this resume is live.
+        var recoverySequence = _inFlightRecoverySequence;
+        try
+        {
+            if (AdvanceDecrement(ref emptyReached, out var holdsLicense))
+                Advance(emptyReached);
+            else if (AdvanceExit(emptyReached, releaseLicense: holdsLicense))
+                Advance(emptyReached);
+        }
+        finally
+        {
+            EndRecoveryTenure(recoverySequence);
+        }
     }
 }
 

@@ -7,6 +7,88 @@ namespace Draghi.Pipelining.Tests;
 [TestClass]
 public class PipelineConcurrencyTests
 {
+    // Races enumeration with recovery-slot publication and clearing. The recovery has no second
+    // enumerable location, so it may be missed by a best-effort pass but must never appear twice.
+    [TestMethod]
+    public async Task Enumeration_RacesRecoverySlotPublishAndClear()
+    {
+        var recoveryHolder = new TestPipelineItem?[1];
+        var idleHolder = new TaskCompletionSource?[1];
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? Volatile.Read(ref recoveryHolder[0]) : null),
+            onIdle: _ => { Volatile.Read(ref idleHolder[0])?.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var stop = false;
+        Exception? hammerException = null;
+        long hammerPasses = 0;
+        // Ensure the hammer participates even under parallel-suite thread-pool pressure.
+        var hammerStarted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var hammer = Task.Run(() =>
+        {
+            try
+            {
+                hammerStarted.TrySetResult();
+                while (!Volatile.Read(ref stop))
+                {
+                    var recovery = Volatile.Read(ref recoveryHolder[0]);
+                    var recoveryYields = 0;
+                    foreach (var observed in pipeline)
+                    {
+                        if (ReferenceEquals(observed, recovery))
+                            recoveryYields++;
+                    }
+                    Assert.IsTrue(recoveryYields <= 1, "Enumeration yielded the recovery twice in one pass.");
+                    Interlocked.Increment(ref hammerPasses);
+                }
+            }
+            catch (Exception ex)
+            {
+                Volatile.Write(ref hammerException, ex);
+            }
+        });
+
+        await hammerStarted.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+        const int iterations = 100;
+        for (var iteration = 0; iteration < iterations && Volatile.Read(ref hammerException) is null; iteration++)
+        {
+            var recovery = new TestPipelineItem { Name = $"recovery-{iteration}", CompleteAsync = true };
+            Volatile.Write(ref recoveryHolder[0], recovery);
+            var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            Volatile.Write(ref idleHolder[0], idleTcs);
+
+            var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
+            pipeline.Enqueue(item).Execute();
+            // Commit before faulting so recovery runs from the dedicated in-flight slot.
+            await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
+
+            item.CompletePipelineTask();
+            await recovery.WaitForExecutedAsync();
+
+            Assert.IsTrue(SpinWait.SpinUntil(() =>
+            {
+                foreach (var observed in pipeline)
+                {
+                    if (ReferenceEquals(observed, recovery))
+                        return true;
+                }
+                return false;
+            }, TimeSpan.FromSeconds(10)), $"Iteration {iteration}: pending recovery never became enumerable.");
+            Assert.IsFalse(recovery.IsCompleted);
+
+            recovery.CompletePipelineTask();
+            await recovery.WaitForCompleteAsync();
+        }
+
+        Volatile.Write(ref stop, true);
+        await hammer;
+        if (Volatile.Read(ref hammerException) is { } fault)
+            throw fault;
+        Assert.IsTrue(Interlocked.Read(ref hammerPasses) > 0, "Hammer never completed a pass.");
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+    }
+
     [TestMethod]
     public async Task ConcurrentEnqueuers()
     {

@@ -192,6 +192,52 @@ public class PipelineEnumeratorTests
             "Pipeline enumerator should be a struct to support allocation-free foreach.");
     }
 
+    // Regression: a recovery retained outside the in-flight store was invisible to heartbeat
+    // enumeration, freezing a decoder timeout while it waited on socket input.
+    [TestMethod]
+    public async Task PendingInFlightRecovery_EnumeratedExactlyOnce_GoneAfterRetirement()
+    {
+        // A pending pipeline task keeps the recovery in its dedicated slot.
+        var recovery = new TestPipelineItem { Name = "recovery", CompleteAsync = true };
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
+        pipeline.Enqueue(item).Execute();
+        // Commit before faulting so recovery runs from the dedicated in-flight slot.
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        item.CompletePipelineTask();
+        await recovery.WaitForExecutedAsync();
+
+        // SignalExecuted slightly precedes slot publication, so wait for visibility.
+        Assert.IsTrue(SpinWait.SpinUntil(() => CountOccurrences(pipeline, recovery) > 0, TimeSpan.FromSeconds(10)),
+            "Pending in-flight recovery never became enumerable.");
+        Assert.AreEqual(1, CountOccurrences(pipeline, recovery), "Recovery must be yielded exactly once per enumeration.");
+        Assert.AreEqual(0, CountOccurrences(pipeline, item), "The failed item was consumed from the store and must not reappear.");
+        Assert.IsFalse(recovery.IsCompleted, "Recovery must still be pending while enumerated.");
+
+        recovery.CompletePipelineTask();
+        await recovery.WaitForCompleteAsync();
+        Assert.IsNull(recovery.Exception);
+        PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+        Assert.AreEqual(0, CountOccurrences(pipeline, recovery), "Retired recovery must not linger in enumeration.");
+    }
+
+    static int CountOccurrences(ObservablePipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TestPipelineItem item)
+    {
+        var count = 0;
+        foreach (var observed in pipeline)
+        {
+            if (ReferenceEquals(observed, item))
+                count++;
+        }
+        return count;
+    }
+
     [TestMethod]
     public async Task ManualMoveNext_ReturnsFalseAfterLastItem()
     {
