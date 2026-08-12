@@ -16,14 +16,35 @@
 
    The model also includes resident-head activation and phantom-edge release.
    Storage tiers and completion dispatch are abstract relies owned by
-   InFlightStore and ItemTenure. Recovery is composed in Pipeline. *)
+   InFlightStore and ItemTenure. Recovery is composed in Pipeline.
+
+   ACTIVATED-SLOT EXTENSION (2026-08-12): DepthDrain deliberately permits a
+   depth-zero verdict to become stale before its deferred consumer runs. A
+   retirement may therefore sample zero, pause, and later try to clear the
+   activated-item slot while a fresh zero-edge activation is being published.
+   The stale consumer and every zero-edge publisher serialize only the slot
+   recheck/publish/clear through this component's edge lock. Mid-chain slot
+   substitutions are outside this extension because resident tenure excludes
+   the zero-edge clearer.
+
+   The six publisher names map one-for-one to the live C# zero-edge sites. The
+   mutation constant removes the bracket from exactly one site; every such
+   mutation must violate NoStompedActivation. *)
 EXTENDS Integers, Sequences, TLC
 
-CONSTANT N
+CONSTANT N, MUTATED_SLOT_PUBLISHER
 
 Items == 1..N
 NONE == 0
 RetirementPasses == {"W", "P", "E"}
+ZeroEdgePublishers == {
+    "dispatcherSelfActivate",  \* ExecuteSource: fresh provisional turn
+    "dispatcherHandoffReclaim",\* ExecuteSource: reclaim own handoff
+    "emptyEdgeHandoff",        \* ResolveEmptyEdgeHandoff
+    "recoverInitial",          \* RecoverItem: no-resident substitute
+    "recoverRestart",          \* RecoverCommittedPendingTailAsync: no-resident substitute
+    "frontierCommit"           \* CommitInFlightItem: prev = 0
+}
 
 VARIABLES
     executionKind,      \* [Items -> {"self","gated"}] gated completes only once activationPerformed
@@ -42,11 +63,22 @@ VARIABLES
     localActivationHandoff,    \* dispatcher-local placement (writer view)
     visibleActivationHandoff,  \* globally visible placement (weak until fence/propagate)
     handoffClaimed,  \* the published handoff was taken
-    dispatcherPc          \* dispatcher: "idle"|"handoffPublished"|"readInFlightCount"|"acquireSelfClaimLock"|"observeSelfClaim"|"finished"
+    dispatcherPc,         \* dispatcher: "idle"|"handoffPublished"|"readInFlightCount"|"acquireSelfClaimLock"|"observeSelfClaim"|"finished"
+    slotDepth,            \* dispatched-minus-retired depth used by the deferred zero consumer
+    activatedSlot,        \* NONE or the freshly activated item
+    slotPublisherKind,    \* one of the six live zero-edge publication sites
+    slotPublisherPc,      \* "increment" | "acquire" | "publish" | "done"
+    staleClearPc,         \* "sample" | "acquire" | "recheck" | "clear" | "done"
+    stompedActivation     \* a delayed stale-zero clear erased a published activation
 
-vars == <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
-          edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation,
-          localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
+legacyVars == <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
+                edgeLockOwner, publisherPc, publisherItem, passPc, passHead, duplicateActivation,
+                localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
+legacyExceptEdgeVars == <<executionKind, storePublished, activationPerformed, completionPublished, retirementCompleted, completionCallbackRegistered, store, inFlightCount, advanceOwner, advancePending,
+                          publisherPc, publisherItem, passPc, passHead, duplicateActivation,
+                          localActivationHandoff, visibleActivationHandoff, handoffClaimed, dispatcherPc>>
+slotVars == <<slotDepth, activatedSlot, slotPublisherKind, slotPublisherPc, staleClearPc, stompedActivation>>
+vars == <<legacyVars, slotVars>>
 
 InFlightHead == IF store = <<>> THEN NONE ELSE store[1]
 
@@ -60,6 +92,9 @@ Init ==
     /\ passPc = [t \in RetirementPasses |-> "off"] /\ passHead = [t \in RetirementPasses |-> NONE]
     /\ duplicateActivation = FALSE
     /\ localActivationHandoff = FALSE /\ visibleActivationHandoff = FALSE /\ handoffClaimed = FALSE /\ dispatcherPc = "idle"
+    /\ slotDepth = 0 /\ activatedSlot = NONE
+    /\ slotPublisherKind \in ZeroEdgePublishers /\ slotPublisherPc = "increment"
+    /\ staleClearPc = "sample" /\ stompedActivation = FALSE
 
 -------------------------------------------------------------------------------
 (* Task completions and fires. *)
@@ -330,11 +365,81 @@ DispatcherResolveSelfClaim ==
 
 -------------------------------------------------------------------------------
 
+(* Activated-slot zero-edge bracket.
+
+   The depth increment intentionally precedes the edge-lock acquisition, as in
+   the implementation. A clearer that already rechecked zero may finish first;
+   the publisher then installs the slot. Conversely, a publisher that installs
+   first makes the clearer's locked recheck observe nonzero. The only forbidden
+   execution is publication inside the clearer's recheck-to-clear interval,
+   which each mutation recreates by bypassing the publisher's lock. *)
+
+StaleClearSampleZero ==
+    /\ staleClearPc = "sample" /\ slotDepth = 0
+    /\ staleClearPc' = "acquire"
+    /\ UNCHANGED <<legacyVars, slotDepth, activatedSlot, slotPublisherKind, slotPublisherPc, stompedActivation>>
+
+StaleClearAcquireLock ==
+    /\ staleClearPc = "acquire" /\ edgeLockOwner = "0"
+    /\ edgeLockOwner' = "C" /\ staleClearPc' = "recheck"
+    /\ UNCHANGED <<legacyExceptEdgeVars, slotDepth, activatedSlot, slotPublisherKind, slotPublisherPc, stompedActivation>>
+
+StaleClearRecheck ==
+    /\ staleClearPc = "recheck" /\ edgeLockOwner = "C"
+    /\ IF slotDepth = 0
+          THEN /\ staleClearPc' = "clear" /\ UNCHANGED edgeLockOwner
+          ELSE /\ staleClearPc' = "done" /\ edgeLockOwner' = "0"
+    /\ UNCHANGED <<legacyExceptEdgeVars, slotDepth, activatedSlot, slotPublisherKind, slotPublisherPc, stompedActivation>>
+
+StaleClearSlot ==
+    /\ staleClearPc = "clear" /\ edgeLockOwner = "C"
+    /\ stompedActivation' = (stompedActivation \/ activatedSlot # NONE)
+    /\ activatedSlot' = NONE
+    /\ edgeLockOwner' = "0" /\ staleClearPc' = "done"
+    /\ UNCHANGED <<legacyExceptEdgeVars, slotDepth, slotPublisherKind, slotPublisherPc>>
+
+ZeroEdgePublisherIncrementDepth ==
+    /\ slotPublisherPc = "increment"
+    /\ slotDepth' = slotDepth + 1
+    /\ slotPublisherPc' = "acquire"
+    /\ UNCHANGED <<legacyVars, activatedSlot, slotPublisherKind, staleClearPc, stompedActivation>>
+
+ZeroEdgePublisherAcquireLock ==
+    /\ slotPublisherPc = "acquire"
+    /\ slotPublisherKind # MUTATED_SLOT_PUBLISHER
+    /\ edgeLockOwner = "0" /\ edgeLockOwner' = "Z"
+    /\ slotPublisherPc' = "publish"
+    /\ UNCHANGED <<legacyExceptEdgeVars, slotDepth, activatedSlot, slotPublisherKind, staleClearPc, stompedActivation>>
+
+ZeroEdgePublisherPublish ==
+    /\ slotPublisherPc = "publish" /\ edgeLockOwner = "Z"
+    /\ activatedSlot' = 1 /\ slotPublisherPc' = "done"
+    /\ edgeLockOwner' = "0"
+    /\ UNCHANGED <<legacyExceptEdgeVars, slotDepth, slotPublisherKind, staleClearPc, stompedActivation>>
+
+ZeroEdgePublisherPublishWithoutBracket ==
+    /\ slotPublisherPc = "acquire"
+    /\ slotPublisherKind = MUTATED_SLOT_PUBLISHER
+    /\ activatedSlot' = 1 /\ slotPublisherPc' = "done"
+    /\ UNCHANGED <<legacyVars, slotDepth, slotPublisherKind, staleClearPc, stompedActivation>>
+
+SlotNext ==
+    \/ StaleClearSampleZero
+    \/ StaleClearAcquireLock
+    \/ StaleClearRecheck
+    \/ StaleClearSlot
+    \/ ZeroEdgePublisherIncrementDepth
+    \/ ZeroEdgePublisherAcquireLock
+    \/ ZeroEdgePublisherPublish
+    \/ ZeroEdgePublisherPublishWithoutBracket
+
+-------------------------------------------------------------------------------
+
 AllRetired == (\A i \in Items : retirementCompleted[i])
               /\ (dispatcherPc \in {"idle", "finished"}) /\ (dispatcherPc = "finished" => handoffClaimed)
 Finished == AllRetired /\ UNCHANGED vars
 
-Next ==
+LegacyNext ==
     \/ \E i \in Items : PublishTaskCompletion(i)
     \/ \E t \in {"W","P"}, i \in Items : RunCompletionCallback(t, i)
     \/ \E t \in RetirementPasses :
@@ -342,6 +447,10 @@ Next ==
          \/ PassAcquireEmptyEdgeHandoffLock(t) \/ PassObserveEmptyEdgeHandoff(t) \/ PassResolveEmptyEdgeHandoff(t) \/ PassExit(t)
     \/ PublisherIncrementInFlightCount \/ PublisherAcquireEmptyEdgeLock \/ PublisherPublishAtEmptyEdge \/ PublisherPublishResidentItem \/ PublisherReadAdvanceLicense \/ PublisherFinishRetirementPass \/ PublisherFinish
     \/ DispatcherPublishHandoff \/ DispatcherFenceHandoffPublication \/ PropagateHandoff \/ DispatcherReadInFlightCount \/ DispatcherAcquireSelfClaimLock \/ DispatcherObserveSelfClaim \/ DispatcherResolveSelfClaim
+
+Next ==
+    \/ LegacyNext /\ UNCHANGED slotVars
+    \/ SlotNext
     \/ Finished
 
 Spec == Init /\ [][Next]_vars
@@ -357,9 +466,11 @@ AtMostOneActivatedItemResident ==
 
 PendingAdvanceHasOwner == advancePending => advanceOwner # "0"
 
-EdgeLockOwnerValid == edgeLockOwner \in {"0", "D"} \cup RetirementPasses   \* structural (typing)
+EdgeLockOwnerValid == edgeLockOwner \in {"0", "C", "D", "Z"} \cup RetirementPasses   \* structural (typing)
 
 InFlightCountNonNegative == inFlightCount >= 0   \* over-promise never under-runs: no -1 skew exists
+
+NoStompedActivation == ~stompedActivation
 
 \* NO-ORPHAN, by deadlock detection (the EdgeLockBail discipline): Finished is the
 \* The only self-loop requires every item retirementCompleted and the handoff turn

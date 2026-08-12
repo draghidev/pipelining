@@ -29,6 +29,7 @@ public class ActivatedItemReductionTests
         // Activate(next) end up on DIFFERENT threads - pipeline-task completions and
         // ActivateHeadItem work items each schedule onto TP independently and race.
         public TaskCompletionSource PipelineTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+        public TaskCompletionSource ActivatedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
         public ValueTask GetPipelineTask() => new(PipelineTcs.Task);
 
         // Tenure-reuse support: models Reset() + re-enqueue of the SAME instance (the pooled-item
@@ -39,6 +40,7 @@ public class ActivatedItemReductionTests
         public void Reset()
         {
             PipelineTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
+            ActivatedTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
             CurrentTenure = new();
         }
     }
@@ -133,13 +135,16 @@ public class ActivatedItemReductionTests
         readonly bool _activateOnTp;
         readonly PipelineHolder? _holder;
         readonly bool _holdRelease;
+        readonly bool _verifyFrameworkSlot;
 
-        public ProbePolicy(ActivationProbe probe, bool activateOnTp, PipelineHolder? holder = null, bool holdRelease = false)
+        public ProbePolicy(ActivationProbe probe, bool activateOnTp, PipelineHolder? holder = null,
+            bool holdRelease = false, bool verifyFrameworkSlot = false)
         {
             _probe = probe;
             _activateOnTp = activateOnTp;
             _holder = holder;
             _holdRelease = holdRelease;
+            _verifyFrameworkSlot = verifyFrameworkSlot;
         }
 
         public ValueTask<PipelineItemResult> ExecuteItemAsync(SyntheticItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
@@ -147,6 +152,21 @@ public class ActivatedItemReductionTests
 
         public void ActivateHeadItem(SyntheticItem item, bool preferAsync = true)
         {
+            if (_verifyFrameworkSlot)
+            {
+                _probe.Activate(item);
+                // This callback is the production BindDecoder boundary: the framework published
+                // ActivatedItem immediately before entering it. Keep sampling briefly so a prior
+                // retirement that already sampled zero can expose an unbracketed late clear.
+                for (var i = 0; i < 64; i++)
+                {
+                    if (!ReferenceEquals(_holder!.Pipeline!.Pipeline.ActivatedItem, item))
+                        Interlocked.Increment(ref _probe.Asserts);
+                    Thread.Yield();
+                }
+                item.ActivatedTcs.TrySetResult();
+                return;
+            }
             if (_holdRelease)
             {
                 // Activate now, then complete the pipeline task after a brief delay on a separate TP
@@ -365,6 +385,10 @@ public class ActivatedItemReductionTests
     // hazard-free.
     [TestMethod] public Task TenureReuse_Cas_ReleaseBeforeComplete() => RunReuseBatch(1, 10, 150, NullPolicy.DepthZeroWithCas);
 
+    [TestMethod]
+    public Task FrameworkSlot_NeverNullWhileLive_PipelinedBroad()
+        => RunSlotNeverNullWhileLive(60, 8);
+
     // The framework's own _activatedItem slot (read by Slon via Control.ActivatedFlow), under
     // pipelined load with MANY items concurrently in-flight. The production contract: the sole reader
     // (PgDecoder.CurrentExecutionControl) reads the slot only while an activated flow's own body is
@@ -456,5 +480,65 @@ public class ActivatedItemReductionTests
         }
     }
 
-    [TestMethod] public Task FrameworkSlot_NeverNullWhileLive_Pipelined() => RunSlotNeverNullWhileLive(60, 8);
+    // Pause the real depth-zero clear while it owns the edge lock, then run the real zero-edge
+    // publication helper concurrently. The policy callback must not start until the clear finishes.
+    // Removing the publisher-side lock makes this fail deterministically.
+    static async Task RunFrameworkSlotZeroEdgeRace(int iterations)
+    {
+        for (var i = 0; i < iterations; i++)
+        {
+            var probe = new ActivationProbe { Policy = NullPolicy.NeverNull };
+            var holder = new PipelineHolder();
+            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(
+                new(probe, activateOnTp: false, holder, verifyFrameworkSlot: true));
+            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+            holder.Pipeline = pipeline;
+
+            var clearEntered = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var publishAttempted = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            using var releaseClear = new ManualResetEventSlim();
+            pipeline.Pipeline.BeforeDepthZeroSlotClear = _ =>
+            {
+                clearEntered.TrySetResult();
+                releaseClear.Wait();
+            };
+
+            var predecessor = new SyntheticItem { Id = i * 2 };
+            pipeline.Enqueue(predecessor).Execute();
+            await predecessor.ActivatedTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+            predecessor.PipelineTcs.TrySetResult();
+            await clearEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            var successor = new SyntheticItem { Id = i * 2 + 1 };
+            Task activation;
+            bool enteredWhileClearHeld;
+            try
+            {
+                pipeline.Pipeline.BeforeZeroEdgeSlotPublish = () => publishAttempted.TrySetResult();
+                activation = Task.Run(() => pipeline.Pipeline.ActivateHeadItemAtZeroEdge(successor, preferAsync: false));
+                await publishAttempted.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                enteredWhileClearHeld = successor.ActivatedTcs.Task.IsCompleted;
+            }
+            finally
+            {
+                releaseClear.Set();
+            }
+            await activation.WaitAsync(TimeSpan.FromSeconds(5));
+            await pipeline.CompleteAsync();
+
+            if (enteredWhileClearHeld)
+            {
+                Assert.Fail($"iteration={i}: successor activation entered before the prior depth-zero clear released its lock.");
+            }
+            Assert.AreEqual(0, Volatile.Read(ref probe.Asserts), $"iteration={i}: activated slot changed during the successor callback.");
+        }
+    }
+
+    [TestMethod, DoNotParallelize]
+    public Task FrameworkSlot_NeverNullWhileLive_Pipelined()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 100;
+        return RunFrameworkSlotZeroEdgeRace(iterations);
+    }
 }

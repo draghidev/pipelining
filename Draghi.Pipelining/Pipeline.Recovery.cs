@@ -61,10 +61,12 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             var recoveryLock = _activationGate.EdgeLock;
             recoveryLock.Enter();
             recoveryGeneration = _activationGate.ClaimOrInheritProvisionalTurn(candidateGeneration);
+            if (recoveryGeneration != 0)
+                SetActivatedItem(recoveryItem);
             recoveryLock.Exit();
             if (recoveryGeneration != 0)
             {
-                ActivateHeadItem(recoveryItem, preferAsync: false);
+                ActivatePublishedHeadItem(recoveryItem, preferAsync: false);
                 recoveryActivated = true;
             }
             else
@@ -373,6 +375,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             var recoveryLock = _activationGate.EdgeLock;
             recoveryLock.Enter();
             recoveryGeneration = _activationGate.ClaimOrInheritProvisionalTurn(candidateGeneration);
+            if (recoveryGeneration != 0)
+                SetActivatedItem(recoveryItem);
             recoveryLock.Exit();
             if (recoveryGeneration == 0)
             {
@@ -380,7 +384,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             }
             else
             {
-                ActivateHeadItem(recoveryItem, preferAsync: false);
+                ActivatePublishedHeadItem(recoveryItem, preferAsync: false);
                 recoveryActivated = true;
             }
         }
@@ -513,7 +517,22 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // transient null between items is safe because activated work cannot run in that gap.
         if (depth is 0)
         {
-            SetActivatedItem(default!);
+            var edgeLock = _activationGate.EdgeLock;
+            edgeLock.Enter();
+            try
+            {
+                // DecrementDepth's zero verdict may be stale by this deferred consumer. Serialize
+                // the recheck with every zero-edge identity publication before clearing the slot.
+                if (_depthState.Depth is 0)
+                {
+                    BeforeDepthZeroSlotClear?.Invoke(ownedTurn);
+                    SetActivatedItem(default!);
+                }
+            }
+            finally
+            {
+                edgeLock.Exit();
+            }
         }
         // Owner-checked release cannot clear a successor's turn.
         if (ownedTurn != 0)
@@ -542,7 +561,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             {
                 // An incomplete head activates while still exclusively unpublished. A completed head
                 // needs only callback delivery to drive advancement.
-                ActivateHeadItem(item, preferAsync: false);
+                ActivateHeadItemAtZeroEdge(item, preferAsync: false);
             }
             // Sole head: no claim can run before our publish, so the ordinal read is stable.
             var sequence = _itemTenure.HeadSequence;

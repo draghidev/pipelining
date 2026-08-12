@@ -89,6 +89,25 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         _policy.ActivateHeadItem(item, preferAsync);
     }
 
+    /// Publishes a newly dispatched zero-edge owner under the same lock used by a delayed
+    /// depth-zero clear. The policy callback remains outside the non-reentrant edge lock.
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    internal void ActivateHeadItemAtZeroEdge(T item, bool preferAsync = true)
+    {
+        BeforeZeroEdgeSlotPublish?.Invoke();
+        var edgeLock = _activationGate.EdgeLock;
+        edgeLock.Enter();
+        // Publication is only non-throwing stores/interlocked operations. Keep this bracket EH-free so
+        // the zero-edge transition remains inlineable while still excluding the delayed clear.
+        SetActivatedItem(item);
+        edgeLock.Exit();
+        _policy.ActivateHeadItem(item, preferAsync);
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    void ActivatePublishedHeadItem(T item, bool preferAsync = true)
+        => _policy.ActivateHeadItem(item, preferAsync);
+
     /// Resolves the item's activation handoff and clears executor visibility. True gives the caller
     /// completion ownership; false means the empty-edge pass owns activation and the item must enter
     /// the store. This uses plain consume because residents may legitimately hold the activation turn.

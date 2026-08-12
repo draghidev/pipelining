@@ -71,6 +71,10 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     ItemTenure _itemTenure;
     ActivationGate<T> _activationGate;
 
+    // Focused test seams for the depth-zero slot handoff. Null in production.
+    internal Action<long>? BeforeDepthZeroSlotClear;
+    internal Action? BeforeZeroEdgeSlotPublish;
+
     T _inFlightRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
     long _inFlightRecoverySequence;          // The recovery position's claim ordinal - the turn identity its completion releases.
     bool _pendingTailActivated;        // The tail was activated on the executor strand and owns its turn directly.
@@ -259,7 +263,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     if (_activationGate.TryClaimProvisionalTurn(generation))
                     {
                         executionGeneration = generation;
-                        ActivateHeadItem(item, preferAsync: false);
+                        ActivateHeadItemAtZeroEdge(item, preferAsync: false);
                         activated = true;
                     }
                     else
@@ -275,7 +279,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     Interlocked.MemoryBarrier();
                     if (_inFlight.Count is 0 && _activationGate.TryReclaimHandoff(executionGeneration))
                     {
-                        ActivateHeadItem(item, preferAsync: false);
+                        ActivateHeadItemAtZeroEdge(item, preferAsync: false);
                         activated = true;
                     }
                 }
@@ -615,7 +619,12 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             && _activationGate.TryClaimProvisionalTurn(turnGeneration))
         {
             claimed = _activationGate.TryTakeHandoff(turnGeneration);
-            if (!claimed)
+            if (claimed)
+            {
+                // The identity store shares the edge bracket with a delayed depth-zero clear.
+                SetActivatedItem(captured);
+            }
+            else
             {
                 _activationGate.Release(-turnGeneration);
                 captured = default!;
@@ -626,7 +635,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         {
             return;
         }
-        ActivateHeadItem(captured, preferAsync: true);
+        ActivatePublishedHeadItem(captured, preferAsync: true);
         // Recovery may inherit this generation only after the original activation call returns.
         _activationGate.MarkHandoffResolved(turnGeneration);
     }
