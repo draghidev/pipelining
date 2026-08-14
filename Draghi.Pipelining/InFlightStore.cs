@@ -313,15 +313,31 @@ struct InFlightStore<T>
         slotItem = hasSlotItem ? _slotItem : default!;
     }
 
-    /// Clears per-run slot references. An allocated queue is empty at completion and retained for reuse.
+    /// <summary>Validates that executor termination reached structural quiescence.</summary>
+    public void EnsureIdle()
+    {
+        var word = Volatile.Read(ref _countWord);
+        var slotState = Volatile.Read(ref _slotState);
+        var queueEmpty = Volatile.Read(ref _queue) is not { } queue || queue.IsEmpty;
+        if (word == 0 && slotState == SlotEmpty && queueEmpty)
+            return;
+
+        throw new UnreachableException(
+            $"Pipeline store remained live at structural quiescence " +
+            $"(count={CountOf(word)}, advanceHeld={IsAdvanceHeld(word)}, " +
+            $"advancePending={IsAdvancePending(word)}, slotState={slotState}, queueEmpty={queueEmpty}).");
+    }
+
+    /// Clears all per-run storage and ownership state. An allocated queue is retained for reuse.
     public void Reset()
     {
-        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-        {
-            _slotItem = default!;
-        }
+        _slotState = SlotEmpty;
+        _slotItem = default!;
         _slotTask = default;
-        Debug.Assert(_slotState == SlotEmpty);
-        Debug.Assert(CountOf(Volatile.Read(ref _countWord)) == 0);
+        _queue?.Clear();
+        // Structural termination owns imbalance diagnostics. Reuse starts a fresh tenure even when
+        // the preceding one was condemned, so no storage, count, or advance-license state may carry
+        // across it.
+        _countWord = 0;
     }
 }

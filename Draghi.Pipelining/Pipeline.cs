@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.ExceptionServices;
@@ -71,10 +72,6 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     ItemTenure _itemTenure;
     ActivationGate<T> _activationGate;
 
-    // Focused test seams for the depth-zero slot handoff. Null in production.
-    internal Action<long>? BeforeDepthZeroSlotClear;
-    internal Action? BeforeZeroEdgeSlotPublish;
-
     T _inFlightRecoveryItem = default!; // The item being recovered, for the bailout/completion paths to access.
     // Publishes the recovery slot to best-effort enumeration. Store the item before true and clear
     // the flag before clearing the item; value types retain their stale slot value while false.
@@ -110,6 +107,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         _policy = policy;
         _source = source;
         _shutdownSlot = null;
+        _pulling = false;
 
         // Depth is counted at DISPATCH (the executor's single-consumer pull), not at enqueue, so the
         // source needs no depth-increment hook. Pipeline doesn't pass a CT here: source owns
@@ -142,7 +140,11 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     // Covers the dequeue-to-depth-increment gap for external empty observations.
     bool _pulling;
-    internal bool IsPulling => Volatile.Read(ref _pulling);
+
+    // An item is always in backlog, pulling, or depth. The second depth read closes the transition
+    // from pulling to dispatched.
+    internal bool IsEmpty(int backlog)
+        => backlog is 0 && Depth is 0 && !Volatile.Read(ref _pulling) && Depth is 0;
 
     /// <summary>
     /// Waits for the pipeline to be empty: both in-flight (<see cref="Depth"/>) and backlog
@@ -381,33 +383,10 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             try
             {
                 await DrainOnCompletionAsync();
-
-                // If CompleteAsync is still inside enumerator.Complete, install its signal before disposal.
-                var prev = Interlocked.CompareExchange(ref _shutdownSlot, Pipeline.ShutdownDone, null);
-                if (prev is not null && !ReferenceEquals(prev, Pipeline.ShutdownDone))
-                {
-                    var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
-                    if (ReferenceEquals(Interlocked.CompareExchange(ref _shutdownSlot, tcs, Pipeline.ShutdownInFlight), Pipeline.ShutdownInFlight))
-                        await tcs.Task.ConfigureAwait(false);
-                }
+                if (PrepareEnumeratorDisposal() is { } disposalWaiter)
+                    await disposalWaiter.ConfigureAwait(false);
                 await _enumerator.DisposeAsync().ConfigureAwait(false);
-
-                // Release per-run references after full quiescence.
-                _completionException = null;
-                _policy = default!;
-                _source = default!;
-                _enumerator = default;
-                _pendingTail = default!;
-                _pendingTailTask = default;
-                // Clear public slots for reference and value-type pipelines.
-                SetExecutingItem(default!);
-                SetActivatedItem(default!);
-                _inFlight.Reset();
-                _itemTenure.Reset();
-                _activationGate.Reset();
-                _inFlightRecoveryVisible = false;
-                _inFlightRecoveryItem = default!;
-                _advanceDrainWaiter = null;
+                EnsureQuiescence();
             }
             catch (Exception teardownEx)
             {
@@ -415,25 +394,95 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     ? ExceptionDispatchInfo.Capture(teardownEx)
                     : ExceptionDispatchInfo.Capture(new AggregateException(fault.SourceException, teardownEx));
             }
+            finally
+            {
+                ResetForReuse();
+            }
         }
 
         // Fault the execution task after teardown while preserving the original stack.
         fault?.Throw();
     }
 
-    /// Waits for store residents, the non-resident executor item, and recovery tenure to drain.
+    Task? PrepareEnumeratorDisposal()
+    {
+        // If CompleteAsync is still inside enumerator.Complete, install its signal before disposal.
+        var previous = Interlocked.CompareExchange(ref _shutdownSlot, Pipeline.ShutdownDone, null);
+        if (previous is null || ReferenceEquals(previous, Pipeline.ShutdownDone))
+            return null;
+
+        var waiter = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        return ReferenceEquals(
+            Interlocked.CompareExchange(ref _shutdownSlot, waiter, Pipeline.ShutdownInFlight),
+            Pipeline.ShutdownInFlight)
+            ? waiter.Task
+            : null;
+    }
+
+    void EnsureQuiescence()
+    {
+        _inFlight.EnsureIdle();
+        _itemTenure.EnsureIdle();
+        _activationGate.EnsureIdle();
+        var depth = _depthState.Depth;
+        if (depth != 0)
+        {
+            throw new UnreachableException(
+                $"Pipeline reached structural quiescence with an imbalanced depth ledger ({depth}).");
+        }
+        if (Volatile.Read(ref _executingItemVisible) || Volatile.Read(ref _hasPendingTail)
+            || Volatile.Read(ref _inFlightRecoveryVisible)
+            || Volatile.Read(ref _advanceDrainWaiter) is not null)
+        {
+            throw new UnreachableException(
+                "Pipeline retained executor, pending-tail, recovery, or drain-waiter state " +
+                "at structural quiescence.");
+        }
+    }
+
+    /// <summary>Leaves a completed or condemned tenure as a clean, reusable shell.</summary>
+    void ResetForReuse()
+    {
+        _completionException = null;
+        _policy = default!;
+        _source = default!;
+        _enumerator = default;
+        _pulling = false;
+        _pendingTail = default!;
+        _hasPendingTail = false;
+        _pendingTailTask = default;
+        _pendingTailActivated = false;
+        _pendingTailGeneration = 0;
+        // Clear public slots for reference and value-type pipelines.
+        SetExecutingItem(default!);
+        _executingItemVisible = false;
+        SetActivatedItem(default!);
+        _inFlight.Reset();
+        _itemTenure.Reset();
+        _activationGate.Reset();
+        _depthState.Reset();
+        _inFlightRecoveryVisible = false;
+        _inFlightRecoveryItem = default!;
+        _inFlightRecoverySequence = 0;
+        _advanceDrainWaiter = null;
+    }
+
+    /// Waits for store residents, the non-resident executor item, recovery tenure, and delivered
+    /// callback tails to drain.
     [MethodImpl(MethodImplOptions.NoInlining)]
     async ValueTask DrainOnCompletionAsync()
     {
         while (_inFlight.Count > 0 || Volatile.Read(ref _executingItemVisible) ||
-               Volatile.Read(ref _inFlightRecoveryVisible) || _inFlight.HasAdvanceOwner)
+               Volatile.Read(ref _inFlightRecoveryVisible) || _inFlight.HasAdvanceOwner ||
+               _itemTenure.HasActiveCompletionCallback)
         {
             var tcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
             // Full-fence arm before recheck pairs with the advancer's decrement-then-signal.
             Interlocked.Exchange(ref _advanceDrainWaiter, tcs);
             // Re-check post-publish in case the last advancer exited while we were setting up.
             if (_inFlight.Count == 0 && !Volatile.Read(ref _executingItemVisible) &&
-                !Volatile.Read(ref _inFlightRecoveryVisible) && !_inFlight.HasAdvanceOwner)
+                !Volatile.Read(ref _inFlightRecoveryVisible) && !_inFlight.HasAdvanceOwner &&
+                !_itemTenure.HasActiveCompletionCallback)
             {
                 Volatile.Write(ref _advanceDrainWaiter, null);
                 break;
@@ -455,11 +504,19 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         // Publish delivery before the license operation so a serving holder may safely claim the head.
         _itemTenure.MarkCompletionCallbackDelivered();
-        if (!_inFlight.TryAcquireAdvanceOrRequest())
+        try
         {
-            return;
+            if (!_inFlight.TryAcquireAdvanceOrRequest())
+                return;
+            Advance();
         }
-        Advance();
+        finally
+        {
+            _itemTenure.CompleteCompletionCallback();
+            // The callback can be the final activity after another driver consumed its item between
+            // delivery publication and this acquire-or-deposit tail.
+            SignalDrainWakeupIfWaiting();
+        }
     }
 
     /// Retires completed FIFO heads and installs activation plus the callback at the next live head.
@@ -641,9 +698,15 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         {
             return;
         }
-        ActivatePublishedHeadItem(captured, preferAsync: true);
-        // Recovery may inherit this generation only after the original activation call returns.
-        _activationGate.MarkHandoffResolved(turnGeneration);
+        try
+        {
+            ActivatePublishedHeadItem(captured, preferAsync: true);
+        }
+        finally
+        {
+            // Recovery may inherit this generation only after the original activation call returns.
+            _activationGate.MarkHandoffResolved(turnGeneration);
+        }
     }
 
     /// Resume the advance from a recovery continuation that has just retired its substitute

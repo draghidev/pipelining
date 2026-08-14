@@ -13,14 +13,17 @@ namespace Draghi.Pipelining.Tests;
 sealed class ThrowingSourceState<T>
 {
     public readonly Queue<T> Items;
+    public readonly Exception? PullThrow;
     public readonly Exception? WaitThrow;
     public readonly Exception? DisposeThrow;
     public readonly TaskCompletionSource<bool>? WaitGate;
     public readonly CancellationTokenSource Cts = new();
 
-    public ThrowingSourceState(IEnumerable<T> items, Exception? waitThrow, Exception? disposeThrow, bool gateWait)
+    public ThrowingSourceState(
+        IEnumerable<T> items, Exception? pullThrow, Exception? waitThrow, Exception? disposeThrow, bool gateWait)
     {
         Items = new Queue<T>(items);
+        PullThrow = pullThrow;
         WaitThrow = waitThrow;
         DisposeThrow = disposeThrow;
         WaitGate = gateWait ? new TaskCompletionSource<bool>(TaskCreationOptions.RunContinuationsAsynchronously) : null;
@@ -33,8 +36,9 @@ readonly struct ThrowingSource<T> : IPipelineSource<T, ThrowingSource<T>.Enumera
     ThrowingSource(ThrowingSourceState<T> state) => _state = state;
 
     public static ThrowingSource<T> Create(
-        IEnumerable<T>? items = null, Exception? waitThrow = null, Exception? disposeThrow = null, bool gateWait = false)
-        => new(new ThrowingSourceState<T>(items ?? Array.Empty<T>(), waitThrow, disposeThrow, gateWait));
+        IEnumerable<T>? items = null, Exception? pullThrow = null, Exception? waitThrow = null,
+        Exception? disposeThrow = null, bool gateWait = false)
+        => new(new ThrowingSourceState<T>(items ?? Array.Empty<T>(), pullThrow, waitThrow, disposeThrow, gateWait));
 
     // Faults the gated empty-wait, landing a source fault while pre-loaded items are still in flight.
     public void TriggerWaitThrow(Exception ex) => _state.WaitGate!.SetException(ex);
@@ -56,6 +60,8 @@ readonly struct ThrowingSource<T> : IPipelineSource<T, ThrowingSource<T>.Enumera
 
         public bool TryGetNext([MaybeNullWhen(false)] out T item)
         {
+            if (_state.PullThrow is { } ex)
+                throw ex;
             if (_state.Items.Count > 0)
             {
                 item = _state.Items.Dequeue();

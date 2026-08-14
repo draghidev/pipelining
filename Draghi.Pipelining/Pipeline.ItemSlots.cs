@@ -92,9 +92,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// Publishes a newly dispatched zero-edge owner under the same lock used by a delayed
     /// depth-zero clear. The policy callback remains outside the non-reentrant edge lock.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    internal void ActivateHeadItemAtZeroEdge(T item, bool preferAsync = true)
+    void ActivateHeadItemAtZeroEdge(T item, bool preferAsync = true)
     {
-        BeforeZeroEdgeSlotPublish?.Invoke();
         var edgeLock = _activationGate.EdgeLock;
         edgeLock.Enter();
         // Publication is only non-throwing stores/interlocked operations. Keep this bracket EH-free so

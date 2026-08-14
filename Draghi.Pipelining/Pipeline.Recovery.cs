@@ -16,7 +16,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         // A foreign provisional turn belongs to the matching empty-edge pass. Wait for activation to return.
         if (!activated && failedTurn != 0)
-            WaitForRecoveryHandoff(-failedTurn, cancellationToken);
+            WaitForRecoveryHandoff(-failedTurn);
 
         T? recoveryCandidate;
         bool recovered;
@@ -80,45 +80,56 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             recoveryGeneration = _activationGate.PublishHandoff(recoveryItem);
         }
 
+        PipelineItemResult result;
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, pipelineTaskRecovery: false, _enumerator.CompletionToken).ConfigureAwait(false);
+            result = await _policy.ExecuteItemAsync(
+                recoveryItem, pipelineTaskRecovery: false, _enumerator.CompletionToken).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
                 await result.TrailingExecutionTask.ConfigureAwait(false);
-
-            if (result.PipelineTask.IsCompleted)
-            {
-                if (ClearExecutingItem(recoveryActivated))
-                {
-                    result.PipelineTask.GetAwaiter().GetResult();
-                    RetireItem(recoveryItem, null, ownedTurn: GetActivationOwner(recoveryActivated, ownsTurn: true, recoveryGeneration));
-                }
-                else
-                {
-                    // A provisional turn claimed during recovery routes through the store.
-                    CommitInFlightItem(recoveryItem, activateAtCommit: false, ownsTurn: false, turnGeneration: recoveryGeneration, GuardRecoveryTask(result.PipelineTask));
-                }
-            }
-            else
-            {
-                // Re-enter the normal pending-tail lifecycle without exposing the item twice. Guard its
-                // late task fault from recursively entering recovery.
-                Volatile.Write(ref _executingItemVisible, false);
-                _pendingTail = recoveryItem;
-                _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
-                _pendingTailActivated = recoveryActivated;
-                _pendingTailGeneration = recoveryGeneration;
-                Volatile.Write(ref _hasPendingTail, true);
-            }
         }
         catch (Exception recoveryEx)
         {
-            // No pending tail to observe here: the only _pendingTail publish in the try
-            // is in the trailing pending branch, which doesn't throw.
             var ownedEx = ClearExecutingItem(recoveryActivated);
             RetireItem(recoveryItem, recoveryEx,
                 ownedTurn: GetActivationOwner(recoveryActivated, ownedEx, recoveryGeneration));
+            return;
+        }
+
+        if (result.PipelineTask.IsCompleted)
+        {
+            if (ClearExecutingItem(recoveryActivated))
+            {
+                Exception? pipelineException = null;
+                try
+                {
+                    result.PipelineTask.GetAwaiter().GetResult();
+                }
+                catch (Exception pipelineTaskException)
+                {
+                    pipelineException = pipelineTaskException;
+                }
+                RetireItem(recoveryItem, pipelineException,
+                    ownedTurn: GetActivationOwner(recoveryActivated, ownsTurn: true, recoveryGeneration));
+            }
+            else
+            {
+                // A provisional turn claimed during recovery routes through the store.
+                CommitInFlightItem(recoveryItem, activateAtCommit: false, ownsTurn: false,
+                    turnGeneration: recoveryGeneration, GuardRecoveryTask(result.PipelineTask));
+            }
+        }
+        else
+        {
+            // Re-enter the normal pending-tail lifecycle without exposing the item twice. Guard its
+            // late task fault from recursively entering recovery.
+            Volatile.Write(ref _executingItemVisible, false);
+            _pendingTail = recoveryItem;
+            _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
+            _pendingTailActivated = recoveryActivated;
+            _pendingTailGeneration = recoveryGeneration;
+            Volatile.Write(ref _hasPendingTail, true);
         }
     }
 
@@ -192,8 +203,12 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             // The substitute inherits the failed item's turn. A self-activated item has no handoff
             // observer to await; only a lost deferred consume requires the generation wait.
             if (!activated)
-                WaitForRecoveryHandoff(failedGeneration, cancellationToken);
+                WaitForRecoveryHandoff(failedGeneration);
             recoveryGeneration = failedGeneration;
+            // This is an identity replacement inside the failed item's existing depth tenure, not a
+            // new zero-edge publication. The executor is the sole depth producer and FIFO retirement
+            // cannot reach zero while this inherited credit is live, so no depth-zero clear can race
+            // this store. Taking EdgeLock here would hide a broken depth/retirement invariant.
             ActivateHeadItem(recoveryItem, preferAsync: false);
             recoveryActivated = true;
         }
@@ -201,59 +216,14 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         Debug.Assert(Interlocked.Exchange(ref _recoverySwapGuard, 0) == 1);
 #endif
 
+        PipelineItemResult result;
         try
         {
-            var result = await _policy.ExecuteItemAsync(recoveryItem, pipelineTaskRecovery: false, _enumerator.CompletionToken).ConfigureAwait(false);
+            result = await _policy.ExecuteItemAsync(
+                recoveryItem, pipelineTaskRecovery: false, _enumerator.CompletionToken).ConfigureAwait(false);
 
             if (!result.TrailingExecutionTask.IsCompletedSuccessfully)
-            {
-                try
-                {
-                    await result.TrailingExecutionTask.ConfigureAwait(false);
-                }
-                catch (Exception trailingEx)
-                {
-                    _hasPendingTail = false;
-                    _pendingTailTask = default;
-                    var ownedTrail = ClearExecutingItem(recoveryActivated);
-                    RetireItem(recoveryItem, trailingEx,
-                        ownedTurn: GetActivationOwner(recoveryActivated, ownedTrail, recoveryGeneration));
-                    return;
-                }
-            }
-
-            if (result.PipelineTask.IsCompleted)
-            {
-                _hasPendingTail = false;
-                _pendingTailTask = default;
-                if (ClearExecutingItem(recoveryActivated))
-                {
-                    Exception? pipelineEx = null;
-                    try
-                    {
-                        result.PipelineTask.GetAwaiter().GetResult();
-                    }
-                    catch (Exception e)
-                    {
-                        pipelineEx = e;
-                    }
-                    RetireItem(recoveryItem, pipelineEx,
-                        ownedTurn: GetActivationOwner(recoveryActivated, ownsTurn: true, recoveryGeneration));
-                }
-                else
-                {
-                    // The empty-edge pass owns the provisional turn, so route through the store.
-                    CommitInFlightItem(recoveryItem, activateAtCommit: false, ownsTurn: false, turnGeneration: recoveryGeneration, GuardRecoveryTask(result.PipelineTask));
-                }
-                return;
-            }
-
-            // Guarded for the same reason as RecoverItem's tail transition: the substitute's own
-            // late fault completes it directly, never re-enters recovery.
-            _pendingTail = recoveryItem;
-            _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
-            _pendingTailActivated = recoveryActivated;
-            _pendingTailGeneration = recoveryGeneration;
+                await result.TrailingExecutionTask.ConfigureAwait(false);
         }
         catch (Exception recoveryEx)
         {
@@ -264,7 +234,42 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             var ownedRec = ClearExecutingItem(recoveryActivated);
             RetireItem(recoveryItem, recoveryEx,
                 ownedTurn: GetActivationOwner(recoveryActivated, ownedRec, recoveryGeneration));
+            return;
         }
+
+        if (result.PipelineTask.IsCompleted)
+        {
+            _hasPendingTail = false;
+            _pendingTailTask = default;
+            if (ClearExecutingItem(recoveryActivated))
+            {
+                Exception? pipelineException = null;
+                try
+                {
+                    result.PipelineTask.GetAwaiter().GetResult();
+                }
+                catch (Exception pipelineTaskException)
+                {
+                    pipelineException = pipelineTaskException;
+                }
+                RetireItem(recoveryItem, pipelineException,
+                    ownedTurn: GetActivationOwner(recoveryActivated, ownsTurn: true, recoveryGeneration));
+            }
+            else
+            {
+                // The empty-edge pass owns the provisional turn, so route through the store.
+                CommitInFlightItem(recoveryItem, activateAtCommit: false, ownsTurn: false,
+                    turnGeneration: recoveryGeneration, GuardRecoveryTask(result.PipelineTask));
+            }
+            return;
+        }
+
+        // Guarded for the same reason as RecoverItem's tail transition: the substitute's own
+        // late fault completes it directly, never re-enters recovery.
+        _pendingTail = recoveryItem;
+        _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
+        _pendingTailActivated = recoveryActivated;
+        _pendingTailGeneration = recoveryGeneration;
     }
 
     /// Commits the pending tail (if any) to the in-flight store. Called by the executor at the
@@ -487,12 +492,13 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// after losing a generation-pinned handoff consume, which proves that the matching empty-edge pass
     /// already consumed it and is at most one synchronous <see cref="IPipelinePolicy{T}.ActivateHeadItem"/>
     /// call away from publishing the resolution stamp. This is therefore a short rendezvous, not an
-    /// open-ended wait. Cancellation prevents a misbehaving policy call from parking shutdown forever.
+    /// open-ended wait. Cancellation cannot waive the pass's ownership: retiring the item before that
+    /// activation returns would let the depth-zero clear erase its published identity under the callback.
     /// </summary>
-    void WaitForRecoveryHandoff(long generation, CancellationToken cancellationToken)
+    void WaitForRecoveryHandoff(long generation)
     {
         var spin = new SpinWait();
-        while (!_activationGate.IsHandoffResolved(generation) && !cancellationToken.IsCancellationRequested)
+        while (!_activationGate.IsHandoffResolved(generation))
             spin.SpinOnce();
     }
 
@@ -525,7 +531,6 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                 // the recheck with every zero-edge identity publication before clearing the slot.
                 if (_depthState.Depth is 0)
                 {
-                    BeforeDepthZeroSlotClear?.Invoke(ownedTurn);
                     SetActivatedItem(default!);
                 }
             }

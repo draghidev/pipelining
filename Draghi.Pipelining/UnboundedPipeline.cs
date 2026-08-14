@@ -62,9 +62,7 @@ public sealed class UnboundedPipeline<T, TPolicy>
             if (!wait.IsCompleted)
                 Pipeline.RecheckEmpty(Source.Backlog);
             await wait.ConfigureAwait(false);
-            // An item is always in backlog, pulling, or depth. The second depth read closes the
-            // transition from pulling to dispatched.
-            if (Source.Backlog is 0 && Pipeline.Depth is 0 && !Pipeline.IsPulling && Pipeline.Depth is 0)
+            if (Pipeline.IsEmpty(Source.Backlog))
                 return;
         }
     }

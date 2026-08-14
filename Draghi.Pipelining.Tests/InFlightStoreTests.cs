@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Draghi.Pipelining;
 
 namespace Draghi.Pipelining.Tests;
@@ -209,5 +210,23 @@ public class InFlightStoreTests
         Assert.AreEqual(1, item);
         Assert.IsTrue(gate.Release(tenure.LastClaimedSequence), "The retiring owner's identity release must win.");
         Assert.IsTrue(store.DecrementCount(), "Single item: the decrement drains to zero.");
+    }
+
+    [TestMethod]
+    public void Reset_ClearsDirtyStorageAndOwnershipForReuse()
+    {
+        var store = new InFlightStore<int>();
+        Commit(ref store, 1, Completed, out _);
+        Commit(ref store, 2, Completed, out _);
+        Assert.IsTrue(store.TryAcquireAdvanceIfFree());
+
+        Assert.ThrowsExactly<UnreachableException>(store.EnsureIdle);
+        store.Reset();
+
+        store.EnsureIdle();
+        Assert.AreEqual(0, store.Count);
+        Assert.IsFalse(store.HasAdvanceOwner);
+        Assert.IsFalse(store.TrySnapshotSlot(out _));
+        Assert.IsFalse(store.TryDequeue(out _));
     }
 }

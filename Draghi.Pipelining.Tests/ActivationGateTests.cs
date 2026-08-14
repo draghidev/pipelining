@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using Draghi.Pipelining;
 
 namespace Draghi.Pipelining.Tests;
@@ -98,5 +99,21 @@ public class ActivationGateTests
         Assert.AreEqual(1, claimedSequence);
         Assert.IsTrue(gate.Release(claimedSequence));
         Assert.IsTrue(store.DecrementCount());
+    }
+
+    [TestMethod]
+    public void Reset_ClearsDirtyOwnershipWithoutReusingGeneration()
+    {
+        var gate = new ActivationGate<int>();
+        var generation = gate.PublishHandoff(1);
+        Assert.IsTrue(gate.TryClaimProvisionalTurn(generation));
+
+        Assert.ThrowsExactly<UnreachableException>(gate.EnsureIdle);
+        gate.Reset();
+
+        gate.EnsureIdle();
+        Assert.IsFalse(gate.HasTurn);
+        Assert.IsFalse(gate.HasHandoff);
+        Assert.IsGreaterThan(generation, gate.PublishHandoff(2));
     }
 }

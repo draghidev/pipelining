@@ -496,6 +496,27 @@ public class PipelineLifecycleTests
         CollectionAssert.Contains(inner, teardownEx, "teardown throw should be folded in, not lost");
     }
 
+    [TestMethod]
+    public async Task TryGetNextFault_ReuseResetsPullingState()
+    {
+        var rootEx = new InvalidOperationException("root: source TryGetNext");
+        var source = ThrowingSource<TestPipelineItem>.Create(pullThrow: rootEx);
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy, ThrowingSource<TestPipelineItem>,
+            ThrowingSource<TestPipelineItem>.Enumerator>(new(), source);
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var ex = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            async () => await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(5)));
+
+        Assert.AreSame(rootEx, ex);
+
+        var reused = Pipeline.Create<TestPipelineItem, TestPipelinePolicy, ThrowingSource<TestPipelineItem>,
+            ThrowingSource<TestPipelineItem>.Enumerator>(new(), ThrowingSource<TestPipelineItem>.Create(), pipeline);
+        Assert.AreSame(pipeline, reused);
+        Assert.IsTrue(reused.IsEmpty(0), "a new run must not inherit transient pull ownership");
+        await reused.Completion;
+    }
+
     /// A source fault while an item is still in flight must still drain that item (its CompleteItem
     /// fires) rather than strand it, and then surface the root fault via CompleteAsync.
     [TestMethod]

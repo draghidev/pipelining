@@ -719,6 +719,7 @@ public class PipelineConcurrencyTests
         var pipeline = Pipeline.Create<TestPipelineItem, SingleReaderGuardPolicy>(new(guard,
             ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery = new TestPipelineItem { Name = "R" } : null));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+        guard.ObserveActivatedSlot(() => pipeline.Pipeline.ActivatedItem);
 
         var item = new TestPipelineItem
         {
@@ -768,7 +769,7 @@ public class PipelineConcurrencyTests
     public async Task RecoveryEclipse_UnderConcurrentLoad_SingleReaderInvariant()
     {
         var iterations = int.TryParse(
-            Environment.GetEnvironmentVariable("DRAGHI_RECOVERY_STRESS_ITERATIONS"), out var n) ? n : 500;
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 500;
 
         for (var iter = 0; iter < iterations; iter++)
         {
@@ -788,6 +789,7 @@ public class PipelineConcurrencyTests
                 return r;
             }));
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+            guard.ObserveActivatedSlot(() => pipeline.Pipeline.ActivatedItem);
             const int count = 64;
 
             var items = new TestPipelineItem[count];
@@ -865,6 +867,7 @@ public class PipelineConcurrencyTests
     sealed class SingleReaderGuard
     {
         TestPipelineItem? _currentReader;
+        Func<TestPipelineItem?>? _activatedSlot;
         volatile string? _violation;
         public string? Violation => _violation;
         // Captured at collision time so the failure dump can self-classify (see DescribeViolation).
@@ -914,6 +917,19 @@ public class PipelineConcurrencyTests
         readonly System.Collections.Concurrent.ConcurrentDictionary<string, int> _completions = new();
         public void RecordCompletion(string name) => _completions.AddOrUpdate(name, 1, (_, c) => c + 1);
         public int CompletionCount(string name) => _completions.TryGetValue(name, out var c) ? c : 0;
+
+        public void ObserveActivatedSlot(Func<TestPipelineItem?> read) => _activatedSlot = read;
+
+        public void VerifyActivatedSlot(TestPipelineItem item)
+        {
+            var actual = _activatedSlot?.Invoke();
+            if (_activatedSlot is not null && !ReferenceEquals(actual, item) && _violation is null)
+            {
+                _violationHolder = actual;
+                _violationTaker = item;
+                _violation = $"activated slot was '{actual?.Name ?? "null"}' while activating '{item.Name}'";
+            }
+        }
 
         // Mirrors ExecutePipelined.Start's TryStart on the shared promise: take the baton, and if
         // another item already holds it, record the collision. The brief spin gives a concurrent
@@ -1011,6 +1027,7 @@ public class PipelineConcurrencyTests
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true)
         {
+            _guard.VerifyActivatedSlot(item);
             _guard.TakeBaton(item);
             item.Activate();
             // The read completes only AFTER activation (Slon's baton read). Async so it doesn't run
@@ -1324,6 +1341,36 @@ public class PipelineConcurrencyTests
             "CompleteItem fired before ActivateHeadItem finished, deferred-activation race not closed.");
     }
 
+    /// Shutdown cancellation does not release a failed executor from an empty-edge activation that
+    /// already claimed its item. The activation call owns that handoff until it returns.
+    [TestMethod]
+    public async Task DeferredActivation_ShutdownFailureWaitsForConcurrentActivate()
+    {
+        var pipeline = Pipeline.Create<ActivationOrderingItem, ActivationOrderingPolicy>(new());
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var resident = new ActivationOrderingItem { PipelineTaskAsync = true };
+        pipeline.Enqueue(resident).Execute();
+        await resident.WaitForExecutedAsync();
+
+        var failed = new ActivationOrderingItem { ExecuteAsync = true };
+        pipeline.Enqueue(failed).Execute();
+        await failed.WaitForExecutedAsync();
+
+        var shutdown = pipeline.CompleteAsync();
+        resident.CompletePipelineTask();
+        failed.WaitForActivationStart();
+        failed.FailExecuteTask(new InvalidOperationException("execute failure during shutdown"));
+
+        await resident.WaitForCompleteAsync();
+        await failed.WaitForCompleteAsync();
+        await shutdown;
+
+        Assert.IsTrue(
+            failed.ActivationFinishedBeforeComplete,
+            "Shutdown let recovery retire the item before its claimed activation returned.");
+    }
+
     /// Regression guard for the CommitPendingTail activation-lock fence. CommitPendingTail's
     /// Exchange(_executingItemActivationPending, false) handshake mirrors ClearExecutingItem's, but if Exchange
     /// returns false (advancer already claimed and is mid-ActivateHeadItem under _activationLock)
@@ -1404,6 +1451,7 @@ public class PipelineConcurrencyTests
         public void CompletePipelineTask() => _pipelineTaskTcs.SetResult();
         public void CompleteTrailingTask() => _trailingTaskTcs.SetResult();
         public void CompleteExecuteTask() => _executeTaskTcs.SetResult(new PipelineItemResult(GetTrailingTask(), GetPipelineTask()));
+        public void FailExecuteTask(Exception exception) => _executeTaskTcs.SetException(exception);
 
         ValueTask GetPipelineTask() => PipelineTaskAsync ? new(_pipelineTaskTcs.Task) : default;
         ValueTask GetTrailingTask() => HasTrailingTaskAsync ? new(_trailingTaskTcs.Task) : default;
@@ -1653,6 +1701,61 @@ public class PipelineConcurrencyTests
         Assert.IsTrue(recovery.IsCompleted, "Recovery item should be completed by the drain.");
         // Faulting item is recovered, so the recovery item carries the result.
         Assert.IsFalse(faulting.IsCompleted, "Original faulting item is not completed when recovery takes over.");
+    }
+
+    [TestMethod, DoNotParallelize]
+    public async Task RecoveryCompletionRacingShutdown_RetiresPositionOnce()
+    {
+        var iterations = int.TryParse(
+            Environment.GetEnvironmentVariable("DRAGHI_STRESS_ITERATIONS"), out var n) ? n : 200;
+
+        for (var i = 0; i < iterations; i++)
+        {
+            await RaceAsync(executePending: true, i);
+            await RaceAsync(executePending: false, i);
+        }
+
+        static async Task RaceAsync(bool executePending, int iteration)
+        {
+            var recovery = executePending
+                ? new TestPipelineItem { Name = $"execute-{iteration}", ExecuteAsync = true }
+                : new TestPipelineItem { Name = $"trailing-{iteration}", HasTrailingTask = true, CompleteAsync = true };
+            var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+                new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
+                onIdle: _ => { idle.TrySetResult(); return default; });
+            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+            var failed = new TestPipelineItem
+            {
+                CompleteAsync = true,
+                PipelineTaskException = new InvalidOperationException("fault"),
+            };
+            pipeline.Enqueue(failed).Execute();
+            await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
+            failed.CompletePipelineTask();
+            await recovery.WaitForExecutedAsync();
+
+            using var start = new ManualResetEventSlim();
+            var shutdown = Task.Run(async () =>
+            {
+                start.Wait();
+                await pipeline.CompleteAsync();
+            });
+            var settle = Task.Run(() =>
+            {
+                start.Wait();
+                if (executePending)
+                    recovery.CompleteExecuteTask();
+                else
+                    recovery.CompleteTrailingTask();
+            });
+
+            start.Set();
+            await Task.WhenAll(shutdown, settle).WaitAsync(TimeSpan.FromSeconds(5));
+            Assert.IsTrue(recovery.IsCompleted, $"iteration {iteration}: recovery did not complete.");
+            PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
+        }
     }
 
     /// Multiple WaitForEmptyAsync callers must all observe the drain. Exercises the drain TCS

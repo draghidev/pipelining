@@ -133,4 +133,14 @@ struct DepthState
         var tcs = Interlocked.Exchange(ref _emptyWaiter, null);
         tcs?.TrySetResult();
     }
+
+    /// <summary>Starts a reused pipeline shell with a fresh ledger.</summary>
+    public void Reset()
+    {
+        // A waiter left by the prior tenure is condemned with that tenure. Completing it here would
+        // let an obsolete continuation run after the shell has been rebound to unrelated work.
+        _emptyWaiter = null;
+        _dispatched = default;
+        _retired = 0;
+    }
 }

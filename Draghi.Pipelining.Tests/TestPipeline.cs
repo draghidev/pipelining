@@ -76,6 +76,8 @@ sealed class TestPipelineItem
     public Exception? ThrowOnExecute { get; init; }
     public Exception? PipelineTaskException { get; init; }
     public Exception? TrailingTaskException { get; init; }
+    Exception? _throwOnCompleteOnce;
+    public Exception? ThrowOnCompleteOnce { init => _throwOnCompleteOnce = value; }
     public bool CompleteAsync { get; init; }
     public bool ExecuteAsync { get; init; }
     public bool HasTrailingTask { get; init; }
@@ -104,6 +106,9 @@ sealed class TestPipelineItem
         OnComplete?.Invoke();
         _completedTcs.TrySetResult();
     }
+
+    public Exception? TakeCompletionException()
+        => Interlocked.Exchange(ref _throwOnCompleteOnce, null);
 
     public void SignalExecuted() => _executedTcs.TrySetResult();
 
@@ -301,6 +306,8 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
         if (remainingDepth < 0)
             Assert.Fail($"CompleteItem observed negative remainingDepth {remainingDepth} for item {item.Name ?? "?"}.");
         item.Complete(exception);
+        if (item.TakeCompletionException() is { } completionException)
+            throw completionException;
     }
 
     public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)

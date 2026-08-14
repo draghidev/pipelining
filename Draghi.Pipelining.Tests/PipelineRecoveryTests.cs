@@ -145,6 +145,45 @@ public class PipelineRecoveryTests
         Assert.IsFalse(item.IsCompleted);
     }
 
+    [TestMethod]
+    public async Task RecoveryCompletionThrow_DoesNotRetireItsCreditTwice()
+    {
+        var completionException = new InvalidOperationException("completion callback");
+        var recovery = new TestPipelineItem
+        {
+            Name = "recovery",
+            ThrowOnCompleteOnce = completionException
+        };
+        var idle = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(true, context => context.Kind is PipelineItemFailureKind.ExecuteItemTask ? recovery : null),
+            onIdle: _ => { idle.TrySetResult(); return default; });
+        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+
+        var resident = new TestPipelineItem { Name = "resident", CompleteAsync = true };
+        pipeline.Enqueue(resident).Execute();
+        await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var failed = new TestPipelineItem
+        {
+            Name = "failed",
+            ThrowOnExecute = new InvalidOperationException("execute")
+        };
+        pipeline.Enqueue(failed).Execute();
+        await recovery.WaitForCompleteAsync();
+
+        Assert.AreEqual(1, pipeline.Depth,
+            "the recovery consumed the failed position's one credit; the resident still owns the other");
+        Assert.IsFalse(resident.IsCompleted);
+
+        resident.CompletePipelineTask();
+        await resident.WaitForCompleteAsync();
+        var propagated = await Assert.ThrowsExactlyAsync<InvalidOperationException>(
+            async () => await pipeline.Pipeline.Completion.WaitAsync(TimeSpan.FromSeconds(5)));
+        Assert.AreSame(completionException, propagated);
+        Assert.AreEqual(0, pipeline.Depth);
+    }
+
     // Regression: an ASYNC waiter-recovery that retires the LAST in-flight item must fire the depth-0
     // idle signal, so a WaitForEmptyAsync armed BEFORE the terminal completion is woken. The bug: the
     // recovery continuation completes the item via CompleteRecoveryItemDeferred (depth -> 0 without

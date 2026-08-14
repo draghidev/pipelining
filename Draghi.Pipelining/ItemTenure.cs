@@ -10,6 +10,7 @@ struct ItemTenure
     // Zero means that no head carries an undelivered callback. Head identities start at one.
     long _armedCallbackSequence;
     long _headSequence;
+    int _activeCompletionCallbacks;
 
     public long LastClaimedSequence => Volatile.Read(ref _headSequence);
     public long HeadSequence => Volatile.Read(ref _headSequence) + 1;
@@ -20,9 +21,24 @@ struct ItemTenure
     public void ArmCompletionCallback(long sequence) => Volatile.Write(ref _armedCallbackSequence, sequence);
 
     /// Called as the callback's first action. Once cleared, consuming the task can no longer tear
-    /// callback dispatch's reads of its continuation pair.
+    /// callback dispatch's reads of its continuation pair. Active publication precedes the clear:
+    /// once another driver may consume the item, teardown can already see that this callback still
+    /// has an acquire-or-deposit tail to run.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void MarkCompletionCallbackDelivered() => Volatile.Write(ref _armedCallbackSequence, 0);
+    public void MarkCompletionCallbackDelivered()
+    {
+        Interlocked.Increment(ref _activeCompletionCallbacks);
+        Volatile.Write(ref _armedCallbackSequence, 0);
+    }
+
+    public bool HasActiveCompletionCallback => Volatile.Read(ref _activeCompletionCallbacks) != 0;
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    public void CompleteCompletionCallback()
+    {
+        var remaining = Interlocked.Decrement(ref _activeCompletionCallbacks);
+        Debug.Assert(remaining >= 0, "Completion callback activity under-ran.");
+    }
 
     /// Claims remain serialized by the advance license. A stale nonzero arm can only cause a
     /// harmless declined claim; the callback's subsequent license acquisition re-drives it.
@@ -39,8 +55,21 @@ struct ItemTenure
         return sequence;
     }
 
+    public void EnsureIdle()
+    {
+        var armedSequence = Volatile.Read(ref _armedCallbackSequence);
+        var activeCallbacks = Volatile.Read(ref _activeCompletionCallbacks);
+        if (armedSequence != 0 || activeCallbacks != 0)
+        {
+            throw new UnreachableException(
+                $"Completion callback remained live at structural quiescence " +
+                $"(sequence={armedSequence}, active={activeCallbacks}).");
+        }
+    }
+
     public void Reset()
     {
-        Debug.Assert(Volatile.Read(ref _armedCallbackSequence) == 0);
+        _armedCallbackSequence = 0;
+        _activeCompletionCallbacks = 0;
     }
 }

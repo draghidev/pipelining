@@ -1,3 +1,4 @@
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 
 namespace Draghi.Pipelining;
@@ -46,4 +47,13 @@ sealed class EdgeLock
         if (Interlocked.Exchange(ref _state, Unlocked) == Contended)
             _wake!.Set();
     }
+
+    public void EnsureIdle()
+    {
+        var state = Volatile.Read(ref _state);
+        if (state != Unlocked)
+            throw new UnreachableException($"Edge lock remained owned at structural quiescence (state={state}).");
+    }
+
+    public void Reset() => _state = Unlocked;
 }

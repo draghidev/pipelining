@@ -149,13 +149,27 @@ struct ActivationGate<T>()
     public bool IsHandoffResolved(long generation)
         => Volatile.Read(ref _resolvedHandoffGeneration) >= generation;
 
-    public void Reset()
+    public void EnsureIdle()
     {
-        if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-            _handoffItem = default!;
         var turn = Volatile.Read(ref _turn);
-        Debug.Assert(turn == 0, $"Activation turn still live at reset: {turn}.");
-        Debug.Assert(StateOf(Volatile.Read(ref _handoffWord)) == NoHandoff);
+        var handoffWord = Volatile.Read(ref _handoffWord);
+        if (turn != 0 || StateOf(handoffWord) != NoHandoff)
+        {
+            throw new UnreachableException(
+                $"Activation gate remained live at structural quiescence " +
+                $"(turn={turn}, handoff={StateOf(handoffWord) == Handoff}, " +
+                $"generation={GenerationOf(handoffWord)}).");
+        }
+        EdgeLock.EnsureIdle();
     }
 
+    public void Reset()
+    {
+        _turn = 0;
+        var generation = Volatile.Read(ref _generation);
+        _resolvedHandoffGeneration = generation;
+        _handoffWord = generation << 1 | NoHandoff;
+        _handoffItem = default!;
+        EdgeLock.Reset();
+    }
 }

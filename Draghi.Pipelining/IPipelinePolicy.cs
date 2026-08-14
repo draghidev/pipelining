@@ -10,9 +10,8 @@ namespace Draghi.Pipelining;
 /// </summary>
 /// <remarks>
 /// Policy methods MUST NOT throw synchronously. They run at lifecycle transitions where a thrown
-/// exception cannot reliably describe which policy effects occurred. Some call sites incidentally
-/// preserve tenure while propagating such misuse, but that is not part of the contract. Failures from
-/// the tasks returned by <see cref="ExecuteItemAsync"/> are first-class and flow through recovery.
+/// exception cannot reliably describe which policy effects occurred. Failures from the tasks returned
+/// by <see cref="ExecuteItemAsync"/> are first-class and flow through recovery.
 /// <para>
 /// Production-side concerns (when items arrive, how the executor suspends while waiting, dispatch
 /// scheduling between enqueue and execute) live on the source, not the policy. The policy is
@@ -76,6 +75,11 @@ public interface IPipelinePolicy<T>
     /// Notifies the item of retirement, with an optional error, exactly once. If recovery supplants
     /// an item, the failed item does not receive this callback; its recovery item does.
     /// <paramref name="remainingDepth"/> is the pipeline depth after retiring this item.
+    /// <remarks>
+    /// Retirement is irrevocable before this callback runs. A synchronous exception violates the
+    /// policy contract and propagates normally. Recovery handlers do not reinterpret it as an item
+    /// failure or invoke this callback again for the same pipeline position.
+    /// </remarks>
     void CompleteItem(T item, int remainingDepth, Exception? exception);
 
     /// Attempts to recover from a failed item. Returns a recovery item that supplants the failed item
