@@ -55,7 +55,7 @@ public abstract class PipelineScheduler
         SubmitDetached(WorkState<TState>.InvokeAction, new WorkState<TState>(action, state, capturedContext: null), preferLocal);
     }
 
-    internal virtual void SubmitDetached(IThreadPoolWorkItem callBack, bool preferLocal)
+    public virtual void SubmitDetached(IThreadPoolWorkItem callBack, bool preferLocal = true)
         => SubmitDetached(ThreadPoolWorkItemAction, callBack, preferLocal);
 
     // Yield is actually a strange name for async programming, as the yielding part is immediate.
@@ -112,7 +112,7 @@ public abstract class PipelineScheduler
         public override void SubmitDetached(Action<object?> action, object? state, bool preferLocal = true)
             => System.Threading.ThreadPool.UnsafeQueueUserWorkItem(action, state, preferLocal);
 
-        internal override void SubmitDetached(IThreadPoolWorkItem callBack, bool preferLocal)
+        public override void SubmitDetached(IThreadPoolWorkItem callBack, bool preferLocal = true)
             => System.Threading.ThreadPool.UnsafeQueueUserWorkItem(callBack, preferLocal);
     }
 }
