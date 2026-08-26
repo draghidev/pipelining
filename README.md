@@ -3,20 +3,22 @@
 Draghi.Pipelining is a source-driven, backpressure-aware execution pipeline for operations whose
 work can overlap while their externally visible effects remain ordered.
 
-A motivating application is pipelined protocol processing. In a protocol client, one operation may
-still be writing while an earlier one is reading, either direction may apply backpressure, and a
-failure may require an ordered recovery operation. A protocol server commonly assigns the read and
-write roles in the opposite direction. These are policy mappings, not roles fixed by the pipeline.
-Draghi.Pipelining itself is not coupled to I/O. It supplies the timing and ownership chain that lets
-work progress and settle out of order while activation and terminal notification cross an ordered
-frontier. Items, execution, activation, completion, and recovery are supplied by the policy.
+A motivating application is protocol processing where a later request may still be writing while
+an earlier response is read. Either direction may apply backpressure, and failure may require
+ordered recovery. Draghi.Pipelining is not coupled to I/O. It supplies the timing and ownership
+chain while the policy defines items, execution, activation, completion, and recovery.
+
+## Status
+
+Draghi.Pipelining targets .NET 10 and is intended for systems-library authors. Public types under
+`Draghi.Pipelining.Internal` are experimental composition primitives and produce diagnostic
+warnings when used directly.
 
 ## When to use it
 
-Use Draghi.Pipelining when items have independently progressing phases but must retain FIFO
-ownership of an ordered resource. It is intended for cases where backpressure in one phase must not
-prevent progress in the other, or where failure may require a substitute to replace the failed item
-at its existing ordered position.
+Use Draghi.Pipelining when item phases progress independently but retain FIFO ownership of an
+ordered resource. Backpressure in one phase must not stop the other, and recovery may need to
+replace a failed item at its existing position.
 
 For example, a protocol client may block while writing request `B` because its peer cannot continue
 consuming requests until the client reads response `A`. Draghi.Pipelining can activate `A`'s read
@@ -37,11 +39,9 @@ A pipeline has four participants:
 - The **in-flight sequence** retains dispatched items and advances its FIFO head when work completes.
 - The **policy** maps those lifecycle transitions onto an application's items.
 
-The source controls how the executor resumes after a missed pull. A wake may let the signaling
-caller resume useful work inline, or may dispatch it through a `PipelineScheduler`.
-For example, a synchronous caller can be allowed to drive execution directly into its handoff
-instead of first taking a thread-pool round trip. Other resumptions can be dispatched through the
-scheduler.
+The source controls how the executor resumes after a missed pull. A wake may resume useful work on
+the signaling thread or dispatch it through a `PipelineScheduler`. This lets a synchronous caller
+drive directly into its handoff without first taking a thread-pool round trip.
 
 ### Two-phase work
 
@@ -52,25 +52,20 @@ scheduler.
 | `TrailingExecutionTask` | Finish writing the request | Dispatch of the next item |
 | `PipelineTask` | Read and process the response | Terminal notification at the FIFO frontier, together with trailing settlement |
 
-`ExecuteItemAsync` produces the two phase tasks. It may instead perform an entire sequential
-roundtrip and return both tasks already completed, requiring no cross-phase coordination.
+Both tasks may already be complete for a sequential round trip. The protocol roles may also be
+reversed. Their names describe ordering and lifetime rather than fixed application work.
 
-Those examples reverse naturally for a protocol server. More generally, the names describe ordering
-and lifetime rather than application roles. A policy decides what work belongs to each phase.
-
-The item is committed to the in-flight sequence before the pipeline awaits trailing execution. This
-lets pipeline work begin and release capacity needed by trailing execution while that trailing work
-remains incomplete.
-
-`CompleteItem` does not run until both phase tasks have been observed. A pipeline task that settles
-while trailing execution remains pending therefore cannot complete its position early.
+The item enters the in-flight sequence before trailing execution is awaited, allowing pipeline work
+to release capacity needed by that trailing phase. `CompleteItem` waits until both obligations have
+settled.
 
 ### Queue-backed use
 
 `Pipeline.Create(policy)` creates an `UnboundedPipeline<T, TPolicy>` backed by the included SPSC
-source. Enqueueing and signaling are deliberately separate because signaling may synchronously run
-the executor on the caller's thread. The source has one logical producer. Multiple submitting
-threads must serialize `Enqueue`; signaling may happen after leaving that synchronization.
+source. Its `EnqueueSignal` separates publication from the source wake so a producer can signal
+after leaving its synchronization. If asynchronous continuations were disabled and the executor
+has armed an empty-source wait, signaling resumes execution on the producer's thread. The source
+has one logical producer, so multiple submitting threads must serialize `Enqueue`.
 
 The following conceptual example shows the policy mapping. `Operation` owns the phase tasks and the
 activation/completion state.
@@ -120,16 +115,14 @@ await pipeline.CompleteAsync();
 ```
 
 Call `Enqueue` under producer synchronization if necessary, but call the returned `Signal` outside
-that synchronization. Applications with different admission or storage requirements can provide a
-custom source.
+that synchronization. `EnqueueSignal` belongs to the included queue source. Custom sources define
+their own submission and wake surface.
 
 ### Out-of-order engine analogy
 
-Draghi.Pipelining can be understood as a software out-of-order engine. The executor dispatches work into an
-in-flight sequence, independent item work may complete out of order, and the activation frontier
-advances in FIFO order. The in-flight store plays a role similar to a reorder buffer: it permits
-overlap behind the head while preserving the ordered point at which an item may take ownership of a
-shared resource and complete.
+Draghi.Pipelining can be understood as a software out-of-order engine. Work may settle out of order
+behind the FIFO activation frontier, while the in-flight store preserves ordered ownership and
+completion.
 
 The analogy is structural rather than literal. Policies define what execution and activation mean,
 sources define admission, and recovery may replace a failed item in its existing position.
@@ -153,22 +146,15 @@ Consider three items arriving in source order: `A`, `B`, then `C`.
 7. `C` is still live, so `ActivateHeadItem(C)` grants its ordered phase.
 8. When `C.PipelineTask` settles, `CompleteItem(C)` runs.
 
-The execution frontier therefore advances through trailing-task settlement, while the ordered
-frontier advances through the in-flight sequence. Pipeline tasks may settle ahead of that ordered
-frontier, but cannot move it out of FIFO order.
-
-Activation moves directly between participants that already own progress. A completing head can
-activate its successor, and a dispatch into an empty pipeline can activate its own item.
-Draghi.Pipelining does not need an additional thread-pool work item just to move the frontier, as a
-naive implementation might. The policy may still dispatch the activated item's own work.
+Pipeline tasks may settle ahead of the ordered frontier but cannot move it out of FIFO order. A
+completing head activates its successor, while a dispatch into an empty pipeline activates itself.
+No additional thread-pool work item is required merely to move the frontier.
 
 ### Activation and completion
 
-Submission is the publication boundary for an item. Before the source makes it visible, the item
-must construct all state needed by both `ExecuteItemAsync` and `ActivateHeadItem`.
-`ExecuteItemAsync` must not initialize state that activation requires because either callback may
-come first. Execution starts work or exposes the item's existing phase tasks. Activation only grants
-or wakes the ordered phase.
+Submission is the publication boundary. An item must already contain the state needed by
+`ExecuteItemAsync` and `ActivateHeadItem` because either callback may come first. Execution starts
+work or exposes existing phase tasks. Activation only grants or wakes the ordered phase.
 
 Activation grants the FIFO head exclusive permission to use the policy-defined ordered resource. It
 is a tenure-safe ownership handoff, not merely notification that the item is first in a queue. For
@@ -178,10 +164,8 @@ every item that is activated, Draghi.Pipelining guarantees:
 - activation occurs before completion
 - activation and completion do not overlap for that item
 
-An item can finish before reaching the head, so activation is optional. This is what makes immediate
-cancellation and pooled item reuse possible without a stale activation touching a later tenure.
-Activation may occur before or after `ExecuteItemAsync` is called, depending on whether the item is
-already at the ordered frontier when it is dispatched.
+An item can finish before reaching the head, so activation is optional. This permits immediate
+cancellation and pooled reuse without a stale activation touching a later tenure.
 
 `CompleteItem` is the terminal lifecycle notification for an item. After the completion that makes
 the in-flight sequence idle, `OnIdle` runs. This is an exact transition notification rather than a
@@ -193,28 +177,21 @@ See [Policy contract](docs/policy-contract.md) for publication, callback concurr
 
 ### Recovery
 
-When an item phase fails, the pipeline calls `TryRecoverItemFailure`. A successful recovery returns a
-substitute in `recoveryItem`. The substitute assumes the failed item's position, and the failed
-item is not separately completed. It receives its own activation and completion callbacks under the
-same lifecycle rules as any other item in that position.
+When a phase fails, `TryRecoverItemFailure` may return a substitute for the failed item's existing
+position. Draghi completes only the substitute, which receives the ordinary activation and
+completion lifecycle. This is an ordered ownership transplant, not a retry at the tail.
 
-Recovery is therefore an ordered ownership transplant, not a retry or generic exception callback.
-The substitute inherits the failed position and responsibility for restoring its shared resource
-before later items may pass it.
-
-When the failed item's opposite phase remains live, `OutstandingPhaseTask` carries that obligation
-into recovery. The substitute can sequence inherited work through one phase while repair progresses
-through the other. See [Ordered substitution](docs/recovery.md) for exact outcomes, opposite-phase
-ownership, and non-recursive recovery.
+`OutstandingPhaseTask` carries a still-live opposite phase into recovery, allowing inherited work
+and repair to remain independently live. See [Ordered substitution](docs/recovery.md) for exact
+outcomes, ownership, and non-recursive recovery.
 
 ## Policy requirements
 
-Implementing a policy is systems programming. Activation and execution may occur in either order,
-calls for different items may overlap, returned `ValueTask` instances must obey single-consumption
-rules, and outstanding work must converge during shutdown. Failure while invoking
-`ExecuteItemAsync`, or while awaiting its outer task, enters ordinary recovery. By contrast,
-`ActivateHeadItem`, `CompleteItem`, `OnIdle`, `TryRecoverItemFailure`, and `SubmitDetached` must not throw
-synchronously. The [policy contract](docs/policy-contract.md) defines these rules.
+Implementing a policy is systems programming. Activation and execution may arrive in either order,
+calls for different items may overlap, returned `ValueTask` instances obey single-consumption rules,
+and outstanding work must converge during shutdown. Invocation or outer-task failure from
+`ExecuteItemAsync` enters recovery. Other lifecycle callbacks must not throw synchronously. The
+[policy contract](docs/policy-contract.md) defines the exact rules.
 
 ## Cost model
 
@@ -222,45 +199,48 @@ The hot path is generic over the policy, source, and concrete source-enumerator 
 them as structs forces a specialized pipeline instantiation for that composition. Focused
 microbenchmarks put the synchronous queue-backed enqueue, execute, activate, and complete cycle at
 approximately the cost of one single-producer, single-consumer `Channel<T>` write/read cycle. The
-comparison lives in `Draghi.Pipelining.Benchmarks`; scheduled paths additionally include the chosen
+comparison lives in `Draghi.Pipelining.Benchmarks`. Scheduled paths also include the chosen
 scheduler's dispatch cost.
 
-That is a conservative unit-cost comparison, not a feature-equivalent baseline. A channel-based
-approximation needs at least separate execution and ordered-progress paths, plus correlation, FIFO
-activation and completion, and failure coordination around them. Draghi.Pipelining was designed so
-that richer lifecycle does not impose a double-channel coordination tax on every successful item.
+This is a conservative unit-cost comparison, not a feature-equivalent baseline. A channel-based
+approximation also needs separate execution and ordered-progress paths, correlation, FIFO
+activation and completion, and failure coordination.
 
 ## Advanced customization
 
-Custom sources can own admission, item storage, wake behavior, migration, and what happens to
-pending undispatched items during shutdown. Their concrete struct enumerators retain the specialized
-pull path. See
-[Custom sources](docs/custom-sources.md) for the publication, miss-and-wake, completion, and instance
-reuse contracts.
+Custom sources can own admission, storage, wake behavior, migration, and undispatched shutdown
+work while retaining a specialized struct-enumerator pull path. See
+[Custom sources](docs/custom-sources.md) for their exact contract.
 
 ## Shutdown and reuse
 
-`CompleteAsync` initiates shutdown and completes only after source execution, in-flight completion,
-recovery continuations, and enumerator teardown are quiet. Repeated calls return the same run task.
+`CompleteAsync` completes after source execution, in-flight work, recovery continuations, and
+enumerator teardown are quiet. Repeated calls return the same run task. The source's
+`CompletionToken` lets policy work converge during shutdown. A completed pipeline instance may then
+be reused with a new policy and source. See [shutdown and instance reuse](docs/custom-sources.md#shutdown-and-instance-reuse).
 
-The source owns its cancellation lifecycle. Its `CompletionToken` is passed into policy execution and
-recovery so outstanding work can converge during shutdown.
+## Build and test
 
-A completed pipeline instance may be reused with a new policy and source after the preceding
-completion task settles. The
-[custom-source guide](docs/custom-sources.md#shutdown-and-instance-reuse) describes that lifecycle.
+```text
+dotnet build Draghi.Pipelining.slnx -c Release
+dotnet test --project Draghi.Pipelining.Tests/Draghi.Pipelining.Tests.csproj -c Release
+```
+
+The test suite uses Microsoft.Testing.Platform.
 
 ## Verification
 
-The coordination protocols are accompanied by TLA+ models under
-[`Draghi.Pipelining/verification`](Draghi.Pipelining/verification). They cover the end-to-end pipeline
-and focused mechanisms including item tenure, empty-edge activation, depth draining, wake handshakes,
-and in-flight-store advancement.
+The [`verification`](verification) directory contains TLA+ models for the end-to-end pipeline and
+focused coordination mechanisms.
 
 ```text
-cd Draghi.Pipelining/verification
+cd verification
 ./verify check
 ./verify run pipeline/Pipeline.cfg
 ```
 
-The verification README documents model scope, fidelity boundaries, and the required TLC setup.
+The verification README documents model scope, fidelity boundaries, and TLC setup.
+
+## License
+
+Copyright (c) 2026 Nino Floris. Licensed under the [MIT License](LICENSE).

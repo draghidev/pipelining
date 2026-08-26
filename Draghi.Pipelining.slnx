@@ -1,0 +1,5 @@
+<Solution>
+  <Project Path="Draghi.Pipelining/Draghi.Pipelining.csproj" />
+  <Project Path="Draghi.Pipelining.Tests/Draghi.Pipelining.Tests.csproj" />
+  <Project Path="Draghi.Pipelining.Benchmarks/Draghi.Pipelining.Benchmarks.csproj" />
+</Solution>

@@ -1,0 +1,14 @@
+.DS_Store
+.idea/
+.vs/
+.vscode/
+
+bin/
+obj/
+artifacts/
+TestResults/
+BenchmarkDotNet.Artifacts/
+
+*.suo
+*.user
+*.DotSettings.user
