@@ -542,7 +542,9 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Owner-checked release cannot clear a successor's turn.
         if (ownedTurn != 0)
             _activationGate.Release(ownedTurn);
-        _policy.CompleteItem(item, depth, exception);
+        _policy.CompleteItem(item, exception);
+        if (depth is 0)
+            _policy.OnIdle();
         return depth is 0;
     }
 

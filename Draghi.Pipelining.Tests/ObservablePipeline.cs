@@ -38,7 +38,7 @@ sealed class ObservablePipeline<T, TPolicy>
 
     public int Depth => Pipeline.Depth;
 
-    public TestObservableQueueSource<T>.EnqueueResult Enqueue(T item) => Source.Enqueue(item);
+    public TestObservableQueueSource<T>.EnqueueSignal Enqueue(T item) => Source.Enqueue(item);
 
     public ValueTask CompleteAsync(Exception? exception = null) => Pipeline.CompleteAsync(exception);
 

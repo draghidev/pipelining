@@ -15,7 +15,7 @@ public class PipelineBehavioralTests
         // Enqueue an item. The wake signal will dispatch through the custom scheduler
         // when running continuations asynchronously.
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
 
         Assert.IsTrue(scheduler.SubmitCount > 0, "Custom ExecutionScheduler should receive at least one submission.");
@@ -34,8 +34,8 @@ public class PipelineBehavioralTests
         var first = new TestPipelineItem { CompleteAsync = true };
         var second = new TestPipelineItem { CompleteAsync = true };
 
-        pipeline.Enqueue(first).Execute();
-        pipeline.Enqueue(second).Execute();
+        pipeline.Enqueue(first).Signal();
+        pipeline.Enqueue(second).Signal();
 
         await first.WaitForExecutedAsync();
         await second.WaitForExecutedAsync();
@@ -64,7 +64,7 @@ public class PipelineBehavioralTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
 
         // After the item completes, the executor calls OnExecutionIdleAsync which throws.
@@ -82,7 +82,7 @@ public class PipelineBehavioralTests
 
         // ExecuteAsync = true holds the executor inside ExecuteItemAsync until we release it.
         var item = new TestPipelineItem { ExecuteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Get the token the policy received.
         var token = await tokenCapture.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -120,7 +120,7 @@ public class PipelineBehavioralTests
             TrailingTaskException = trailingException,
         };
 
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         // Complete the pipeline task successfully, then fail the trailing task.
@@ -158,7 +158,9 @@ public class PipelineBehavioralTests
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -177,7 +179,9 @@ public class PipelineBehavioralTests
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -202,7 +206,9 @@ public class PipelineBehavioralTests
             item.Activate();
         }
 
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -221,7 +227,9 @@ public class PipelineBehavioralTests
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -241,7 +249,9 @@ public class PipelineBehavioralTests
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -266,13 +276,13 @@ public class PipelineBehavioralTests
                 if (enqueued)
                     return;
                 enqueued = true;
-                pipelineRef!.Enqueue(follower).Execute();
+                pipelineRef!.Enqueue(follower).Signal();
             }));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         pipelineRef = pipeline;
 
         var first = new TestPipelineItem();
-        pipeline.Enqueue(first).Execute();
+        pipeline.Enqueue(first).Signal();
 
         await first.WaitForCompleteAsync();
         await follower.WaitForCompleteAsync();
@@ -300,14 +310,14 @@ public class PipelineBehavioralTests
             onIdle: _ =>
             {
                 if (refillIdx < refills.Length)
-                    pipelineRef!.Enqueue(refills[refillIdx++]).Execute();
+                    pipelineRef!.Enqueue(refills[refillIdx++]).Signal();
                 return default;
             });
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         pipelineRef = pipeline;
 
         var first = new TestPipelineItem();
-        pipeline.Enqueue(first).Execute();
+        pipeline.Enqueue(first).Signal();
 
         await first.WaitForCompleteAsync();
         foreach (var item in refills)
@@ -336,7 +346,9 @@ public class PipelineBehavioralTests
             item.Activate();
         }
 
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -356,7 +368,9 @@ public class PipelineBehavioralTests
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {

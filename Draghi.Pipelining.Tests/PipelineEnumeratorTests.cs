@@ -61,7 +61,7 @@ public class PipelineEnumeratorTests
         for (var i = 0; i < count; i++)
         {
             enqueued[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(enqueued[i]).Execute();
+            pipeline.Enqueue(enqueued[i]).Signal();
         }
 
         // Wait for all items to enter the in-flight state (executor pulled them, awaiting pipeline task).
@@ -101,7 +101,7 @@ public class PipelineEnumeratorTests
         for (var i = 0; i < count; i++)
         {
             enqueued[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(enqueued[i]).Execute();
+            pipeline.Enqueue(enqueued[i]).Signal();
         }
 
         for (var i = 0; i < count; i++)
@@ -133,7 +133,7 @@ public class PipelineEnumeratorTests
         for (var i = 0; i < count; i++)
         {
             var item = new TestPipelineItem();
-            pipeline.Enqueue(item).Execute();
+            pipeline.Enqueue(item).Signal();
             await item.WaitForCompleteAsync();
         }
 
@@ -163,7 +163,7 @@ public class PipelineEnumeratorTests
         for (var i = 0; i < count; i++)
         {
             enqueued[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(enqueued[i]).Execute();
+            pipeline.Enqueue(enqueued[i]).Signal();
         }
         for (var i = 0; i < count; i++)
             await enqueued[i].WaitForExecutedAsync();
@@ -206,7 +206,7 @@ public class PipelineEnumeratorTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         // Commit before faulting so recovery runs from the dedicated in-flight slot.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -252,7 +252,7 @@ public class PipelineEnumeratorTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 

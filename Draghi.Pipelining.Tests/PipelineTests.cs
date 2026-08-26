@@ -8,7 +8,7 @@ public class PipelineTests
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(false));
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         item.WaitForComplete();
         Assert.IsNull(item.Exception);
     }
@@ -20,7 +20,7 @@ public class PipelineTests
         for (var i = 0; i < 100; i++)
         {
             var item = new TestPipelineItem();
-            pipeline.Enqueue(item).Execute();
+            pipeline.Enqueue(item).Signal();
             item.WaitForComplete();
             Assert.IsNull(item.Exception);
         }
@@ -32,7 +32,7 @@ public class PipelineTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
         Assert.IsNull(item.Exception);
     }
@@ -46,7 +46,7 @@ public class PipelineTests
         for (var i = 0; i < items.Length; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         // Complete pipeline tasks in order.
@@ -64,7 +64,7 @@ public class PipelineTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("test") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
         Assert.IsInstanceOfType<InvalidOperationException>(item.Exception);
     }
@@ -75,7 +75,7 @@ public class PipelineTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("test") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         item.CompletePipelineTask();
         await item.WaitForCompleteAsync();
         Assert.IsInstanceOfType<InvalidOperationException>(item.Exception);
@@ -90,7 +90,7 @@ public class PipelineTests
         for (var i = 0; i < items.Length; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         await pipeline.CompleteAsync();
@@ -105,7 +105,7 @@ public class PipelineTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         var drainTask = pipeline.WaitForEmptyAsync();
         Assert.IsFalse(drainTask.IsCompleted);
@@ -121,7 +121,7 @@ public class PipelineTests
         Assert.AreEqual(0, pipeline.Depth);
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         item.WaitForComplete();
         // Depth may transiently over-read by one while the executor is mid-pull (the speculative
         // dispatch count, see the Depth doc); it never under-reads. Assert eventual-zero: the
@@ -171,8 +171,8 @@ public class PipelineTests
         // Enqueue items with pending pipeline tasks, they become waiters.
         var item1 = new TestPipelineItem { CompleteAsync = true };
         var item2 = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item1).Execute();
-        pipeline.Enqueue(item2).Execute();
+        pipeline.Enqueue(item1).Signal();
+        pipeline.Enqueue(item2).Signal();
         item1.WaitForExecuted();
         item2.WaitForExecuted();
 
@@ -195,7 +195,7 @@ public class PipelineTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(false));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Executor ran inline: item executed then stored as tail waiter.
         await item.WaitForExecutedAsync();

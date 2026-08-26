@@ -9,7 +9,7 @@ public class PipelineRecoveryTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
 
         Assert.IsInstanceOfType<InvalidOperationException>(item.Exception);
@@ -36,7 +36,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = thrown };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await recovery.WaitForCompleteAsync();
 
         Assert.AreEqual(PipelineItemFailureKind.ExecuteItemTask, observedKind);
@@ -50,7 +50,7 @@ public class PipelineRecoveryTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         await recovery.WaitForCompleteAsync();
         Assert.IsNull(recovery.Exception);
@@ -64,7 +64,7 @@ public class PipelineRecoveryTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Recovery execute is async, complete it.
         recovery.CompleteExecuteTask();
@@ -80,7 +80,7 @@ public class PipelineRecoveryTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         await recovery.WaitForCompleteAsync();
         Assert.IsInstanceOfType<ApplicationException>(recovery.Exception);
@@ -94,7 +94,7 @@ public class PipelineRecoveryTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Recovery's pipeline task is pending and should not be completed yet.
         await Task.Delay(50);
@@ -113,7 +113,7 @@ public class PipelineRecoveryTests
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true, _ => recovery));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         recovery.CompletePipelineTask();
         await recovery.WaitForCompleteAsync();
@@ -132,7 +132,7 @@ public class PipelineRecoveryTests
 
         // Item has a pending pipeline task that will fault later.
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Wait for idle, the item is committed as a waiter.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -161,7 +161,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var resident = new TestPipelineItem { Name = "resident", CompleteAsync = true };
-        pipeline.Enqueue(resident).Execute();
+        pipeline.Enqueue(resident).Signal();
         await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var failed = new TestPipelineItem
@@ -169,7 +169,7 @@ public class PipelineRecoveryTests
             Name = "failed",
             ThrowOnExecute = new InvalidOperationException("execute")
         };
-        pipeline.Enqueue(failed).Execute();
+        pipeline.Enqueue(failed).Signal();
         await recovery.WaitForCompleteAsync();
 
         Assert.AreEqual(1, pipeline.Depth,
@@ -210,7 +210,7 @@ public class PipelineRecoveryTests
 
         // One committed item whose pipeline task faults, driving pipeline-task recovery.
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Arm WaitForEmptyAsync while depth > 0 (item still in flight): it must park, not complete.
@@ -248,7 +248,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             TrailingTaskException = new InvalidOperationException("trailing failed")
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Wait for execution, then fail the trailing task.
         await item.WaitForExecutedAsync();
@@ -273,7 +273,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var first = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("tail fault") };
-        pipeline.Enqueue(first).Execute();
+        pipeline.Enqueue(first).Signal();
 
         // Wait for idle, first item is committed as a waiter.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -300,7 +300,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             TrailingTaskException = new InvalidOperationException("trailing fail"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         item.CompleteTrailingTask();
 
@@ -330,7 +330,7 @@ public class PipelineRecoveryTests
             TrailingTaskException = new InvalidOperationException("trailing fail"),
             PipelineTaskException = pipelineEx,
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         item.CompleteTrailingTask();
         item.CompletePipelineTask();
@@ -360,7 +360,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             TrailingTaskException = new InvalidOperationException("original trailing"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         item.CompleteTrailingTask();
 
@@ -394,7 +394,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             TrailingTaskException = new InvalidOperationException("original trailing"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         item.CompleteTrailingTask();
 
@@ -429,7 +429,7 @@ public class PipelineRecoveryTests
             HasTrailingTask = true,
             PipelineTaskException = new InvalidOperationException("tail fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         // Executor is awaiting item's trailing task.
 
@@ -475,7 +475,7 @@ public class PipelineRecoveryTests
             HasTrailingTask = true,
             PipelineTaskException = new InvalidOperationException("tail fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         item.CompletePipelineTask();   // fault pipeline task while executor in trailing-await
@@ -520,7 +520,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             PipelineTaskException = new InvalidOperationException("waiter fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Wait for the original to be committed as a waiter.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
@@ -569,7 +569,7 @@ public class PipelineRecoveryTests
         };
         var successor = new TestPipelineItem { CompleteAsync = true };
         _ = pipeline.Enqueue(failed);
-        pipeline.Enqueue(successor).Execute();
+        pipeline.Enqueue(successor).Signal();
         await successor.WaitForExecutedAsync();
         await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -632,7 +632,7 @@ public class PipelineRecoveryTests
                 CompleteAsync = true,
                 PipelineTaskException = new InvalidOperationException("fault"),
             };
-            pipeline.Enqueue(item).Execute();
+            pipeline.Enqueue(item).Signal();
             await item.WaitForExecutedAsync();
 
             // Fault pipeline → advancer → RecoverInFlightItem hooks async executeTask continuation,
@@ -676,11 +676,13 @@ public class PipelineRecoveryTests
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
 
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+        public void CompleteItem(TestPipelineItem item, Exception? exception)
         {
             _completeCounts.AddOrUpdate(item, 1, (_, c) => c + 1);
             item.Complete(exception);
         }
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -713,7 +715,7 @@ public class PipelineRecoveryTests
         // CompleteAsync=false + PipelineTaskException = sync-faulted ValueTask from GetPipelineTask,
         // so the executor sees itemResult.PipelineTask.IsCompleted && !IsCompletedSuccessfully inline.
         var item = new TestPipelineItem { PipelineTaskException = faultEx };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await recovery.WaitForCompleteAsync();
 
         Assert.AreEqual(PipelineItemFailureKind.ExecutionPipelineTask, observedKind);
@@ -737,7 +739,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             TrailingTaskException = new InvalidOperationException("trailing fail"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         item.CompleteTrailingTask();
 
@@ -762,7 +764,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             TrailingTaskException = new InvalidOperationException("trailing fail"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         item.CompleteTrailingTask();
 
@@ -788,7 +790,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             PipelineTaskException = new InvalidOperationException("waiter fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
         item.CompletePipelineTask();
 
@@ -822,7 +824,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             PipelineTaskException = new InvalidOperationException("waiter fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
         item.CompletePipelineTask();
 
@@ -856,7 +858,7 @@ public class PipelineRecoveryTests
             CompleteAsync = true,
             PipelineTaskException = new InvalidOperationException("waiter fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Fault the waiter -> advancer -> RecoverInFlightItem dispatches the substitute, it executes sync, its
@@ -889,7 +891,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = new ApplicationException("original") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // CompleteAsync returns _executionTask, faulted with the captured root by the loop's catch-all.
         Exception? surfaced = null;
@@ -928,7 +930,7 @@ public class PipelineRecoveryTests
             HasTrailingTask = true,
             PipelineTaskException = new InvalidOperationException("tail fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         item.CompletePipelineTask();
         item.CompleteTrailingTask();
@@ -967,7 +969,7 @@ public class PipelineRecoveryTests
             HasTrailingTask = true,
             PipelineTaskException = new InvalidOperationException("tail fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         item.CompletePipelineTask();
@@ -998,7 +1000,7 @@ public class PipelineRecoveryTests
             HasTrailingTask = true,
             PipelineTaskException = new InvalidOperationException("tail fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         item.CompletePipelineTask();
@@ -1028,7 +1030,7 @@ public class PipelineRecoveryTests
             HasTrailingTask = true,
             TrailingTaskException = new InvalidOperationException("trailing fail"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         item.CompleteTrailingTask();
@@ -1050,7 +1052,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("fail") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         await recovery.WaitForCompleteAsync();
         PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
@@ -1082,7 +1084,7 @@ public class PipelineRecoveryTests
         // completed+faulted task and takes the committed-tail recovery path.
         var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("original") };
         item.CompletePipelineTask();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // The recovery is committed with a pending pipeline task; fault it late.
         await recovery.WaitForExecutedAsync();
@@ -1114,7 +1116,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { ThrowOnExecute = new InvalidOperationException("original") };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         await recovery.WaitForExecutedAsync();
         recovery.CompletePipelineTask();
@@ -1143,7 +1145,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var faulting = new TestPipelineItem { Name = "A", CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
-        pipeline.Enqueue(faulting).Execute();
+        pipeline.Enqueue(faulting).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5)); // A committed (slot tier)
 
         // Fault the committed item: the drain claims the slot, the policy substitutes R, and
@@ -1154,12 +1156,12 @@ public class PipelineRecoveryTests
         // Successors committed during the park: B refills the freed slot, C forces escalation.
         var b = new TestPipelineItem { Name = "B", CompleteAsync = true };
         idleTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pipeline.Enqueue(b).Execute();
+        pipeline.Enqueue(b).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         var c = new TestPipelineItem { Name = "C", CompleteAsync = true };
         idleTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pipeline.Enqueue(c).Execute();
+        pipeline.Enqueue(c).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // The recovered position still holds its count credit, so neither successor may have
@@ -1201,7 +1203,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var faulting = new TestPipelineItem { Name = "A", CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
-        pipeline.Enqueue(faulting).Execute();
+        pipeline.Enqueue(faulting).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         faulting.CompletePipelineTask();
@@ -1209,7 +1211,7 @@ public class PipelineRecoveryTests
 
         var b = new TestPipelineItem { Name = "B", CompleteAsync = true };
         idleTcs = new(TaskCreationOptions.RunContinuationsAsynchronously);
-        pipeline.Enqueue(b).Execute();
+        pipeline.Enqueue(b).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         Assert.AreEqual(0, b.ActivationCount, "Slot successor activated while the recovery occupies the head position.");
@@ -1241,7 +1243,7 @@ public class PipelineRecoveryTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var prior = new TestPipelineItem { Name = "W", CompleteAsync = true };
-        pipeline.Enqueue(prior).Execute();
+        pipeline.Enqueue(prior).Signal();
         await prior.WaitForExecutedAsync();
 
         // The faulting tail. The trailing await is the only deterministic suspension between the
@@ -1255,7 +1257,7 @@ public class PipelineRecoveryTests
             PipelineTaskException = new InvalidOperationException("faulted at commit"),
             TrailingTaskSource = gate,
         };
-        pipeline.Enqueue(tail).Execute();
+        pipeline.Enqueue(tail).Signal();
         await gate.Awaited.WaitAsync(TimeSpan.FromSeconds(5));
 
         tail.CompletePipelineTask();

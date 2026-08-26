@@ -51,7 +51,7 @@ sealed class PipelineChannel<T>
 
     public void Write(T item)
     {
-        _pipeline.Enqueue(item).Execute();
+        _pipeline.Enqueue(item).Signal();
     }
 
     /// Delivers a completed item to a waiting reader or stores it.
@@ -121,8 +121,10 @@ sealed class PipelineChannel<T>
 
         public void ActivateHeadItem(T item, bool preferAsync = true) { }
 
-        public void CompleteItem(T item, int remainingDepth, Exception? exception)
+        public void CompleteItem(T item, Exception? exception)
             => channel.OnItemCompleted(item);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out T? recoveryItem)
         {

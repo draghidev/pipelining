@@ -39,14 +39,14 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     /// source's lifetime. Distinct from the per-enumeration token captured by the enumerator.</summary>
     public CancellationToken CancellationToken => _state.CancellationToken;
 
-    /// <summary>Enqueues an item for processing. Returns an <see cref="EnqueueResult"/>.</summary>
+    /// <summary>Enqueues an item for processing. Returns an <see cref="EnqueueSignal"/>.</summary>
     /// <remarks>
-    /// Invoke <see cref="EnqueueResult.Execute"/> outside any held lock to signal the executor.
+    /// Invoke <see cref="EnqueueSignal.Signal"/> outside any held lock to signal the executor.
     /// The signal may synchronously dispatch the executor on the caller's thread if the source was
     /// constructed with <c>runContinuationsAsynchronously: false</c>.
     /// </remarks>
     /// <exception cref="InvalidOperationException">Thrown if the source has been completed.</exception>
-    public EnqueueResult Enqueue(T item)
+    public EnqueueSignal Enqueue(T item)
     {
         if (_state.WakeEvent.IsCompleted)
             ThrowCompleted();
@@ -93,19 +93,19 @@ public readonly struct UnboundedQueueSource<T> : IPipelineSource<T, UnboundedQue
     }
 
     /// <summary>
-    /// Represents a deferred enqueue completion returned by <see cref="Enqueue"/>.
-    /// The item is already in the queue. Calling <see cref="Execute"/> may signal the execution loop to process it.
+    /// Represents a deferred executor signal returned by <see cref="Enqueue"/>.
+    /// The item is already in the queue. Calling <see cref="Signal"/> may signal the execution loop to process it.
     /// This two-step design exists because the signal may synchronously run the execution loop on the caller's
     /// thread (when the source was created with <c>runContinuationsAsynchronously: false</c>), so it must be
     /// invoked outside any held lock.
     /// </summary>
-    public readonly struct EnqueueResult
+    public readonly struct EnqueueSignal
     {
         readonly SourceWakeEvent? _signal;
-        internal EnqueueResult(SourceWakeEvent? signal) => _signal = signal;
+        internal EnqueueSignal(SourceWakeEvent? signal) => _signal = signal;
 
         /// <summary>Signals the execution loop, which may run the executor inline on the calling thread.</summary>
-        public void Execute() => _signal?.Set();
+        public void Signal() => _signal?.Set();
     }
 
     /// <summary>The struct enumerator driven by the pipeline.</summary>

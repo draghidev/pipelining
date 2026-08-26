@@ -32,7 +32,7 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
 
     public int Backlog => _state.Queue.Count;
 
-    public EnqueueResult Enqueue(T item)
+    public EnqueueSignal Enqueue(T item)
     {
         if (_state.WakeEvent.IsCompleted)
             ThrowCompleted();
@@ -118,12 +118,12 @@ readonly struct TestObservableQueueSource<T> : IPipelineSource<T, TestObservable
         }
     }
 
-    public readonly struct EnqueueResult
+    public readonly struct EnqueueSignal
     {
         readonly SourceWakeEvent? _signal;
-        internal EnqueueResult(SourceWakeEvent? signal) => _signal = signal;
+        internal EnqueueSignal(SourceWakeEvent? signal) => _signal = signal;
 
-        public void Execute() => _signal?.Set();
+        public void Signal() => _signal?.Set();
     }
 
     public struct Enumerator : IPipelineEnumerator<T>

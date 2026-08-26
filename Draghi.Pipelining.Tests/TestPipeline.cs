@@ -132,7 +132,7 @@ sealed class TestPipelineItem
     //  - UnderExecutorDrive: a POSITIVE test-level bracket. A test that builds its pipeline with
     //    runContinuationsAsynchronously:false and enqueues into a PARKED executor runs the whole
     //    drive - pull, dispatch, activation, ExecuteItemAsync, commit - inline inside its own
-    //    Enqueue().Execute() call, so bracketing that call with this [ThreadStatic] positively
+    //    Enqueue().Signal() call, so bracketing that call with this [ThreadStatic] positively
     //    certifies "this activation ran on the executor" by construction: any item pushed into a
     //    synchronously-driven source is by definition dispatched on the driving thread, and nothing
     //    escapes the bracket without unwinding past the test's finally.
@@ -152,7 +152,7 @@ sealed class TestPipelineItem
     [ThreadStatic] static bool _executorDriveActive;
 
     /// The test-level executor-drive bracket (see FirstActivationUnderExecutorDrive). Set around a
-    /// synchronous Enqueue().Execute() drive, cleared in the caller's finally.
+    /// synchronous Enqueue().Signal() drive, cleared in the caller's finally.
     public static bool ExecutorDriveActive
     {
         get => _executorDriveActive;
@@ -296,19 +296,14 @@ struct TestPipelinePolicy : IPipelinePolicy<TestPipelineItem>
 
     public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate(preferAsync);
 
-    public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+    public void CompleteItem(TestPipelineItem item, Exception? exception)
     {
-        // Depth-accounting sentinel: a negative remainingDepth means a double-decrement
-        // (a recovery double-completion door, or depth/count token disagreement). Asserting
-        // here turns every test plus the stress runners into a detector for the whole
-        // accounting family - the policy seam is the contract surface, so this is where
-        // "never report a negative depth" is pinned.
-        if (remainingDepth < 0)
-            Assert.Fail($"CompleteItem observed negative remainingDepth {remainingDepth} for item {item.Name ?? "?"}.");
         item.Complete(exception);
         if (item.TakeCompletionException() is { } completionException)
             throw completionException;
     }
+
+    public void OnIdle() { }
 
     public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
     {

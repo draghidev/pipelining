@@ -44,7 +44,7 @@ public class PipelineLifecycleTests
 
         // Enqueue an item. Policy's ExecuteItemAsync awaits cancellation on the token.
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         // Give the executor a moment to enter ExecuteItemAsync.
         await Task.Delay(50);
@@ -88,7 +88,7 @@ public class PipelineLifecycleTests
         // Enqueue an item to push the executor past the cold wait into the post-batch idle hook.
         // Without this, the executor suspends at the wake signal without ever firing onIdle.
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
 
         // CompleteAsync's task completes cleanly - the idle hook's rethrown OCE is swallowed by the
@@ -110,7 +110,7 @@ public class PipelineLifecycleTests
         for (var i = 0; i < items.Length; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
         for (var i = 0; i < items.Length; i++)
             await items[i].WaitForExecutedAsync();
@@ -144,7 +144,7 @@ public class PipelineLifecycleTests
         for (var i = 0; i < waitersItems.Length; i++)
         {
             waitersItems[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(waitersItems[i]).Execute();
+            pipeline.Enqueue(waitersItems[i]).Signal();
         }
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -156,7 +156,7 @@ public class PipelineLifecycleTests
         for (var i = 0; i < queueItems.Length; i++)
         {
             queueItems[i] = new TestPipelineItem { CompleteAsync = true };
-            _ = pipeline.Enqueue(queueItems[i]);  // discard the EnqueueResult, don't wake executor
+            _ = pipeline.Enqueue(queueItems[i]);  // discard the EnqueueSignal, don't wake executor
         }
 
         // CompleteAsync wakes the executor, which exits and DrainOnCompletionAsync drains both.
@@ -197,7 +197,7 @@ public class PipelineLifecycleTests
 
         // Hold an item in-flight so WaitForEmptyAsync has to wait.
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         using var cts = new CancellationTokenSource();
@@ -224,7 +224,7 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
 
         // Once the executor has nothing left to dequeue, OnExecutionIdleAsync should fire.
@@ -233,41 +233,39 @@ public class PipelineLifecycleTests
     }
 
     [TestMethod]
-    public async Task CompleteItem_RemainingDepth_DecreasesPerCompletion()
+    public async Task OnIdle_FollowsFinalCompleteItem()
     {
-        var depths = new List<int>();
-        var pipeline = Pipeline.Create<TestPipelineItem, DepthCapturingPolicy>(new(depths));
+        var events = new List<string>();
+        var pipeline = Pipeline.Create<TestPipelineItem, IdleCapturingPolicy>(new(events));
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int count = 5;
         // CompleteAsync holds each item's pipeline task pending, so every item dispatches and stays
         // in-flight (becomes the pending tail) without completing - in-flight Depth climbs to count. Under
         // in-flight depth the default sync-completing item drains before the next dispatches (Depth
-        // caps at 1); holding the tasks pins all count items in-flight at once so the reported sequence
+        // caps at 1); holding the tasks pins all count items in-flight at once so the callback sequence
         // is deterministic.
         var items = new TestPipelineItem[count];
         for (var i = 0; i < count; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         // Wait until all count items are dispatched and in-flight (Depth == count).
         for (var i = 0; i < count; i++)
             await items[i].WaitForExecutedAsync();
 
-        // Release head-first, one fully before the next, so completions don't interleave. Each
-        // completion reports the in-flight depth AFTER its own decrement: count-1, count-2, ..., 0.
+        // Release head-first, one fully before the next, so callback ordering is deterministic.
         for (var i = 0; i < count; i++)
         {
             items[i].CompletePipelineTask();
             await items[i].WaitForCompleteAsync();
         }
 
-        var expected = new int[count];
-        for (var i = 0; i < count; i++)
-            expected[i] = count - 1 - i;
-        CollectionAssert.AreEqual(expected, depths);
+        CollectionAssert.AreEqual(
+            new[] { "complete", "complete", "complete", "complete", "complete", "idle" },
+            events);
     }
 
     /// CompleteItem must latch on BOTH the trailing AND the pipeline task - not the trailing alone.
@@ -285,7 +283,7 @@ public class PipelineLifecycleTests
         // CompleteAsync => pipeline task is TCS-gated (CompletePipelineTask); HasTrailingTask =>
         // trailing task is separately TCS-gated (CompleteTrailingTask).
         var item = new TestPipelineItem { CompleteAsync = true, HasTrailingTask = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         // Settle ONLY the trailing task. The pipeline task is still in flight.
@@ -325,7 +323,7 @@ public class PipelineLifecycleTests
         var second = new InvalidOperationException("second");
 
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         var firstTask = pipeline.CompleteAsync(first).AsTask();
@@ -350,7 +348,7 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true, HasTrailingTask = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         // Executor is now awaiting the trailing task.
 
@@ -374,7 +372,7 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
         // Item is now _pendingTail with a pending pipeline task.
 
@@ -398,7 +396,7 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
         // Executor finishes item, then calls OnExecutionIdleAsync which throws.
 
@@ -418,7 +416,7 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
         // CompleteAsync fires the token; the next wait's onIdle observes it and throws the properly
         // tokened OCE, which the executor swallows as sanctioned shutdown - clean completion.
@@ -450,7 +448,7 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
         await settled.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -470,7 +468,7 @@ public class PipelineLifecycleTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForCompleteAsync();
 
         var ex = await Assert.ThrowsExactlyAsync<OperationCanceledException>(
@@ -551,11 +549,11 @@ public class PipelineLifecycleTests
         Assert.IsTrue(task.IsCompleted, "WaitForEmptyAsync after CompleteAsync should be immediately completed.");
     }
 
-    struct DepthCapturingPolicy : IPipelinePolicy<TestPipelineItem>
+    struct IdleCapturingPolicy : IPipelinePolicy<TestPipelineItem>
     {
-        readonly List<int> _depths;
+        readonly List<string> _events;
 
-        public DepthCapturingPolicy(List<int> depths) => _depths = depths;
+        public IdleCapturingPolicy(List<string> events) => _events = events;
 
         public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
         {
@@ -567,11 +565,13 @@ public class PipelineLifecycleTests
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
 
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+        public void CompleteItem(TestPipelineItem item, Exception? exception)
         {
-            _depths.Add(remainingDepth);
+            _events.Add("complete");
             item.Complete(exception);
         }
+
+        public void OnIdle() => _events.Add("idle");
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -595,7 +595,7 @@ public class PipelineLifecycleTests
         pipelineRef = pipeline;
 
         var item = new TestPipelineItem();
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         await item.WaitForCompleteAsync();
         // Outside-thread CompleteAsync returns the same execution task. Awaiting confirms drain.
@@ -616,7 +616,9 @@ public class PipelineLifecycleTests
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -650,7 +652,9 @@ public class PipelineLifecycleTests
         }
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception) => item.Complete(exception);
+        public void CompleteItem(TestPipelineItem item, Exception? exception) => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {

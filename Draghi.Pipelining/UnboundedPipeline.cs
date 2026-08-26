@@ -40,8 +40,8 @@ public sealed class UnboundedPipeline<T, TPolicy>
     public int Backlog => Source.Backlog;
 
     /// <summary>Enqueues an item for processing. See
-    /// <see cref="UnboundedQueueSource{T}.Enqueue"/> for the deferred-execute semantics.</summary>
-    public UnboundedQueueSource<T>.EnqueueResult Enqueue(T item) => Source.Enqueue(item);
+    /// <see cref="UnboundedQueueSource{T}.Enqueue"/> for the deferred-signal semantics.</summary>
+    public UnboundedQueueSource<T>.EnqueueSignal Enqueue(T item) => Source.Enqueue(item);
 
     /// <summary>Completion of the current run. See
     /// <see cref="Pipeline{T,TPolicy,TSource,TEnumerator}.Completion"/>.</summary>

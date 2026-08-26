@@ -6,7 +6,7 @@ namespace Draghi.Pipelining;
 /// <summary>
 /// Per-item lifecycle contract for a pipeline. The pipeline consumes items from an
 /// <see cref="IPipelineSource{T,TEnumerator}"/> and invokes these methods at each lifecycle
-/// transition (execute, activate, complete, recover).
+/// transition (execute, activate, complete, idle, recover).
 /// </summary>
 /// <remarks>
 /// <see cref="ExecuteItemAsync"/> may fail synchronously or through its returned task; both are
@@ -91,14 +91,21 @@ public interface IPipelinePolicy<T>
 
     /// Notifies the item that its pipeline position has completed, with an optional error, exactly
     /// once. If recovery replaces an item, the failed item does not receive this callback; its
-    /// substitute does. <paramref name="remainingDepth"/> is the pipeline depth after retiring
-    /// this item's position.
+    /// substitute does.
     /// <remarks>
     /// Retirement is irrevocable before this callback runs. A synchronous exception violates the
     /// policy contract and propagates normally. Recovery handlers do not reinterpret it as an item
     /// failure or invoke this callback again for the same pipeline position.
     /// </remarks>
-    void CompleteItem(T item, int remainingDepth, Exception? exception);
+    void CompleteItem(T item, Exception? exception);
+
+    /// Notifies the policy when retirement leaves no item in flight.
+    /// <remarks>
+    /// This callback runs immediately after <see cref="CompleteItem"/> for the item whose retirement
+    /// reached zero. It is an exact edge notification, not a stable observation: source backlog may
+    /// remain, and completion may synchronously publish more work. This method must not throw.
+    /// </remarks>
+    void OnIdle();
 
     /// Attempts to recover from a failed item. Returns a substitute that replaces the failed item
     /// in the same pipeline position, or false if recovery is not possible. When true, the pipeline

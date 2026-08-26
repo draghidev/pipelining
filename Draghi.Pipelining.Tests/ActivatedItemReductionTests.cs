@@ -66,7 +66,7 @@ public class ActivatedItemReductionTests
     enum NullPolicy
     {
         AlwaysNull,           // baseline: activated slot = null in Complete unconditionally
-        DepthZeroOnly,        // null only when remainingDepth == 0 (assignment)
+        DepthZeroOnly,        // null only on the exact idle edge (assignment)
         DepthZeroWithCas,     // null only at depth=0, via CAS that fails on overwrite
         NeverNull,            // never null - rely on next Activate to overwrite
     }
@@ -86,7 +86,7 @@ public class ActivatedItemReductionTests
             Volatile.Write(ref _activated, item);
         }
 
-        public void Complete(SyntheticItem item, int remainingDepth)
+        public void Complete(SyntheticItem item, bool idle)
         {
             Interlocked.Increment(ref Completions);
             switch (Policy)
@@ -95,11 +95,11 @@ public class ActivatedItemReductionTests
                     Volatile.Write(ref _activated, null);
                     break;
                 case NullPolicy.DepthZeroOnly:
-                    if (remainingDepth is 0)
+                    if (idle)
                         Volatile.Write(ref _activated, null);
                     break;
                 case NullPolicy.DepthZeroWithCas:
-                    if (remainingDepth is 0)
+                    if (idle)
                         Interlocked.CompareExchange(ref _activated, null, item);
                     break;
                 case NullPolicy.NeverNull:
@@ -243,14 +243,16 @@ public class ActivatedItemReductionTests
             }
         }
 
-        public void CompleteItem(SyntheticItem item, int remainingDepth, Exception? exception)
+        public void CompleteItem(SyntheticItem item, Exception? exception)
         {
             // Bookkeeping (Probe.Complete - the depth==0 CompareExchange) runs BEFORE the item's
             // completion action, so the re-enqueued tenure's Activate cannot ABA-defeat the
             // comparand. Mark the completing tenure's drain over at entry so the completion action's
             // Reset doesn't stamp the new tenure mid-drain.
             item.CurrentTenure.Completed = true;
-            _probe.Complete(item, remainingDepth);
+            // The framework clears its activated slot only at the exact idle edge and does so
+            // before CompleteItem, giving policies an item-safe discriminator without a depth count.
+            _probe.Complete(item, _holder?.Pipeline?.Pipeline.ActivatedItem is null);
             FireCompletionAction(item);
         }
 
@@ -260,8 +262,10 @@ public class ActivatedItemReductionTests
                 return;
             item.RemainingTenures--;
             item.Reset();
-            _holder.Pipeline!.Enqueue(item).Execute();
+            _holder.Pipeline!.Enqueue(item).Signal();
         }
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, SyntheticItem failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out SyntheticItem? recoveryItem)
         {
@@ -277,8 +281,10 @@ public class ActivatedItemReductionTests
         for (var b = 0; b < batches; b++)
         {
             var probe = new ActivationProbe { Policy = nullPolicy };
-            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp));
+            var holder = new PipelineHolder();
+            var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp, holder));
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
+            holder.Pipeline = pipeline;
             var all = new SyntheticItem[items];
             if (concurrentEnqueue)
             {
@@ -290,10 +296,10 @@ public class ActivatedItemReductionTests
                 Parallel.For(0, items, i =>
                 {
                     all[i] = new SyntheticItem { Id = i };
-                    UnboundedQueueSource<SyntheticItem>.EnqueueResult enqueue;
+                    UnboundedQueueSource<SyntheticItem>.EnqueueSignal enqueue;
                     lock (enqueueLock)
                         enqueue = pipeline.Enqueue(all[i]);
-                    enqueue.Execute();
+                    enqueue.Signal();
                 });
             }
             else
@@ -301,7 +307,7 @@ public class ActivatedItemReductionTests
                 for (var i = 0; i < items; i++)
                 {
                     all[i] = new SyntheticItem { Id = i };
-                    pipeline.Enqueue(all[i]).Execute();
+                    pipeline.Enqueue(all[i]).Signal();
                 }
             }
 
@@ -336,7 +342,7 @@ public class ActivatedItemReductionTests
             holder.Pipeline = pipeline;
             var expected = items * (1 + tenures);
             for (var i = 0; i < items; i++)
-                pipeline.Enqueue(new SyntheticItem { Id = i, RemainingTenures = tenures }).Execute();
+                pipeline.Enqueue(new SyntheticItem { Id = i, RemainingTenures = tenures }).Signal();
 
             while (Volatile.Read(ref probe.Completions) < expected)
             {
@@ -468,7 +474,7 @@ public class ActivatedItemReductionTests
             // brief delay (holdRelease), so depth climbs above 1 and completions interleave with later
             // activations across threads.
             for (var i = 0; i < items; i++)
-                pipeline.Enqueue(new SyntheticItem { Id = i }).Execute();
+                pipeline.Enqueue(new SyntheticItem { Id = i }).Signal();
 
             await pipeline.CompleteAsync();
             Volatile.Write(ref stop, true);

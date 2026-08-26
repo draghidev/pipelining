@@ -94,8 +94,10 @@ readonly struct ProtocolPolicy : IPipelinePolicy<Operation>
     public void ActivateHeadItem(Operation item, bool preferAsync = true)
         => item.GrantReaderTurn(preferAsync);
 
-    public void CompleteItem(Operation item, int _, Exception? exception)
+    public void CompleteItem(Operation item, Exception? exception)
         => item.Complete(exception);
+
+    public void OnIdle() { }
 
     public bool TryRecoverItemFailure(
         in PipelineItemFailureContext context,
@@ -111,13 +113,13 @@ readonly struct ProtocolPolicy : IPipelinePolicy<Operation>
 var pipeline = Pipeline.Create<Operation, ProtocolPolicy>(new());
 
 var enqueue = pipeline.Enqueue(operation);
-enqueue.Execute();
+enqueue.Signal();
 
 await operation.Completion;
 await pipeline.CompleteAsync();
 ```
 
-Call `Enqueue` under producer synchronization if necessary, but call the returned `Execute` outside
+Call `Enqueue` under producer synchronization if necessary, but call the returned `Signal` outside
 that synchronization. Applications with different admission or storage requirements can provide a
 custom source.
 
@@ -181,7 +183,10 @@ cancellation and pooled item reuse possible without a stale activation touching 
 Activation may occur before or after `ExecuteItemAsync` is called, depending on whether the item is
 already at the ordered frontier when it is dispatched.
 
-`CompleteItem` is the terminal lifecycle notification for an item.
+`CompleteItem` is the terminal lifecycle notification for an item. After the completion that makes
+the in-flight sequence idle, `OnIdle` runs. This is an exact transition notification rather than a
+stable emptiness observation: pending source work may remain, and `CompleteItem` may already have
+published more work.
 
 See [Policy contract](docs/policy-contract.md) for publication, callback concurrency, cancellation,
 `ValueTask` consumption, and nonthrowing-callback requirements.
@@ -208,7 +213,7 @@ Implementing a policy is systems programming. Activation and execution may occur
 calls for different items may overlap, returned `ValueTask` instances must obey single-consumption
 rules, and outstanding work must converge during shutdown. Failure while invoking
 `ExecuteItemAsync`, or while awaiting its outer task, enters ordinary recovery. By contrast,
-`ActivateHeadItem`, `CompleteItem`, `TryRecoverItemFailure`, and `SubmitDetached` must not throw
+`ActivateHeadItem`, `CompleteItem`, `OnIdle`, `TryRecoverItemFailure`, and `SubmitDetached` must not throw
 synchronously. The [policy contract](docs/policy-contract.md) defines these rules.
 
 ## Cost model

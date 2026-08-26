@@ -21,7 +21,7 @@ public class ValueTPipelineTests
         for (var i = 0; i < count; i++)
         {
             ids[i] = pool.Allocate();
-            pipeline.Enqueue(new ValueItem(ids[i])).Execute();
+            pipeline.Enqueue(new ValueItem(ids[i])).Signal();
         }
 
         for (var i = 0; i < count; i++)
@@ -58,7 +58,7 @@ public class ValueTPipelineTests
         for (var i = 0; i < count; i++)
         {
             ids[i] = pool.Allocate(completeAsync: true);
-            pipeline.Enqueue(new ValueItem(ids[i])).Execute();
+            pipeline.Enqueue(new ValueItem(ids[i])).Signal();
         }
 
         // The first idle can fire between enqueues (the executor's wake races the enqueue loop
@@ -136,7 +136,7 @@ public class ValueTPipelineTests
             for (var i = 0; i < producerItems; i++)
             {
                 var id = pool.Allocate();
-                pipeline.Enqueue(new LargeValueItem(id, id, id, id)).Execute();
+                pipeline.Enqueue(new LargeValueItem(id, id, id, id)).Signal();
             }
             producerDone = true;
         });
@@ -181,7 +181,7 @@ public class ValueTPipelineTests
         for (var i = 0; i < count; i++)
         {
             ids[i] = pool.Allocate(completeAsync: true);
-            pipeline.Enqueue(new ValueItem(ids[i])).Execute();
+            pipeline.Enqueue(new ValueItem(ids[i])).Signal();
         }
 
         // Wait until the executor suspends (all items in _inFlight with callbacks registered).
@@ -233,7 +233,7 @@ public class ValueTPipelineTests
             for (var i = 0; i < producerItems; i++)
             {
                 var id = pool.Allocate();
-                pipeline.Enqueue(new LargeValueItem(id, id, id, id)).Execute();
+                pipeline.Enqueue(new LargeValueItem(id, id, id, id)).Signal();
             }
         });
 
@@ -302,7 +302,9 @@ readonly struct ValueItemPolicy(ValueItemPool pool) : IPipelinePolicy<ValueItem>
 
     public void ActivateHeadItem(ValueItem item, bool preferAsync = true) => pool.Get(item.Id).Activate();
 
-    public void CompleteItem(ValueItem item, int remainingDepth, Exception? exception) => pool.Get(item.Id).Complete();
+    public void CompleteItem(ValueItem item, Exception? exception) => pool.Get(item.Id).Complete();
+
+    public void OnIdle() { }
 
     public bool TryRecoverItemFailure(in PipelineItemFailureContext context, ValueItem failedItem, CancellationToken cancellationToken, out ValueItem recoveryItem)
     {
@@ -324,11 +326,13 @@ readonly struct LargeValueItemPolicy(ValueItemPool pool, Action<long, long, long
 
     public void ActivateHeadItem(LargeValueItem item, bool preferAsync = true) { }
 
-    public void CompleteItem(LargeValueItem item, int remainingDepth, Exception? exception)
+    public void CompleteItem(LargeValueItem item, Exception? exception)
     {
         onComplete?.Invoke(item.A, item.B, item.C, item.D);
         pool.Get((int)item.A).Complete();
     }
+
+    public void OnIdle() { }
 
     public bool TryRecoverItemFailure(in PipelineItemFailureContext context, LargeValueItem failedItem, CancellationToken cancellationToken, out LargeValueItem recoveryItem)
     {

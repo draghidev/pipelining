@@ -44,7 +44,7 @@ public class PipelineBenchmarks
     {
         var item = _item;
         item.Reset();
-        _pipeline.Enqueue(item).Execute();
+        _pipeline.Enqueue(item).Signal();
         item.Wait();
     }
 
@@ -77,7 +77,7 @@ public class PipelineBenchmarks
         last.Reset();
         // Single wake drains the backlog. Items complete in order on the sync path, so waiting
         // on the last is waiting on all.
-        _pipeline.Enqueue(last).Execute();
+        _pipeline.Enqueue(last).Signal();
         last.Wait();
     }
 
@@ -93,8 +93,8 @@ public class PipelineBenchmarks
         // in permanently.
         var a = new BareInFlightItem();
         var b = new BareInFlightItem();
-        _inFlightPipeline.Enqueue(a).Execute();
-        _inFlightPipeline.Enqueue(b).Execute();
+        _inFlightPipeline.Enqueue(a).Signal();
+        _inFlightPipeline.Enqueue(b).Signal();
         a.CompletePipelineTask();
         b.CompletePipelineTask();
         a.Wait();
@@ -115,7 +115,7 @@ public class PipelineBenchmarks
     {
         var item = _inFlightItem;
         item.Reset();
-        _inFlightPipeline.Enqueue(item).Execute();
+        _inFlightPipeline.Enqueue(item).Signal();
         item.WaitExecuted();
         item.CompletePipelineTask();
         item.Wait();
@@ -139,7 +139,7 @@ public class PipelineBenchmarks
     {
         var item = _item;
         item.Reset();
-        _structPipeline.Enqueue(new BareItemHandle(item)).Execute();
+        _structPipeline.Enqueue(new BareItemHandle(item)).Signal();
         item.Wait();
     }
 }
@@ -156,8 +156,10 @@ struct BareHandlePolicy : IPipelinePolicy<BareItemHandle>
 
     public void ActivateHeadItem(BareItemHandle item, bool preferAsync = true) { }
 
-    public void CompleteItem(BareItemHandle item, int remainingDepth, Exception? exception)
+    public void CompleteItem(BareItemHandle item, Exception? exception)
         => item.Item.SignalComplete();
+
+    public void OnIdle() { }
 
     public bool TryRecoverItemFailure(in PipelineItemFailureContext context, BareItemHandle failedItem, CancellationToken cancellationToken, out BareItemHandle recoveryItem)
     {
@@ -235,8 +237,10 @@ struct BareInFlightPolicy : IPipelinePolicy<BareInFlightItem>
 
     public void ActivateHeadItem(BareInFlightItem item, bool preferAsync = true) { }
 
-    public void CompleteItem(BareInFlightItem item, int remainingDepth, Exception? exception)
+    public void CompleteItem(BareInFlightItem item, Exception? exception)
         => item.SignalComplete();
+
+    public void OnIdle() { }
 
     public bool TryRecoverItemFailure(in PipelineItemFailureContext context, BareInFlightItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareInFlightItem? recoveryItem)
     {
@@ -258,10 +262,12 @@ struct BarePolicy : IPipelinePolicy<BareItem>
 
     public void ActivateHeadItem(BareItem item, bool preferAsync = true) { }
 
-    public void CompleteItem(BareItem item, int remainingDepth, Exception? exception)
+    public void CompleteItem(BareItem item, Exception? exception)
     {
         item.SignalComplete();
     }
+
+    public void OnIdle() { }
 
     public bool TryRecoverItemFailure(in PipelineItemFailureContext context, BareItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareItem? recoveryItem)
     {

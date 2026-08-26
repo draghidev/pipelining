@@ -59,7 +59,7 @@ public class PipelineConcurrencyTests
             Volatile.Write(ref idleHolder[0], idleTcs);
 
             var item = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
-            pipeline.Enqueue(item).Execute();
+            pipeline.Enqueue(item).Signal();
             // Commit before faulting so recovery runs from the dedicated in-flight slot.
             await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(10));
 
@@ -110,10 +110,10 @@ public class PipelineConcurrencyTests
             {
                 for (var i = 0; i < itemsPerThread; i++)
                 {
-                    UnboundedQueueSource<TestPipelineItem>.EnqueueResult enqueue;
+                    UnboundedQueueSource<TestPipelineItem>.EnqueueSignal enqueue;
                     lock (enqueueLock)
                         enqueue = pipeline.Enqueue(allItems[offset + i]);
-                    enqueue.Execute();
+                    enqueue.Signal();
                 }
             });
         }
@@ -162,7 +162,7 @@ public class PipelineConcurrencyTests
         {
             // A commits edge-owned at the empty edge; RegisterAdvanceCallback lands the BCL pairing
             // (s_invokeActionDelegate, _onAdvanceCallback) on sourceA - the registration under threat.
-            pipeline.Enqueue(itemA).Execute();
+            pipeline.Enqueue(itemA).Signal();
             await itemA.WaitForExecutedAsync();
             Assert.IsTrue(sourceA.WaitForRegistration(TimeSpan.FromSeconds(10)), "advance-fire registration on A's task");
 
@@ -179,7 +179,7 @@ public class PipelineConcurrencyTests
             // claims A (phase 1 is out), GetResult-consumes it (the tear), retires it, and
             // activates B - synchronously on the executor strand, microseconds after B executes -
             // all while A's completion dispatch is provably parked. The invariant forbids all of it.
-            pipeline.Enqueue(itemB).Execute();
+            pipeline.Enqueue(itemB).Signal();
             await itemB.WaitForExecutedAsync();
             var bActivatedDuringDispatch = SpinWait.SpinUntil(() => itemB.ActivationCount > 0, TimeSpan.FromSeconds(1));
             Assert.IsFalse(bActivatedDuringDispatch,
@@ -217,7 +217,7 @@ public class PipelineConcurrencyTests
 
         // First item has an async execute. While it's pending, enqueue more items.
         var first = new TestPipelineItem { ExecuteAsync = true };
-        pipeline.Enqueue(first).Execute();
+        pipeline.Enqueue(first).Signal();
 
         // Wait for first to start executing.
         await first.WaitForExecutedAsync();
@@ -225,8 +225,8 @@ public class PipelineConcurrencyTests
         // Enqueue more items while first is still executing.
         var second = new TestPipelineItem();
         var third = new TestPipelineItem();
-        pipeline.Enqueue(second).Execute();
-        pipeline.Enqueue(third).Execute();
+        pipeline.Enqueue(second).Signal();
+        pipeline.Enqueue(third).Signal();
 
         // Complete the first item's execute.
         first.CompleteExecuteTask();
@@ -252,7 +252,7 @@ public class PipelineConcurrencyTests
         for (var i = 0; i < items.Length; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         // Wait for all to be executed.
@@ -291,7 +291,7 @@ public class PipelineConcurrencyTests
         for (var i = 0; i < count; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = i % 2 != 0 };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         // Per-boundary check, keyed off the NEXT item's SignalExecuted (the executor dispatching
@@ -358,17 +358,17 @@ public class PipelineConcurrencyTests
         // C: a follow-on item that can only be dispatched once the pump is freed from B.
         var c = new TestPipelineItem();
 
-        pipeline.Enqueue(a).Execute();
+        pipeline.Enqueue(a).Signal();
         // Barrier: only A is enqueued, so the first idle deterministically means A was dispatched,
         // committed to _inFlight with its callback registered, and the pump is free and suspended.
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
-        pipeline.Enqueue(b).Execute();
+        pipeline.Enqueue(b).Signal();
         // B is dequeued, deferred-activation-published (A still in flight), and the executor is now
         // suspended awaiting B's pending execute task. The single pump is held by B: the stall.
         await b.WaitForExecutedAsync();
 
-        pipeline.Enqueue(c).Execute();
+        pipeline.Enqueue(c).Signal();
 
         // The stall, deterministically: C sits behind B in the queue and the pump is sequential, so
         // the executor cannot reach C until B's execute task resolves - which needs B's activation,
@@ -425,7 +425,7 @@ public class PipelineConcurrencyTests
                         completionOrder.Add(index);
                 }
             };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         // Wait for all items to be executed.
@@ -452,7 +452,7 @@ public class PipelineConcurrencyTests
 
         // Enqueue an item.
         var first = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(first).Execute();
+        pipeline.Enqueue(first).Signal();
 
         // Start waiting for idle.
         var idleTask = pipeline.WaitForEmptyAsync();
@@ -460,7 +460,7 @@ public class PipelineConcurrencyTests
 
         // Enqueue another item while waiting. Idle should not trigger until both are done.
         var second = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(second).Execute();
+        pipeline.Enqueue(second).Signal();
 
         // Complete first. Idle should still not trigger (second is pending).
         first.CompletePipelineTask();
@@ -486,7 +486,7 @@ public class PipelineConcurrencyTests
         for (var i = 0; i < count; i++)
         {
             var item = new TestPipelineItem();
-            pipeline.Enqueue(item).Execute();
+            pipeline.Enqueue(item).Signal();
             await item.WaitForCompleteAsync();
             Assert.IsNull(item.Exception);
         }
@@ -505,7 +505,7 @@ public class PipelineConcurrencyTests
         for (var i = 0; i < count; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         // Complete all pipeline tasks in order.
@@ -536,7 +536,7 @@ public class PipelineConcurrencyTests
             // Mix of async (CompleteAsync=true) and sync items to exercise both deferred-publish
             // and inline-activate paths.
             items[i] = new TestPipelineItem { CompleteAsync = i % 2 == 0 };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
             if (items[i].CompleteAsync)
             {
                 // Fire pipeline tasks from a separate thread to race with the executor / advancer.
@@ -611,7 +611,7 @@ public class PipelineConcurrencyTests
                 // Slon: sync flows complete at head inline; an async flow behind them can only complete
                 // if activation lands. A lost activation => the async item strands forever (the hang).
                 items[i] = new TestPipelineItem { Name = i.ToString(), CompleteAsync = i % 2 != 0 };
-                pipeline.Enqueue(items[i]).Execute();
+                pipeline.Enqueue(items[i]).Signal();
                 // Third flavor (every fourth, a subset of the async half): the pipeline task settles
                 // immediately off-thread, racing execute and commit. Produces completed-before-commit
                 // heads and commit-window completions, the ingredient the peek-gated C-path license
@@ -727,7 +727,7 @@ public class PipelineConcurrencyTests
             HasTrailingTask = true,
             TrailingTaskException = new InvalidOperationException("trailing failed"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
 
         await item.WaitForExecutedAsync();
         Assert.AreEqual(1, item.ActivationCount, "X must have been elided (activated) before its trailing task faults - the scenario under test.");
@@ -817,7 +817,7 @@ public class PipelineConcurrencyTests
                     TrailingTaskException = triggersRecovery ? new InvalidOperationException($"trailing failed {i}") : null,
                     ThrowOnExecute = declinesRecovery ? new InvalidOperationException($"execute failed {i}") : null,
                 };
-                pipeline.Enqueue(items[i]).Execute();
+                pipeline.Enqueue(items[i]).Signal();
                 if (triggersRecovery)
                     ThreadPool.UnsafeQueueUserWorkItem(
                         static it => ((TestPipelineItem)it!).CompleteTrailingTask(), items[i], preferLocal: false);
@@ -1035,12 +1035,14 @@ public class PipelineConcurrencyTests
             Task.Run(item.CompletePipelineTask);
         }
 
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+        public void CompleteItem(TestPipelineItem item, Exception? exception)
         {
             _guard.RecordCompletion(item.Name!);
             _guard.ReleaseBaton(item);
             item.Complete(exception);
         }
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -1069,7 +1071,7 @@ public class PipelineConcurrencyTests
         for (var i = 0; i < iterations; i++)
         {
             items[i] = new TestPipelineItem { Name = i.ToString(), CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
             _ = Task.Run(items[i].CompletePipelineTask);
         }
 
@@ -1104,8 +1106,10 @@ public class PipelineConcurrencyTests
             item.Activate();
         }
 
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+        public void CompleteItem(TestPipelineItem item, Exception? exception)
             => item.Complete(exception);
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context,
             TestPipelineItem failedItem, CancellationToken cancellationToken,
@@ -1138,7 +1142,7 @@ public class PipelineConcurrencyTests
         for (var i = 0; i < count; i++)
         {
             items[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(items[i]).Execute();
+            pipeline.Enqueue(items[i]).Signal();
         }
 
         // Wait for all to enter the in-flight store.
@@ -1188,7 +1192,7 @@ public class PipelineConcurrencyTests
             for (var i = 0; i < itemsPerRound; i++)
             {
                 asyncItems[i] = new TestPipelineItem { CompleteAsync = true };
-                pipeline.Enqueue(asyncItems[i]).Execute();
+                pipeline.Enqueue(asyncItems[i]).Signal();
                 allItems.Add(asyncItems[i]);
             }
             for (var i = 0; i < itemsPerRound; i++)
@@ -1204,7 +1208,7 @@ public class PipelineConcurrencyTests
             });
 
             var tail = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(tail).Execute();
+            pipeline.Enqueue(tail).Signal();
             allItems.Add(tail);
             await tail.WaitForExecutedAsync();
             tail.CompletePipelineTask();
@@ -1234,7 +1238,7 @@ public class PipelineConcurrencyTests
     ///
     /// Executor-ness is certified by construction, not inference: the pipeline is built with
     /// runContinuationsAsynchronously:false, so enqueueing into a parked executor runs the whole
-    /// drive inline within the test's own bracketed Enqueue().Execute() call - any item pushed
+    /// drive inline within the test's own bracketed Enqueue().Signal() call - any item pushed
     /// into a synchronously-driven source is by definition dispatched on the driving thread.
     /// BeforeExecute splits the dispatch activation (asserted) from the post-execute commit walk
     /// within the same drive (a legitimate true). The self-resolved-handoff case needs the sole
@@ -1251,7 +1255,7 @@ public class PipelineConcurrencyTests
         static void EnqueueUnderExecutorDrive(UnboundedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TestPipelineItem item)
         {
             TestPipelineItem.ExecutorDriveActive = true;
-            try { pipeline.Enqueue(item).Execute(); }
+            try { pipeline.Enqueue(item).Signal(); }
             finally { TestPipelineItem.ExecutorDriveActive = false; }
         }
 
@@ -1321,13 +1325,13 @@ public class PipelineConcurrencyTests
 
         // A: async-pipeline waiter. Drives the advancer when its pipeline task completes.
         var a = new ActivationOrderingItem { PipelineTaskAsync = true };
-        pipeline.Enqueue(a).Execute();
+        pipeline.Enqueue(a).Signal();
         await a.WaitForExecutedAsync();
 
         // B: async-execute item. Takes the deferred-activation branch (waiter A present).
         // Async execute gives the advancer time to claim _executingItem and start ActivateHeadItem.
         var b = new ActivationOrderingItem { ExecuteAsync = true };
-        pipeline.Enqueue(b).Execute();
+        pipeline.Enqueue(b).Signal();
         await b.WaitForExecutedAsync();
 
         // Fire the advancer: completes A and lets the advancer claim B's deferred publish.
@@ -1358,11 +1362,11 @@ public class PipelineConcurrencyTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var resident = new ActivationOrderingItem { PipelineTaskAsync = true };
-        pipeline.Enqueue(resident).Execute();
+        pipeline.Enqueue(resident).Signal();
         await resident.WaitForExecutedAsync();
 
         var failed = new ActivationOrderingItem { ExecuteAsync = true };
-        pipeline.Enqueue(failed).Execute();
+        pipeline.Enqueue(failed).Signal();
         await failed.WaitForExecutedAsync();
 
         var shutdown = pipeline.CompleteAsync();
@@ -1393,7 +1397,7 @@ public class PipelineConcurrencyTests
 
         // A: async-pipeline waiter. When A's pipeline completes, advancer drains and claims B.
         var a = new ActivationOrderingItem { PipelineTaskAsync = true };
-        pipeline.Enqueue(a).Execute();
+        pipeline.Enqueue(a).Signal();
         await a.WaitForExecutedAsync();
 
         // B: async pipeline + async trailing. Goes through deferred path (A is waiter, count>0)
@@ -1401,7 +1405,7 @@ public class PipelineConcurrencyTests
         // ClearExecutingItem test - B's pipeline is pending so it becomes _pendingTail, and
         // tail-commit (not inline ClearExecutingItem) is the path that races the advancer.
         var b = new ActivationOrderingItem { PipelineTaskAsync = true, HasTrailingTaskAsync = true };
-        pipeline.Enqueue(b).Execute();
+        pipeline.Enqueue(b).Signal();
         await b.WaitForExecutedAsync();
 
         // Fire the advancer: drain A, claim B (deferred), start slow ActivateHeadItem(B).
@@ -1508,11 +1512,11 @@ public class PipelineConcurrencyTests
             if (ReferenceEquals(item, first) && !enqueued)
             {
                 enqueued = true;
-                pipeline.Enqueue(second).Execute();
+                pipeline.Enqueue(second).Signal();
             }
         };
 
-        pipeline.Enqueue(first).Execute();
+        pipeline.Enqueue(first).Signal();
 
         // Under RunAsync=false the executor ran inline. Both items should be completed by now.
         await first.WaitForCompleteAsync();
@@ -1553,8 +1557,8 @@ public class PipelineConcurrencyTests
         {
             faultingItems[i] = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException($"fault {i}") };
             fillerItems[i] = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(faultingItems[i]).Execute();
-            pipeline.Enqueue(fillerItems[i]).Execute();
+            pipeline.Enqueue(faultingItems[i]).Signal();
+            pipeline.Enqueue(fillerItems[i]).Signal();
         }
 
         for (var i = 0; i < iterations; i++)
@@ -1603,13 +1607,15 @@ public class PipelineConcurrencyTests
 
         public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
 
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
+        public void CompleteItem(TestPipelineItem item, Exception? exception)
         {
             box.OnComplete?.Invoke(item);
             item.Complete(exception);
         }
 
         public bool RunEnqueueAsynchronously => false;
+
+        public void OnIdle() { }
 
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
         {
@@ -1622,49 +1628,13 @@ public class PipelineConcurrencyTests
     {
         public ValueTask<PipelineItemResult> ExecuteItemAsync(ActivationOrderingItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken) => item.RunExecute();
         public void ActivateHeadItem(ActivationOrderingItem item, bool preferAsync = true) => item.RunActivate();
-        public void CompleteItem(ActivationOrderingItem item, int remainingDepth, Exception? exception) => item.RunComplete();
+        public void CompleteItem(ActivationOrderingItem item, Exception? exception) => item.RunComplete();
+        public void OnIdle() { }
+
         public bool TryRecoverItemFailure(in PipelineItemFailureContext context, ActivationOrderingItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out ActivationOrderingItem? recoveryItem)
         {
             recoveryItem = null;
             return false;
-        }
-    }
-
-    /// Depth-accounting guard: no negative remainingDepth ever surfaces to policy.CompleteItem under
-    /// a tight enqueue burst. Historically this hunted a PRODUCER-side race - Enqueue published the
-    /// item then IncrementDepth, so the executor's TryDequeue could land between and decrement before
-    /// the increment (negative depth; OnDepthReachedZero observed at -1 instead of 0, hanging
-    /// WaitForEmptyAsync). That window is now structurally closed: depth is incremented at DISPATCH by
-    /// the single-consumer executor (commit b0e45260), so Enqueue no longer touches depth and there is
-    /// no producer race to fish for. What remains is the deterministic dispatch-increment /
-    /// completion-decrement accounting, identical per item - a small burst exercises it fully (the old
-    /// 1M-iteration brute force only re-ran the same single-consumer loop).
-    [TestMethod]
-    public async Task Enqueue_TightBurst_RemainingDepthNeverNegative()
-    {
-        var observed = new System.Collections.Concurrent.ConcurrentQueue<int>();
-        var pipeline = Pipeline.Create<TestPipelineItem, DepthRecordingPolicy>(
-            new DepthRecordingPolicy(observed));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
-
-        // A tight synchronous enqueue burst maximizes executor-wakeup churn (~130us/item here, far
-        // pricier than a lock-batched enqueue), so a few hundred items already exercises the dispatch-
-        // increment / completion-decrement accounting fully. (Was 1M, which only re-ran the same
-        // single-consumer loop now that the producer-side depth race is structurally closed.)
-        const int n = 500;
-        for (var i = 0; i < n; i++)
-            pipeline.Enqueue(new TestPipelineItem()).Execute();
-
-        await pipeline.CompleteAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(30));
-
-        Assert.IsTrue(observed.Count >= n, $"expected a CompleteItem depth observation per item, got {observed.Count} for {n}.");
-        var min = int.MaxValue;
-        var max = int.MinValue;
-        foreach (var d in observed)
-        {
-            if (d < min) min = d;
-            if (d > max) max = d;
-            Assert.IsTrue(d >= 0, $"negative remainingDepth observed: {d}. range [{min}, {max}]");
         }
     }
 
@@ -1688,7 +1658,7 @@ public class PipelineConcurrencyTests
 
         // In-flight item with a pipeline task that will fault, triggering recovery.
         var faulting = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
-        pipeline.Enqueue(faulting).Execute();
+        pipeline.Enqueue(faulting).Signal();
         await faulting.WaitForExecutedAsync();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
@@ -1739,7 +1709,7 @@ public class PipelineConcurrencyTests
                 CompleteAsync = true,
                 PipelineTaskException = new InvalidOperationException("fault"),
             };
-            pipeline.Enqueue(failed).Execute();
+            pipeline.Enqueue(failed).Signal();
             await idle.Task.WaitAsync(TimeSpan.FromSeconds(5));
             failed.CompletePipelineTask();
             await recovery.WaitForExecutedAsync();
@@ -1775,7 +1745,7 @@ public class PipelineConcurrencyTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         const int waiters = 8;
@@ -1806,7 +1776,7 @@ public class PipelineConcurrencyTests
         for (var c = 0; c < cycles; c++)
         {
             var item = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(item).Execute();
+            pipeline.Enqueue(item).Signal();
             await item.WaitForExecutedAsync();
 
             var idleTask = pipeline.WaitForEmptyAsync().AsTask();
@@ -1836,7 +1806,7 @@ public class PipelineConcurrencyTests
         const int callers = 8;
 
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         var exceptions = new InvalidOperationException[callers];
@@ -1869,7 +1839,7 @@ public class PipelineConcurrencyTests
         using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await item.WaitForExecutedAsync();
 
         var idleTask = pipeline.WaitForEmptyAsync().AsTask();
@@ -1896,7 +1866,7 @@ public class PipelineConcurrencyTests
             var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             var item = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(item).Execute();
+            pipeline.Enqueue(item).Signal();
             await item.WaitForExecutedAsync();
 
             var idleTask = pipeline.WaitForEmptyAsync().AsTask();
@@ -1949,8 +1919,8 @@ public class PipelineConcurrencyTests
             using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             var item1 = new TestPipelineItem { CompleteAsync = true };
             var item2 = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(item1).Execute();
-            pipeline.Enqueue(item2).Execute();
+            pipeline.Enqueue(item1).Signal();
+            pipeline.Enqueue(item2).Signal();
             await item1.WaitForExecutedAsync();
             await item2.WaitForExecutedAsync();
 
@@ -2005,7 +1975,7 @@ public class PipelineConcurrencyTests
             for (var i = 0; i < pileSize; i++)
             {
                 pile[i] = new TestPipelineItem { CompleteAsync = true };
-                pipeline.Enqueue(pile[i]).Execute();
+                pipeline.Enqueue(pile[i]).Signal();
             }
             foreach (var item in pile)
             {
@@ -2022,7 +1992,7 @@ public class PipelineConcurrencyTests
             });
 
             var tail = new TestPipelineItem { CompleteAsync = true };
-            pipeline.Enqueue(tail).Execute();
+            pipeline.Enqueue(tail).Signal();
 
             if (!await tail.TryWaitForExecutedAsync(stageTimeout))
                 await HangAsync(iter, "tail-executed", pipeline, pile, tail);
@@ -2113,7 +2083,7 @@ public class PipelineConcurrencyTests
     {
         var item = new TestPipelineItem();
         itemRef = new WeakReference(item);
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
     }
 
     /// Regression guard for the _pendingTail slot clear in CommitPendingTail (Pipeline.cs:508-509).
@@ -2173,7 +2143,7 @@ public class PipelineConcurrencyTests
         var item = new TestPipelineItem { CompleteAsync = true, OnComplete = completed.SetResult };
         itemRef = new WeakReference(item);
         completer = item.CompletePipelineTask;
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
     }
 
     /// Regression guard for the _executingItem slot clear in ClearExecutingItem (Pipeline.cs:1038-1039).
@@ -2228,8 +2198,8 @@ public class PipelineConcurrencyTests
         waiterRef = new WeakReference(waiter);
         deferredRef = new WeakReference(deferred);
         waiterCompleter = waiter.CompletePipelineTask;
-        pipeline.Enqueue(waiter).Execute();
-        pipeline.Enqueue(deferred).Execute();
+        pipeline.Enqueue(waiter).Signal();
+        pipeline.Enqueue(deferred).Signal();
     }
 
     /// Regression guard for RecoverInFlightItemResult's async-trailing continuation bailout
@@ -2254,7 +2224,7 @@ public class PipelineConcurrencyTests
             CompleteAsync = true,
             PipelineTaskException = new InvalidOperationException("waiter fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         // Fault → advancer → RecoverInFlightItem → recovery executes sync → RecoverInFlightItemResult hooks
@@ -2309,7 +2279,7 @@ public class PipelineConcurrencyTests
             CompleteAsync = true,
             PipelineTaskException = new InvalidOperationException("fault"),
         };
-        pipeline.Enqueue(item).Execute();
+        pipeline.Enqueue(item).Signal();
         await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
 
         item.CompletePipelineTask();
@@ -2327,39 +2297,6 @@ public class PipelineConcurrencyTests
 
         Assert.IsNotNull(recoveryRef);
         await AssertDiesAsync(recoveryRef, "Recovery item still alive after completion.");
-    }
-
-    struct DepthRecordingPolicy : IPipelinePolicy<TestPipelineItem>
-    {
-        readonly System.Collections.Concurrent.ConcurrentQueue<int> _observed;
-
-        public DepthRecordingPolicy(System.Collections.Concurrent.ConcurrentQueue<int> observed)
-        {
-            _observed = observed;
-        }
-
-        public ValueTask<PipelineItemResult> ExecuteItemAsync(TestPipelineItem item, bool pipelineTaskRecovery, CancellationToken cancellationToken)
-        {
-            var task = item.GetExecuteTask();
-            item.SignalExecuted();
-            return task;
-        }
-
-        public void ActivateHeadItem(TestPipelineItem item, bool preferAsync = true) => item.Activate();
-
-        public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
-        {
-            _observed.Enqueue(remainingDepth);
-            item.Complete(exception);
-        }
-
-        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, TestPipelineItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
-        {
-            recoveryItem = null;
-            return false;
-        }
-
-        public bool RunEnqueueAsynchronously => true;
     }
 
     /// Stress test targeting the cancel-during-arm window in TestObservableQueueSource's
@@ -2400,7 +2337,7 @@ public class PipelineConcurrencyTests
             {
                 for (var i = 0; i < 5; i++)
                 {
-                    try { pipeline.Enqueue(new TestPipelineItem()).Execute(); }
+                    try { pipeline.Enqueue(new TestPipelineItem()).Signal(); }
                     catch (InvalidOperationException) { return; } // source completed
                 }
             });
