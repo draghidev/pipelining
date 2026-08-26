@@ -238,7 +238,7 @@ struct BareInFlightPolicy : IPipelinePolicy<BareInFlightItem>
     public void CompleteItem(BareInFlightItem item, int remainingDepth, Exception? exception)
         => item.SignalComplete();
 
-    public bool TryRecoverItemFailure(PipelineItemFailureContext context, BareInFlightItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareInFlightItem? recoveryItem)
+    public bool TryRecoverItemFailure(in PipelineItemFailureContext context, BareInFlightItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareInFlightItem? recoveryItem)
     {
         recoveryItem = null;
         return false;
@@ -263,7 +263,7 @@ struct BarePolicy : IPipelinePolicy<BareItem>
         item.SignalComplete();
     }
 
-    public bool TryRecoverItemFailure(PipelineItemFailureContext context, BareItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareItem? recoveryItem)
+    public bool TryRecoverItemFailure(in PipelineItemFailureContext context, BareItem failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out BareItem? recoveryItem)
     {
         recoveryItem = null;
         return false;

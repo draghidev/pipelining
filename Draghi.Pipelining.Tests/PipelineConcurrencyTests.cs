@@ -1107,6 +1107,14 @@ public class PipelineConcurrencyTests
         public void CompleteItem(TestPipelineItem item, int remainingDepth, Exception? exception)
             => item.Complete(exception);
 
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context,
+            TestPipelineItem failedItem, CancellationToken cancellationToken,
+            [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out TestPipelineItem? recoveryItem)
+        {
+            recoveryItem = null;
+            return false;
+        }
+
         public bool RunEnqueueAsynchronously => true;
     }
 

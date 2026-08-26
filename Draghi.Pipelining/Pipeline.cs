@@ -440,7 +440,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
     }
 
-    /// <summary>Leaves a completed or condemned tenure as a clean, reusable shell.</summary>
+    /// <summary>Leaves a completed or condemned tenure as a clean, reusable instance.</summary>
     void ResetForReuse()
     {
         _completionException = null;
@@ -763,14 +763,14 @@ public static class Pipeline
     /// <para>
     /// Instance reuse: pass a previously-completed <paramref name="instance"/> to rebind it
     /// against the new <paramref name="policy"/> + <paramref name="source"/> and restart it.
-    /// The shell allocation (in-flight queue, delegates, depth machinery) gets reused while
+    /// The instance allocation (in-flight queue, delegates, depth machinery) gets reused while
     /// the per-run state (enumerator, execution task) gets fresh.
     /// </para>
     /// <para>
     /// The natural call-site pattern when caller caches a nullable pipeline field:
     /// <code>_cachedPipeline = Pipeline.Create(policy, source, _cachedPipeline);</code>
     /// First call: <paramref name="instance"/> is null → fresh allocation.
-    /// Subsequent calls: <paramref name="instance"/> is non-null → shell reuse.
+    /// Subsequent calls: <paramref name="instance"/> is non-null → instance reuse.
     /// </para>
     /// <para>
     /// Throws if <paramref name="instance"/> is non-null but its previous run hasn't fully

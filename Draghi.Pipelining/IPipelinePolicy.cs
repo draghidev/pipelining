@@ -9,9 +9,10 @@ namespace Draghi.Pipelining;
 /// transition (execute, activate, complete, recover).
 /// </summary>
 /// <remarks>
-/// Policy methods MUST NOT throw synchronously. They run at lifecycle transitions where a thrown
-/// exception cannot reliably describe which policy effects occurred. Failures from the tasks returned
-/// by <see cref="ExecuteItemAsync"/> are first-class and flow through recovery.
+/// <see cref="ExecuteItemAsync"/> may fail synchronously or through its returned task; both are
+/// first-class item-execution failures and flow through recovery. The remaining policy callbacks
+/// MUST NOT throw synchronously. They run at lifecycle transitions where a thrown exception cannot
+/// reliably describe which policy effects occurred.
 /// <para>
 /// Production-side concerns (when items arrive, how the executor suspends while waiting, dispatch
 /// scheduling between enqueue and execute) live on the source, not the policy. The policy is
@@ -34,6 +35,11 @@ public interface IPipelinePolicy<T>
     /// Idiomatic handling is to either throw <see cref="OperationCanceledException"/> on
     /// cancellation or return a faulted task.
     /// <para>
+    /// A synchronous exception thrown before this method returns its <see cref="ValueTask{TResult}"/>
+    /// is supported and has the same failure classification as a fault from that outer task. No
+    /// trailing or pipeline task has been established in that case.
+    /// </para>
+    /// <para>
     /// <paramref name="pipelineTaskRecovery"/> is true only when recovering a
     /// <see cref="PipelineItemFailureKind.PipelineTask"/> failure from the in-flight drain. Calls with
     /// <c>pipelineTaskRecovery: true</c> never overlap one another, but one may overlap an ordinary
@@ -54,6 +60,8 @@ public interface IPipelinePolicy<T>
     /// recovery, sync-deferred path) will not see a subsequent (stale) call for activation.
     /// When called, it is guaranteed to be at most once per item,
     /// strictly before <see cref="CompleteItem"/> for the same item, and never concurrently with it.
+    /// Activation may occur before or after <see cref="ExecuteItemAsync"/> is called. Policies must
+    /// not assume an ordering between those two callbacks.
     /// <para>
     /// Pooling: the "will never" guarantee above is load-bearing. Without it, pooling would
     /// be structurally impossible. A stale Activate arriving after the item is returned to
@@ -69,12 +77,22 @@ public interface IPipelinePolicy<T>
     /// schedule item-body work rather than running it inline. Slow work here, or in
     /// <see cref="CompleteItem"/>, delays retirement and other completion callbacks.
     /// </para>
+    /// <para>
+    /// This method must not throw. The pipeline has already published the item as the activated head and
+    /// transferred its activation turn before invoking the policy. A synchronous exception cannot
+    /// roll that transition back or be treated as an ordinary item failure. Activation should only
+    /// perform or schedule a nonthrowing wake. Operational failures belong to the item's task
+    /// machinery. A scheduler used here must obey
+    /// <see cref="PipelineScheduler.SubmitDetached(Action{object?}, object?, bool)"/>'s nonthrowing
+    /// fire-and-forget contract.
+    /// </para>
     /// </remarks>
     void ActivateHeadItem(T item, bool preferAsync = true);
 
-    /// Notifies the item of retirement, with an optional error, exactly once. If recovery supplants
-    /// an item, the failed item does not receive this callback; its recovery item does.
-    /// <paramref name="remainingDepth"/> is the pipeline depth after retiring this item.
+    /// Notifies the item that its pipeline position has completed, with an optional error, exactly
+    /// once. If recovery replaces an item, the failed item does not receive this callback; its
+    /// substitute does. <paramref name="remainingDepth"/> is the pipeline depth after retiring
+    /// this item's position.
     /// <remarks>
     /// Retirement is irrevocable before this callback runs. A synchronous exception violates the
     /// policy contract and propagates normally. Recovery handlers do not reinterpret it as an item
@@ -82,17 +100,12 @@ public interface IPipelinePolicy<T>
     /// </remarks>
     void CompleteItem(T item, int remainingDepth, Exception? exception);
 
-    /// Attempts to recover from a failed item. Returns a recovery item that supplants the failed item
+    /// Attempts to recover from a failed item. Returns a substitute that replaces the failed item
     /// in the same pipeline position, or false if recovery is not possible. When true, the pipeline
-    /// does not call <see cref="CompleteItem"/> for <paramref name="failedItem"/>; the recovery item
+    /// does not call <see cref="CompleteItem"/> for <paramref name="failedItem"/>; the substitute
     /// assumes that lifecycle position. A consultation for
     /// <see cref="PipelineItemFailureKind.PipelineTask"/> may overlap ordinary item execution.
-    /// Struct policies should override this default implementation to avoid boxing.
-    bool TryRecoverItemFailure(in PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out T? recoveryItem)
-    {
-        recoveryItem = default;
-        return false;
-    }
+    bool TryRecoverItemFailure(in PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [NotNullWhen(true)] out T? recoveryItem);
 }
 
 /// <summary>

@@ -124,9 +124,7 @@ sealed class PipelineChannel<T>
         public void CompleteItem(T item, int remainingDepth, Exception? exception)
             => channel.OnItemCompleted(item);
 
-        // Override IPipelinePolicy DIM methods explicitly. DIM dispatch through an interface
-        // call on a struct boxes the struct on every call. Explicit overrides avoid the box.
-        public bool TryRecoverItemFailure(PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out T? recoveryItem)
+        public bool TryRecoverItemFailure(in PipelineItemFailureContext context, T failedItem, CancellationToken cancellationToken, [System.Diagnostics.CodeAnalysis.NotNullWhen(true)] out T? recoveryItem)
         {
             recoveryItem = default;
             return false;

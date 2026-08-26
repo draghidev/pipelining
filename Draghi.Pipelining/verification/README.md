@@ -1,6 +1,6 @@
-# Draghi pipeline verification
+# Draghi.Pipelining verification
 
-This directory contains the maintained TLA+ models for Draghi's pipeline and its planned component boundaries.
+This directory contains the maintained TLA+ models for Draghi.Pipelining and its component boundaries.
 
 Each runnable model has one canonical, code-faithful configuration beside its `.tla` file. Contract and library modules are composed by runnable models and need no configuration. Diagnostic configurations are grouped by purpose:
 
