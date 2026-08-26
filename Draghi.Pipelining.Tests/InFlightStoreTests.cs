@@ -3,9 +3,9 @@ using Draghi.Pipelining;
 
 namespace Draghi.Pipelining.Tests;
 
-/// Tri-state slot word contract. The
-/// fields and the occupancy flag tore under the old two-state word: a claim that won between a
-/// commit's flag publish and its field writes read a stale/default or torn pair. These tests pin
+/// Tri-state slot ownership contract. The fields and occupancy flag were previously published
+/// separately, so a claim between the field writes and flag publication could read a stale/default
+/// or torn pair. These tests pin
 /// the three behaviors the tri-state introduced (the data-then-license commit, the live-task
 /// peek bail, and the licensed never-default claim) plus the LEAVE-HEAD escalation contract (the
 /// slot occupant stays in the slot; only the overflow is enqueued).
@@ -197,18 +197,18 @@ public class InFlightStoreTests
         Assert.AreEqual(gen, peekedGen);
         Assert.AreEqual(7, handedOff, "The empty-edge pass peeks the published item, not a stale capture.");
         Assert.IsTrue(gate.TryClaimProvisionalTurn(peekedGen), "Fail-if-live turn claim must win on a free turn.");
-        Assert.AreEqual(-peekedGen, gate.Turn, "The provisional turn is identity-tagged -gen.");
+        Assert.AreEqual(-peekedGen, gate.TurnOwner, "The provisional turn is identity-tagged -gen.");
         Assert.IsTrue(gate.TryTakeHandoff(peekedGen), "The generation-pinned consume must win the unrecycled handoff.");
-        Assert.IsTrue(gate.Release(-peekedGen), "The turn's completion releases exactly its -gen.");
+        Assert.IsTrue(gate.TryReleaseTurn(-peekedGen), "The turn's completion releases exactly its -gen.");
 
         // A later, unrelated item commits at the edge and retires: the turn must assign and
         // release cleanly, without residue from the earlier provisional turn.
         Assert.AreEqual(0, Commit(ref store, 1, Completed, out var isSlot));
         Assert.IsTrue(isSlot);
-        Assert.IsFalse(gate.CommitTurn(0, tenure.HeadSequence), "A fresh edge assign must not read as inherited.");
+        Assert.IsFalse(gate.CommitTurn(0, tenure.NextSequence), "A fresh edge assign must not read as inherited.");
         Assert.IsTrue(store.TryClaimCompletedHead(ref tenure, out var item, out _, out _, out _));
         Assert.AreEqual(1, item);
-        Assert.IsTrue(gate.Release(tenure.LastClaimedSequence), "The retiring owner's identity release must win.");
+        Assert.IsTrue(gate.TryReleaseTurn(tenure.LastClaimedSequence), "The retiring owner's identity release must win.");
         Assert.IsTrue(store.DecrementCount(), "Single item: the decrement drains to zero.");
     }
 

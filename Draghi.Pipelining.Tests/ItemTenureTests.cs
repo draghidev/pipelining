@@ -11,10 +11,10 @@ public class ItemTenureTests
     {
         var tenure = new ItemTenure();
 
-        Assert.AreEqual(1, tenure.HeadSequence);
+        Assert.AreEqual(1, tenure.NextSequence);
         Assert.AreEqual(1, tenure.ClaimHead());
         Assert.AreEqual(1, tenure.LastClaimedSequence);
-        Assert.AreEqual(2, tenure.HeadSequence);
+        Assert.AreEqual(2, tenure.NextSequence);
         Assert.AreEqual(2, tenure.ClaimHead());
     }
 
@@ -23,7 +23,7 @@ public class ItemTenureTests
     {
         var tenure = new ItemTenure();
 
-        tenure.ArmCompletionCallback(tenure.HeadSequence);
+        tenure.ArmCompletionCallback(tenure.NextSequence);
         Assert.IsTrue(tenure.IsCompletionCallbackPendingForHead());
 
         tenure.MarkCompletionCallbackDelivered();
@@ -38,7 +38,7 @@ public class ItemTenureTests
     {
         var tenure = new ItemTenure();
         Assert.AreEqual(1, tenure.ClaimHead());
-        tenure.ArmCompletionCallback(tenure.HeadSequence);
+        tenure.ArmCompletionCallback(tenure.NextSequence);
 
         Assert.ThrowsExactly<UnreachableException>(tenure.EnsureIdle);
         tenure.Reset();

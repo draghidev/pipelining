@@ -126,9 +126,9 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             // late task fault from recursively entering recovery.
             Volatile.Write(ref _executingItemVisible, false);
             _pendingTail = recoveryItem;
-            _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
-            _pendingTailActivated = recoveryActivated;
-            _pendingTailGeneration = recoveryGeneration;
+            _pendingTailPipelineTask = GuardRecoveryTask(result.PipelineTask);
+            _pendingTailOwnsActivation = recoveryActivated;
+            _pendingTailActivationGeneration = recoveryGeneration;
             Volatile.Write(ref _hasPendingTail, true);
         }
     }
@@ -142,7 +142,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // method's locals. Wrap it back into a ValueTask for the context's per-construction-
         // site value - the recovery awaits the Task-backed ValueTask idempotently, the
         // framework's CommitInFlightItem takes the Task directly.
-        var pipelineTask = _pendingTailTask.Preserve();
+        var pipelineTask = _pendingTailPipelineTask.Preserve();
         var context = new PipelineItemFailureContext(PipelineItemFailureKind.TrailingExecutionTask, ex, pipelineTask);
         T? recoveryCandidate;
         bool recovered;
@@ -153,8 +153,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         catch
         {
             _hasPendingTail = false;
-            _pendingTailTask = default;
-            _pendingTailActivated = false;
+            _pendingTailPipelineTask = default;
+            _pendingTailOwnsActivation = false;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _pendingTail = default!;
             var ownsTurn = activated || _activationGate.TryTakeHandoff();
@@ -167,8 +167,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             // A pending pipeline task must enter the in-flight store rather than complete prematurely.
             // Items can handle their own interdependency between the two tasks if needed.
             _hasPendingTail = false;
-            _pendingTailTask = default;
-            _pendingTailActivated = false;
+            _pendingTailPipelineTask = default;
+            _pendingTailOwnsActivation = false;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _pendingTail = default!;
             // Resolve the parked handoff before the commit (the commit invariant): the one-winner
@@ -228,7 +228,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         catch (Exception recoveryEx)
         {
             _hasPendingTail = false;
-            _pendingTailTask = default;
+            _pendingTailPipelineTask = default;
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
                 _pendingTail = default!;
             var ownedRec = ClearExecutingItem(recoveryActivated);
@@ -240,7 +240,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         if (result.PipelineTask.IsCompleted)
         {
             _hasPendingTail = false;
-            _pendingTailTask = default;
+            _pendingTailPipelineTask = default;
             if (ClearExecutingItem(recoveryActivated))
             {
                 Exception? pipelineException = null;
@@ -267,9 +267,9 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // Guarded for the same reason as RecoverItem's tail transition: the substitute's own
         // late fault completes it directly, never re-enters recovery.
         _pendingTail = recoveryItem;
-        _pendingTailTask = GuardRecoveryTask(result.PipelineTask);
-        _pendingTailActivated = recoveryActivated;
-        _pendingTailGeneration = recoveryGeneration;
+        _pendingTailPipelineTask = GuardRecoveryTask(result.PipelineTask);
+        _pendingTailOwnsActivation = recoveryActivated;
+        _pendingTailActivationGeneration = recoveryGeneration;
     }
 
     /// Commits the pending tail (if any) to the in-flight store. Called by the executor at the
@@ -284,16 +284,16 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             return null;
 
         var item = _pendingTail;
-        var task = _pendingTailTask;
+        var task = _pendingTailPipelineTask;
         _hasPendingTail = false;
-        _pendingTailTask = default;
+        _pendingTailPipelineTask = default;
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _pendingTail = default!;
 
-        var tailActivated = _pendingTailActivated;
-        _pendingTailActivated = false;
-        var tailGeneration = _pendingTailGeneration;
-        _pendingTailGeneration = 0;
+        var tailActivated = _pendingTailOwnsActivation;
+        _pendingTailOwnsActivation = false;
+        var tailGeneration = _pendingTailActivationGeneration;
+        _pendingTailActivationGeneration = 0;
         // Reclaim an executor-owned activation or an ungranted handoff. If the edge pass won, route
         // through the store so advance-license ordering places activation before retirement.
         var ownsTurn = tailActivated || _activationGate.TryTakeHandoff();
@@ -457,7 +457,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             // point would leak: OnInFlightTaskCompleted bails on wake completion, and DrainOnCompletionAsync
             // has likely already passed. Complete directly so depth tracking and CompleteItem still fire.
             var ownedShut = ClearExecutingItem(recoveryActivated);
-            RetireItem(recoveryItem, _completionException,
+            RetireItem(recoveryItem, _shutdownItemException,
                 ownedTurn: GetActivationOwner(recoveryActivated, ownedShut, recoveryGeneration));
         }
         else
@@ -516,7 +516,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// empty observer from resuming while retirement is still in progress.
     bool RetireItemDeferred(T item, Exception? exception, long ownedTurn)
     {
-        var depth = _depthState.DecrementDepth();
+        var depth = _depthState.RecordRetirement();
         // Keep the zero comparison exact: <= would hide a double retirement and corrupt empty signaling.
         Debug.Assert(depth >= 0, "Pipeline depth under-ran: double completion for a single enqueue.");
         // In-order retirement makes depth zero the only safe clear: no activated owner remains. A
@@ -527,7 +527,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             edgeLock.Enter();
             try
             {
-                // DecrementDepth's zero verdict may be stale by this deferred consumer. Serialize
+                // RecordRetirement's zero verdict may be stale by this deferred consumer. Serialize
                 // the recheck with every zero-edge identity publication before clearing the slot.
                 if (_depthState.Depth is 0)
                 {
@@ -541,7 +541,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
         // Owner-checked release cannot clear a successor's turn.
         if (ownedTurn != 0)
-            _activationGate.Release(ownedTurn);
+            _activationGate.TryReleaseTurn(ownedTurn);
         _policy.CompleteItem(item, exception);
         if (depth is 0)
             _policy.OnIdle();
@@ -571,7 +571,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                 ActivateHeadItemAtZeroEdge(item, preferAsync: false);
             }
             // Sole head: no claim can run before our publish, so the ordinal read is stable.
-            var sequence = _itemTenure.HeadSequence;
+            var sequence = _itemTenure.NextSequence;
             if (ownsTurn && _inFlight.TryAcquireAdvanceIfFree())
             {
                 // Hold advance ownership through turn assignment, publication, and callback attachment.
@@ -603,7 +603,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         }
 
         // Mid-chain publication uses acquire-or-deposit. A live advancer consumes the deposit on
-        // release; otherwise this caller wins the license and drives. The count-word CAS also
+        // release; otherwise this caller wins the license and drives. The packed-state CAS also
         // supplies the StoreLoad edge between publication and the license decision.
         _inFlight.PublishCommitted(item, pipelineTask, out _);
         if (_inFlight.TryAcquireAdvanceOrRequest())
@@ -651,7 +651,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // behind the failed head would create a liveness cycle.
         _activationGate.AssignTurnForRecovery(claimedSequence);
         ActivateHeadItem(recoveryItem, preferAsync: true);
-        _inFlightRecoverySequence = claimedSequence;
+        _inFlightRecoveryTurnOwner = claimedSequence;
 
         ValueTask<PipelineItemResult> executeTask;
         try
@@ -829,7 +829,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         var recoveryItem = _inFlightRecoveryItem;
         var emptyReached = RetireItemDeferred(
-            recoveryItem, _completionException, ownedTurn: _inFlightRecoverySequence);
+            recoveryItem, _shutdownItemException, ownedTurn: _inFlightRecoveryTurnOwner);
         // Shutdown still has to leave through the episode's advance license. This settles the retained
         // count credit and continues retiring successors already resident behind the recovery.
         ResumeAdvanceAfterRecovery(emptyReached);
@@ -842,27 +842,27 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         // The full-fence probe is the producer half of DrainOnCompletionAsync's two-location
         // handshake: either drain observes the completed tenure after publishing its waiter, or
         // the completing producer observes the waiter after publishing the tenure's end.
-        => Interlocked.CompareExchange(ref _advanceDrainWaiter, null, null)?.TrySetResult();
+        => Interlocked.CompareExchange(ref _advancementDrainWaiter, null, null)?.TrySetResult();
 
     /// Completes the recovery item on the normal (non-shutdown) recovery path. The continuation
     /// owns completion uncontested. Drain (DrainOnCompletionAsync) only waits for the advancer
     /// advance to drain via ResumeAdvanceAfterRecovery's exit signal.
     void CompleteRecoveryItem(T recoveryItem, Exception? exception)
     {
-        RetireItem(recoveryItem, exception, ownedTurn: _inFlightRecoverySequence);
+        RetireItem(recoveryItem, exception, ownedTurn: _inFlightRecoveryTurnOwner);
     }
 
     /// Completes recovery while deferring the empty signal until the advance exits.
     bool CompleteRecoveryItemDeferred(T recoveryItem, Exception? exception)
     {
-        return RetireItemDeferred(recoveryItem, exception, ownedTurn: _inFlightRecoverySequence);
+        return RetireItemDeferred(recoveryItem, exception, ownedTurn: _inFlightRecoveryTurnOwner);
     }
 
-    void EndRecoveryTenure(long recoverySequence)
+    void EndRecoveryTenure(long recoveryTurnOwner)
     {
         // Advancing can install the next recovery before an older resume frame returns. Only the
         // generation being completed may clear the shared recovery tenure.
-        if (_inFlightRecoverySequence != recoverySequence)
+        if (_inFlightRecoveryTurnOwner != recoveryTurnOwner)
             return;
         if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
             _inFlightRecoveryItem = default!;

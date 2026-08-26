@@ -10,15 +10,15 @@ struct DepthState
 {
     // Explicit layout preserves isolation inside this ref-bearing auto-layout struct.
     [StructLayout(LayoutKind.Explicit, Size = 256)]
-    struct PaddedProducerCounter
+    struct PaddedDispatchCounter
     {
-        [FieldOffset(128)] public uint Value;
-        // This producer-owned snapshot deliberately shares the dispatch line.
+        [FieldOffset(128)] public uint Dispatched;
+        // This executor-owned snapshot deliberately shares the dispatch line.
         [FieldOffset(132)] public uint RetiredCache;
     }
 
-    PaddedProducerCounter _dispatched;
-    uint _retired;
+    PaddedDispatchCounter _dispatchCounter;
+    uint _retiredCount;
     // Non-null both stores the waiter and publishes that empty observation is armed.
     TaskCompletionSource? _emptyWaiter;
 
@@ -29,41 +29,41 @@ struct DepthState
         get
         {
             // Retirement cannot precede dispatch, so this order cannot produce a negative result.
-            var comp = Volatile.Read(ref _retired);
-            var enq = Volatile.Read(ref _dispatched.Value);
-            return (int)(enq - comp);
+            var retired = Volatile.Read(ref _retiredCount);
+            var dispatched = Volatile.Read(ref _dispatchCounter.Dispatched);
+            return (int)(dispatched - retired);
         }
     }
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public void IncrementDepth()
+    public void RecordDispatch()
     {
         // Dispatch is executor-owned; only its publication requires a release store.
-        var next = _dispatched.Value + 1;
+        var next = _dispatchCounter.Dispatched + 1;
         // Read the cross-core completion counter only near the overflow limit.
-        if (next - _dispatched.RetiredCache > (uint)int.MaxValue)
+        if (next - _dispatchCounter.RetiredCache > (uint)int.MaxValue)
             RefreshCacheOrThrow(next);
-        Volatile.Write(ref _dispatched.Value, next);
+        Volatile.Write(ref _dispatchCounter.Dispatched, next);
     }
 
     [MethodImpl(MethodImplOptions.NoInlining)]
     void RefreshCacheOrThrow(uint next)
     {
-        var comp = Volatile.Read(ref _retired);
-        if (next - comp > (uint)int.MaxValue)
+        var retired = Volatile.Read(ref _retiredCount);
+        if (next - retired > (uint)int.MaxValue)
             throw new InvalidOperationException("Pipeline depth overflow.");
-        _dispatched.RetiredCache = comp;
+        _dispatchCounter.RetiredCache = retired;
     }
 
     /// <summary>Records retirement and returns the resulting depth. A zero result must be passed to
     /// <see cref="OnDepthReachedZero"/> after retirement finishes.</summary>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
-    public int DecrementDepth()
+    public int RecordRetirement()
     {
         // Retirements may overlap, so only the increment winner observes each count.
-        var comp = Interlocked.Increment(ref _retired);
-        var enq = Volatile.Read(ref _dispatched.Value);
-        return (int)(enq - comp);
+        var retired = Interlocked.Increment(ref _retiredCount);
+        var dispatched = Volatile.Read(ref _dispatchCounter.Dispatched);
+        return (int)(dispatched - retired);
     }
 
     /// <summary>
@@ -140,7 +140,7 @@ struct DepthState
         // A waiter left by the prior tenure is condemned with that tenure. Completing it here would
         // let an obsolete continuation run after the shell has been rebound to unrelated work.
         _emptyWaiter = null;
-        _dispatched = default;
-        _retired = 0;
+        _dispatchCounter = default;
+        _retiredCount = 0;
     }
 }

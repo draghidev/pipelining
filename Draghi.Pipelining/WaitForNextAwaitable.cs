@@ -30,7 +30,7 @@ public readonly struct WaitForNextAwaitable
     }
 
     readonly SourceWakeEvent? _signal;
-    readonly ValueTask<bool> _wait;
+    readonly ValueTask<bool> _task;
     readonly bool _retry;
     readonly Kind _kind;
 
@@ -48,7 +48,7 @@ public readonly struct WaitForNextAwaitable
 
     WaitForNextAwaitable(ValueTask<bool> task)
     {
-        _wait = task;
+        _task = task;
         _kind = Kind.Task;
     }
 
@@ -72,7 +72,7 @@ public readonly struct WaitForNextAwaitable
         {
             _wait = wait;
             if (wait._kind == Kind.Task)
-                _taskAwaiter = wait._wait.ConfigureAwait(false).GetAwaiter();
+                _taskAwaiter = wait._task.ConfigureAwait(false).GetAwaiter();
         }
 
         public bool IsCompleted => _wait._kind switch

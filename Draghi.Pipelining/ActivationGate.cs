@@ -10,20 +10,22 @@ struct ActivationGate<T>()
     const long NoHandoff = 0;
     const long Handoff = 1;
 
-    long _turn;
+    // Zero is unowned, a negative generation is provisional, and a positive head sequence is committed.
+    long _turnOwner;
     long _generation;
     long _resolvedHandoffGeneration;
-    long _handoffWord;
+    // Packed handoff generation and Handoff/NoHandoff state.
+    long _handoffState;
     T _handoffItem = default!;
 
-    static long StateOf(long word) => word & HandoffStateMask;
-    static long GenerationOf(long word) => word >> 1;
+    static long StateOf(long state) => state & HandoffStateMask;
+    static long GenerationOf(long state) => state >> 1;
 
     public EdgeLock EdgeLock { get; } = new();
 
-    public long Turn => Volatile.Read(ref _turn);
-    public bool HasTurn => Volatile.Read(ref _turn) != 0;
-    public bool HasHandoff => StateOf(Volatile.Read(ref _handoffWord)) == Handoff;
+    public long TurnOwner => Volatile.Read(ref _turnOwner);
+    public bool IsTurnOwned => Volatile.Read(ref _turnOwner) != 0;
+    public bool HasHandoff => StateOf(Volatile.Read(ref _handoffState)) == Handoff;
 
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public long NextGeneration() => Interlocked.Increment(ref _generation);
@@ -31,60 +33,60 @@ struct ActivationGate<T>()
     public bool TryClaimProvisionalTurn(long generation)
     {
         Debug.Assert(generation >= 1);
-        return Interlocked.CompareExchange(ref _turn, -generation, 0) == 0;
+        return Interlocked.CompareExchange(ref _turnOwner, -generation, 0) == 0;
     }
 
     public long ClaimOrInheritProvisionalTurn(long generation)
     {
         Debug.Assert(generation >= 1);
-        var turn = Volatile.Read(ref _turn);
-        if (turn == -generation)
+        var turnOwner = Volatile.Read(ref _turnOwner);
+        if (turnOwner == -generation)
             return generation;
-        return Interlocked.CompareExchange(ref _turn, -generation, 0) == 0 ? generation : 0;
+        return Interlocked.CompareExchange(ref _turnOwner, -generation, 0) == 0 ? generation : 0;
     }
 
     public bool CommitTurn(long generation, long sequence)
     {
-        var turn = Volatile.Read(ref _turn);
-        if (generation != 0 && turn == -generation)
+        var turnOwner = Volatile.Read(ref _turnOwner);
+        if (generation != 0 && turnOwner == -generation)
         {
-            Volatile.Write(ref _turn, sequence);
+            Volatile.Write(ref _turnOwner, sequence);
             return true;
         }
-        Debug.Assert(turn == 0,
-            $"Edge commit over a foreign activation turn: turn={turn}, generation={generation}, sequence={sequence}.");
-        Volatile.Write(ref _turn, sequence);
+        Debug.Assert(turnOwner == 0,
+            $"Edge commit over a foreign activation turn: owner={turnOwner}, generation={generation}, sequence={sequence}.");
+        Volatile.Write(ref _turnOwner, sequence);
         return false;
     }
 
     public void AssignTurnAtStop(long sequence)
     {
-        Debug.Assert(Volatile.Read(ref _turn) == 0, "Stop assigned over a live activation turn.");
-        Volatile.Write(ref _turn, sequence);
+        Debug.Assert(Volatile.Read(ref _turnOwner) == 0, "Stop assigned over a live activation turn.");
+        Volatile.Write(ref _turnOwner, sequence);
     }
 
     public void AssignTurnForRecovery(long sequence)
     {
-        var turn = Volatile.Read(ref _turn);
-        Debug.Assert(turn == 0 || turn == sequence, "Recovery assigned over a foreign activation turn.");
-        Volatile.Write(ref _turn, sequence);
+        var turnOwner = Volatile.Read(ref _turnOwner);
+        Debug.Assert(turnOwner == 0 || turnOwner == sequence, "Recovery assigned over a foreign activation turn.");
+        Volatile.Write(ref _turnOwner, sequence);
     }
 
-    public bool Release(long owner)
+    public bool TryReleaseTurn(long owner)
     {
         Debug.Assert(owner != 0);
-        return Interlocked.CompareExchange(ref _turn, 0, owner) == owner;
+        return Interlocked.CompareExchange(ref _turnOwner, 0, owner) == owner;
     }
 
     /// Publishes an executor-owned handoff. The item is written before its versioned publication,
     /// binding an empty-edge observer to that placement.
     public long PublishHandoff(T item)
     {
-        Debug.Assert(StateOf(Volatile.Read(ref _handoffWord)) == NoHandoff,
+        Debug.Assert(StateOf(Volatile.Read(ref _handoffState)) == NoHandoff,
             "Activation handoff published over an unresolved handoff.");
         _handoffItem = item;
         var generation = Interlocked.Increment(ref _generation);
-        Volatile.Write(ref _handoffWord, (generation << 1) | Handoff);
+        Volatile.Write(ref _handoffState, (generation << 1) | Handoff);
         return generation;
     }
 
@@ -98,11 +100,11 @@ struct ActivationGate<T>()
     {
         while (true)
         {
-            var word = Volatile.Read(ref _handoffWord);
-            if (StateOf(word) != Handoff)
+            var state = Volatile.Read(ref _handoffState);
+            if (StateOf(state) != Handoff)
                 return false;
-            if (Interlocked.CompareExchange(ref _handoffWord,
-                    GenerationOf(word) << 1 | NoHandoff, word) == word)
+            if (Interlocked.CompareExchange(ref _handoffState,
+                    GenerationOf(state) << 1 | NoHandoff, state) == state)
                 return true;
         }
     }
@@ -116,31 +118,31 @@ struct ActivationGate<T>()
             return false;
         if (TryTakeHandoff(generation))
             return true;
-        Release(-generation);
+        TryReleaseTurn(-generation);
         return false;
     }
 
     public bool TryPeekHandoff(out long generation, out T item)
     {
-        var word = Volatile.Read(ref _handoffWord);
-        if (StateOf(word) != Handoff)
+        var state = Volatile.Read(ref _handoffState);
+        if (StateOf(state) != Handoff)
         {
             generation = 0;
             item = default!;
             return false;
         }
-        generation = GenerationOf(word);
+        generation = GenerationOf(state);
         item = _handoffItem;
         return true;
     }
 
     public bool TryTakeHandoff(long generation)
     {
-        var word = Volatile.Read(ref _handoffWord);
-        if (StateOf(word) != Handoff || GenerationOf(word) != generation)
+        var state = Volatile.Read(ref _handoffState);
+        if (StateOf(state) != Handoff || GenerationOf(state) != generation)
             return false;
-        return Interlocked.CompareExchange(ref _handoffWord,
-            generation << 1 | NoHandoff, word) == word;
+        return Interlocked.CompareExchange(ref _handoffState,
+            generation << 1 | NoHandoff, state) == state;
     }
 
     public void MarkHandoffResolved(long generation)
@@ -151,24 +153,24 @@ struct ActivationGate<T>()
 
     public void EnsureIdle()
     {
-        var turn = Volatile.Read(ref _turn);
-        var handoffWord = Volatile.Read(ref _handoffWord);
-        if (turn != 0 || StateOf(handoffWord) != NoHandoff)
+        var turnOwner = Volatile.Read(ref _turnOwner);
+        var handoffState = Volatile.Read(ref _handoffState);
+        if (turnOwner != 0 || StateOf(handoffState) != NoHandoff)
         {
             throw new UnreachableException(
                 $"Activation gate remained live at structural quiescence " +
-                $"(turn={turn}, handoff={StateOf(handoffWord) == Handoff}, " +
-                $"generation={GenerationOf(handoffWord)}).");
+                $"(turnOwner={turnOwner}, handoff={StateOf(handoffState) == Handoff}, " +
+                $"generation={GenerationOf(handoffState)}).");
         }
         EdgeLock.EnsureIdle();
     }
 
     public void Reset()
     {
-        _turn = 0;
+        _turnOwner = 0;
         var generation = Volatile.Read(ref _generation);
         _resolvedHandoffGeneration = generation;
-        _handoffWord = generation << 1 | NoHandoff;
+        _handoffState = generation << 1 | NoHandoff;
         _handoffItem = default!;
         EdgeLock.Reset();
     }

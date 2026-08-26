@@ -17,7 +17,7 @@ public sealed class SourceWakeEvent(bool runContinuationsAsynchronously, Pipelin
     : IThreadPoolWorkItem
 {
     readonly CancellationTokenSource _cts = new();
-    bool _pending;
+    bool _waitPending;
     int _waitLock;
     Action? _afterWaitLock;
     // The async method normally supplies the same cached delegate on every wait.
@@ -71,7 +71,7 @@ public sealed class SourceWakeEvent(bool runContinuationsAsynchronously, Pipelin
     /// </summary>
     WaitForNextAwaitable Arm()
     {
-        _pending = true;
+        _waitPending = true;
         return new WaitForNextAwaitable(this);
     }
 
@@ -145,9 +145,9 @@ public sealed class SourceWakeEvent(bool runContinuationsAsynchronously, Pipelin
     /// </summary>
     bool TryClaimLocked()
     {
-        if (!_pending)
+        if (!_waitPending)
             return false;
-        _pending = false;
+        _waitPending = false;
         return true;
     }
 

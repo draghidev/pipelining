@@ -17,8 +17,8 @@ public class ActivationGateTests
         Assert.AreEqual(7, item);
         Assert.IsTrue(gate.TryClaimProvisionalTurn(generation));
         Assert.IsTrue(gate.TryTakeHandoff(generation));
-        Assert.IsTrue(gate.Release(-generation));
-        Assert.IsFalse(gate.HasTurn);
+        Assert.IsTrue(gate.TryReleaseTurn(-generation));
+        Assert.IsFalse(gate.IsTurnOwned);
         Assert.IsFalse(gate.HasHandoff);
     }
 
@@ -70,12 +70,12 @@ public class ActivationGateTests
         await Task.Delay(25);
         Assert.IsFalse(commit.IsCompleted, "The commit must not overwrite the pass's live old-generation claim.");
 
-        Assert.IsTrue(gate.Release(-oldGeneration));
+        Assert.IsTrue(gate.TryReleaseTurn(-oldGeneration));
         edgeLock.Exit();
 
         Assert.IsFalse(await commit, "The current generation was executor-owned, so commit assigns a fresh resident turn.");
-        Assert.AreEqual(1, gate.Turn);
-        Assert.IsTrue(gate.Release(1));
+        Assert.AreEqual(1, gate.TurnOwner);
+        Assert.IsTrue(gate.TryReleaseTurn(1));
     }
 
     [TestMethod]
@@ -90,14 +90,14 @@ public class ActivationGateTests
         Assert.IsTrue(gate.TryTakeHandoff(recoveryGeneration));
 
         Assert.AreEqual(0, store.IncrementCommitCount());
-        Assert.IsTrue(gate.CommitTurn(recoveryGeneration, tenure.HeadSequence),
+        Assert.IsTrue(gate.CommitTurn(recoveryGeneration, tenure.NextSequence),
             "The recovery commit must carry its generation so the provisional turn becomes resident ownership.");
         store.PublishCommitted(7, default, out _);
 
         Assert.IsTrue(store.TryClaimCompletedHead(ref tenure, out var item, out _, out var claimedSequence, out _));
         Assert.AreEqual(7, item);
         Assert.AreEqual(1, claimedSequence);
-        Assert.IsTrue(gate.Release(claimedSequence));
+        Assert.IsTrue(gate.TryReleaseTurn(claimedSequence));
         Assert.IsTrue(store.DecrementCount());
     }
 
@@ -112,7 +112,7 @@ public class ActivationGateTests
         gate.Reset();
 
         gate.EnsureIdle();
-        Assert.IsFalse(gate.HasTurn);
+        Assert.IsFalse(gate.IsTurnOwned);
         Assert.IsFalse(gate.HasHandoff);
         Assert.IsGreaterThan(generation, gate.PublishHandoff(2));
     }

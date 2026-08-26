@@ -322,7 +322,7 @@ public class PipelineLifecycleTests
         Assert.IsTrue(item.IsCompleted);
         // First-writer-wins is about the completion latch, not exception propagation: the
         // pipeline drains gracefully only, and the item settles via the shutdown token
-        // (item-side escalation). The retired forceful sweep propagated _completionException.
+        // (item-side escalation). The retired forceful sweep propagated _shutdownItemException.
         Assert.IsInstanceOfType<OperationCanceledException>(item.Exception);
     }
 
@@ -366,7 +366,7 @@ public class PipelineLifecycleTests
 
         Assert.IsTrue(item.IsCompleted, "Pending tail waiter should be completed by drain.");
         // Graceful-only drain: the committed tail settles via the shutdown token (item-side
-        // escalation), not via _completionException (retired forceful-sweep contract).
+        // escalation), not via _shutdownItemException (retired forceful-sweep contract).
         Assert.IsInstanceOfType<OperationCanceledException>(item.Exception);
     }
 

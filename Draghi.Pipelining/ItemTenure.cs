@@ -9,11 +9,11 @@ struct ItemTenure
 {
     // Zero means that no head carries an undelivered callback. Head identities start at one.
     long _armedCallbackSequence;
-    long _headSequence;
+    long _lastClaimedSequence;
     int _activeCompletionCallbacks;
 
-    public long LastClaimedSequence => Volatile.Read(ref _headSequence);
-    public long HeadSequence => Volatile.Read(ref _headSequence) + 1;
+    public long LastClaimedSequence => Volatile.Read(ref _lastClaimedSequence);
+    public long NextSequence => Volatile.Read(ref _lastClaimedSequence) + 1;
 
     /// Must precede callback registration. An already-completed task may deliver inline from
     /// UnsafeOnCompleted, so delivery must be able to clear the arm during registration.
@@ -44,14 +44,14 @@ struct ItemTenure
     /// harmless declined claim; the callback's subsequent license acquisition re-drives it.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public bool IsCompletionCallbackPendingForHead()
-        => Volatile.Read(ref _armedCallbackSequence) == Volatile.Read(ref _headSequence) + 1;
+        => Volatile.Read(ref _armedCallbackSequence) == Volatile.Read(ref _lastClaimedSequence) + 1;
 
     /// Advances the tenure identity in the same exclusive operation that removes the FIFO head.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public long ClaimHead()
     {
-        var sequence = _headSequence + 1;
-        Volatile.Write(ref _headSequence, sequence);
+        var sequence = _lastClaimedSequence + 1;
+        Volatile.Write(ref _lastClaimedSequence, sequence);
         return sequence;
     }
 

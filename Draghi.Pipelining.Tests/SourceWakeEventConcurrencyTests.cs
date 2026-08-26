@@ -16,7 +16,7 @@ public class SourceWakeEventConcurrencyTests
     /// Races Complete() against an in-flight consumer that's mid-arm: AcquireLock, peek (empty),
     /// Arm, await. The hypothesis under test is the corruption shape where
     /// cancellation lands while the consumer's state
-    /// machine is between Arm and OnCompleted, leaving _pending = TRUE with _waitContinuation
+    /// machine is between Arm and OnCompleted, leaving _waitPending = TRUE with _waitContinuation
     /// null. A subsequent SignalCore claim dispatches a null continuation (NRE).
     ///
     /// Iterations via DRAGHI_STRESS_ITERATIONS (default 200). On a hit, the test fails with the
@@ -55,7 +55,7 @@ public class SourceWakeEventConcurrencyTests
 
             // Two competing wakers: a producer that sets the slot + signals, and a canceller that
             // calls Complete(). Both eventually unblock the consumer. The race window is
-            // arm-then-await: if Complete claims _pending while the consumer hasn't registered yet,
+            // arm-then-await: if Complete claims _waitPending while the consumer hasn't registered yet,
             // the dispatch path NREs.
             var spinTarget = (iter * 13) % 128;
             var producerTask = Task.Run(() =>

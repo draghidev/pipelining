@@ -84,7 +84,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     void ActivateHeadItem(T item, bool preferAsync = true)
     {
-        // Publish identity before activation. Turn ownership was established by the caller.
+        // Publish identity before activation. Activation-turn ownership was established by the caller.
         SetActivatedItem(item);
         _policy.ActivateHeadItem(item, preferAsync);
     }
@@ -115,9 +115,9 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     {
         // Executor-owned; release the enumeration-visible flag.
         Volatile.Write(ref _executingItemVisible, false);
-        var owned = wasActivated || _activationGate.TryTakeHandoff();
+        var completionOwned = wasActivated || _activationGate.TryTakeHandoff();
         // A winning empty-edge pass captured the item before consuming the handoff.
         SetExecutingItem(default!);
-        return owned;
+        return completionOwned;
     }
 }

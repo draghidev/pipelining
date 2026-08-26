@@ -144,7 +144,7 @@ public class PipelineConcurrencyTests
     //
     // ASSERTS THE INVARIANT (the fix's acceptance): while a claimed-completed head's dispatch is
     // in flight, the done-arm must not retire it nor activate the successor (deposit instead -
-    // the fire is guaranteed to arrive and serve it); the released completer must dispatch
+    // the fire is guaranteed to arrive and redrive it); the released completer must dispatch
     // cleanly, and only then does the walk retire A and activate B.
     [TestMethod]
     public async Task Advance_SuccessorActivationWaitsForPredecessorCompletionDispatch()
@@ -268,7 +268,7 @@ public class PipelineConcurrencyTests
     /// driven to completion inline before the executor advances. A sync item with a pending async
     /// predecessor buffered in the store is head-gated through the ROB instead: its retirement
     /// defers until the predecessor completes, keeping retirement strictly FIFO (an inline complete
-    /// there would jump the ROB and clear the head word out from under the live reader - the baton
+    /// there would jump the ROB and clear the head state out from under the live reader - the baton
     /// wedge). Async items (CompleteAsync=true) commit via CommitPendingTail and drain in FIFO.
     /// Verifies both behaviors and that every item completes.
     [TestMethod]
@@ -880,8 +880,8 @@ public class PipelineConcurrencyTests
 
         void Journal(string what, TestPipelineItem item, TestPipelineItem? prev)
         {
-            var seq = Interlocked.Increment(ref _journalTicket);
-            _journal[seq & (JournalSize - 1)] = (what, item.Name, prev?.Name, Environment.CurrentManagedThreadId);
+            var sequence = Interlocked.Increment(ref _journalTicket);
+            _journal[sequence & (JournalSize - 1)] = (what, item.Name, prev?.Name, Environment.CurrentManagedThreadId);
         }
 
         public string DumpJournal()
@@ -889,10 +889,10 @@ public class PipelineConcurrencyTests
             var ticket = Volatile.Read(ref _journalTicket);
             var entries = new List<string>();
             var start = Math.Max(0, ticket - (JournalSize - 1));
-            for (var seq = start; seq <= ticket; seq++)
+            for (var sequence = start; sequence <= ticket; sequence++)
             {
-                var e = _journal[seq & (JournalSize - 1)];
-                entries.Add($"#{seq} t{e.Thread} {e.What} '{e.Item}'{(e.Prev is null ? "" : $" prev='{e.Prev}'")}");
+                var e = _journal[sequence & (JournalSize - 1)];
+                entries.Add($"#{sequence} t{e.Thread} {e.What} '{e.Item}'{(e.Prev is null ? "" : $" prev='{e.Prev}'")}");
             }
             return string.Join("\n", entries);
         }
@@ -1472,7 +1472,7 @@ public class PipelineConcurrencyTests
     /// RunEnqueueAsynchronously=false + reentrant enqueue from CompleteItem: the policy's
     /// CompleteItem callback re-enqueues a second item. The second Enqueue's Signal calls
     /// _continuation inline, but the executor's MoveNext is already running (we're inside
-    /// CompleteItem), so Signal early-exits on _pending=false. The new item is queued and
+    /// CompleteItem), so Signal early-exits on _waitPending=false. The new item is queued and
     /// picked up by the current MoveNext's inner loop iteration. No recursion, no hang.
     [TestMethod]
     public async Task SyncEnqueue_ReentrantEnqueueFromCompleteItem_NoRecursion()
@@ -2263,11 +2263,11 @@ public class PipelineConcurrencyTests
 
     /// Stress test targeting the cancel-during-arm window in TestObservableQueueSource's
     /// WaitForNextAsync. The executor parks at
-    /// `await wakeSignal.Arm()` after _pending=TRUE has been set under the wake lock; if the
+    /// `await wakeSignal.Arm()` after _waitPending=TRUE has been set under the wake lock; if the
     /// source CancellationToken fires while the state machine is in the microsecond window
     /// between Arm() and the await machinery's OnCompleted call, the state machine can
-    /// unwind without invoking WaitOnCompleted - _pending leaks at TRUE with
-    /// _waitContinuation NULL. A subsequent Signal claims _pending and dispatches a null
+    /// unwind without invoking WaitOnCompleted - _waitPending leaks at TRUE with
+    /// _waitContinuation NULL. A subsequent Signal claims _waitPending and dispatches a null
     /// delegate (NRE), or the wake silently routes nowhere (lost wake / hang).
     ///
     /// The race is exclusively probabilistic: any deterministic sync (waiting for idle TCS,
@@ -2315,7 +2315,7 @@ public class PipelineConcurrencyTests
             catch (TimeoutException)
             {
                 Assert.Fail($"iter {iter}: enqueue/cancel race did not settle in 5s - " +
-                    "SourceWakeEvent likely wedged with stale _pending");
+                    "SourceWakeEvent likely wedged with stale _waitPending");
             }
 
             string? hangDiagnosis = null;
@@ -2330,7 +2330,7 @@ public class PipelineConcurrencyTests
             catch (TimeoutException)
             {
                 hangDiagnosis = $"iter {iter}: CompleteAsync hung after cancel. " +
-                    "Lost wake or corrupted _pending in SourceWakeEvent.";
+                    "Lost wake or corrupted _waitPending in SourceWakeEvent.";
             }
             catch (NullReferenceException ex)
             {

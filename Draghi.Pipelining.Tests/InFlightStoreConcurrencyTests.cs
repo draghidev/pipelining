@@ -4,8 +4,8 @@ namespace Draghi.Pipelining.Tests;
 
 /// Targeted regression guard for the slot field/flag tear. The tear was a claim
 /// winning between a commit's flag publish and its field writes, reading a stale/default or torn
-/// pair. The tri-state word fixed it (data-then-license commit, peek-gated claim). These races
-/// hammer exactly that window at the InFlightStore boundary, a far tighter loop than the full
+/// pair. The tri-state ownership state fixed it (data-then-license commit, peek-gated claim).
+/// These races hammer exactly that window at the InFlightStore boundary, a far tighter loop than the full
 /// pipeline stress, so a reintroduced tear surfaces fast as a default(0) or a lost/duplicated
 /// marker. DRAGHI_STRESS_ITERATIONS overrides the iteration count.
 [TestClass, DoNotParallelize]
