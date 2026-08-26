@@ -10,7 +10,6 @@ public class PipelineBehavioralTests
     {
         var scheduler = new RecordingScheduler();
         var pipeline = Pipeline.Create<TestPipelineItem, CustomSchedulerPolicy>(new(), scheduler: scheduler);
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Enqueue an item. The wake signal will dispatch through the custom scheduler
         // when running continuations asynchronously.
@@ -26,7 +25,6 @@ public class PipelineBehavioralTests
     {
         var preferAsyncValues = new List<bool>();
         var pipeline = Pipeline.Create<TestPipelineItem, PreferAsyncCapturingPolicy>(new(preferAsyncValues));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Both items async so both become waiters. First activates inline (preferAsync=false).
         // Second is published as deferred-activation _executingItem and only activated by
@@ -61,7 +59,6 @@ public class PipelineBehavioralTests
         var idleException = new InvalidOperationException("idle handler exploded");
         var pipeline = ObservablePipeline.Create<TestPipelineItem, ThrowingIdlePolicy>(
             new(), onIdle: _ => throw idleException);
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem();
         pipeline.Enqueue(item).Signal();
@@ -78,7 +75,6 @@ public class PipelineBehavioralTests
     {
         var tokenCapture = new TaskCompletionSource<CancellationToken>(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = Pipeline.Create<TestPipelineItem, TokenCapturingPolicy>(new(tokenCapture));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // ExecuteAsync = true holds the executor inside ExecuteItemAsync until we release it.
         var item = new TestPipelineItem { ExecuteAsync = true };
@@ -109,7 +105,6 @@ public class PipelineBehavioralTests
     {
         var captured = new List<PipelineItemFailureContext>();
         var pipeline = Pipeline.Create<TestPipelineItem, FailureCapturingPolicy>(new(captured));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Item that will succeed the pipeline task but fail the trailing task.
         var trailingException = new InvalidOperationException("trailing failed");
@@ -278,7 +273,6 @@ public class PipelineBehavioralTests
                 enqueued = true;
                 pipelineRef!.Enqueue(follower).Signal();
             }));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         pipelineRef = pipeline;
 
         var first = new TestPipelineItem();
@@ -313,7 +307,6 @@ public class PipelineBehavioralTests
                     pipelineRef!.Enqueue(refills[refillIdx++]).Signal();
                 return default;
             });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         pipelineRef = pipeline;
 
         var first = new TestPipelineItem();

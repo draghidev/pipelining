@@ -17,7 +17,6 @@ public class PipelineConcurrencyTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? Volatile.Read(ref recoveryHolder[0]) : null),
             onIdle: _ => { Volatile.Read(ref idleHolder[0])?.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var stop = false;
         Exception? hammerException = null;
@@ -93,7 +92,6 @@ public class PipelineConcurrencyTests
     public async Task ConcurrentEnqueuers()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var enqueueLock = new Lock();
         const int itemsPerThread = 100;
         const int threadCount = 4;
@@ -152,7 +150,6 @@ public class PipelineConcurrencyTests
     public async Task Advance_SuccessorActivationWaitsForPredecessorCompletionDispatch()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var sourceA = new TwoPhaseValueTaskSource();
         var itemA = new TestPipelineItem { Name = "A", PipelineTaskSource = sourceA };
@@ -213,7 +210,6 @@ public class PipelineConcurrencyTests
     public async Task EnqueueDuringExecution()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // First item has an async execute. While it's pending, enqueue more items.
         var first = new TestPipelineItem { ExecuteAsync = true };
@@ -245,7 +241,6 @@ public class PipelineConcurrencyTests
     public async Task CompleteAsyncDuringProcessing()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Enqueue items with pending pipeline tasks.
         var items = new TestPipelineItem[5];
@@ -280,7 +275,6 @@ public class PipelineConcurrencyTests
     public async Task MixedSyncAsyncPipelineTasks_AllItemsComplete()
     {
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Alternating mix: even = sync (CompleteAsync=false), odd = async (CompleteAsync=true).
         // Stream items in one at a time: each Execute() can wake the executor mid-stream, so a sync
@@ -345,7 +339,6 @@ public class PipelineConcurrencyTests
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // A: a prior async item. Activated inline (no waiters at dispatch), then parks as a waiter
         // on its pending pipeline task - free-floating, it does NOT hold the executor pump.
@@ -408,7 +401,6 @@ public class PipelineConcurrencyTests
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         var completionOrder = new List<int>();
         var orderLock = new object();
 
@@ -448,7 +440,6 @@ public class PipelineConcurrencyTests
     public async Task WaitForIdleWithConcurrentEnqueue()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // Enqueue an item.
         var first = new TestPipelineItem { CompleteAsync = true };
@@ -480,7 +471,6 @@ public class PipelineConcurrencyTests
     public async Task HighThroughputSequential()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int count = 1_000;
 
         for (var i = 0; i < count; i++)
@@ -498,7 +488,6 @@ public class PipelineConcurrencyTests
     public async Task HighThroughputPipelined()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int count = 1_000;
 
         var items = new TestPipelineItem[count];
@@ -527,7 +516,6 @@ public class PipelineConcurrencyTests
     public async Task NoItemActivatedMoreThanOnceUnderLoad()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int iterations = 500;
 
         var items = new TestPipelineItem[iterations];
@@ -600,7 +588,6 @@ public class PipelineConcurrencyTests
         {
             var guard = new SingleReaderGuard();
             var pipeline = Pipeline.Create<TestPipelineItem, SingleReaderGuardPolicy>(new(guard));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             const int count = 64;
 
             var items = new TestPipelineItem[count];
@@ -718,7 +705,6 @@ public class PipelineConcurrencyTests
         TestPipelineItem? recovery = null;
         var pipeline = Pipeline.Create<TestPipelineItem, SingleReaderGuardPolicy>(new(guard,
             ctx => ctx.Kind is PipelineItemFailureKind.TrailingExecutionTask ? recovery = new TestPipelineItem { Name = "R" } : null));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         guard.ObserveActivatedSlot(() => pipeline.Pipeline.ActivatedItem);
 
         var item = new TestPipelineItem
@@ -788,7 +774,6 @@ public class PipelineConcurrencyTests
                 substitutes.Add(r);
                 return r;
             }));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             guard.ObserveActivatedSlot(() => pipeline.Pipeline.ActivatedItem);
             const int count = 64;
 
@@ -1064,7 +1049,6 @@ public class PipelineConcurrencyTests
         var activationOrder = new System.Collections.Concurrent.ConcurrentQueue<int>();
         var pipeline = Pipeline.Create<TestPipelineItem, ActivationOrderRecordingPolicy>(
             new(activationOrder));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int iterations = 500;
 
         var items = new TestPipelineItem[iterations];
@@ -1135,7 +1119,6 @@ public class PipelineConcurrencyTests
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int count = 200;
 
         var items = new TestPipelineItem[count];
@@ -1179,7 +1162,6 @@ public class PipelineConcurrencyTests
     public async Task DeferredActivationUnderSustainedLoad()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int rounds = 50;
         const int itemsPerRound = 10;
         var allItems = new List<TestPipelineItem>();
@@ -1250,7 +1232,6 @@ public class PipelineConcurrencyTests
     public async Task InlineActivation_NeverPrefersAsync()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true), runContinuationsAsynchronously: false);
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         static void EnqueueUnderExecutorDrive(UnboundedPipeline<TestPipelineItem, TestPipelinePolicy> pipeline, TestPipelineItem item)
         {
@@ -1321,7 +1302,6 @@ public class PipelineConcurrencyTests
     public async Task DeferredActivation_CompleteWaitsForConcurrentActivate()
     {
         var pipeline = Pipeline.Create<ActivationOrderingItem, ActivationOrderingPolicy>(new());
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // A: async-pipeline waiter. Drives the advancer when its pipeline task completes.
         var a = new ActivationOrderingItem { PipelineTaskAsync = true };
@@ -1359,7 +1339,6 @@ public class PipelineConcurrencyTests
     public async Task DeferredActivation_ShutdownFailureWaitsForConcurrentActivate()
     {
         var pipeline = Pipeline.Create<ActivationOrderingItem, ActivationOrderingPolicy>(new());
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var resident = new ActivationOrderingItem { PipelineTaskAsync = true };
         pipeline.Enqueue(resident).Signal();
@@ -1393,7 +1372,6 @@ public class PipelineConcurrencyTests
     public async Task TailCommit_CompleteWaitsForConcurrentActivate()
     {
         var pipeline = Pipeline.Create<ActivationOrderingItem, ActivationOrderingPolicy>(new());
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // A: async-pipeline waiter. When A's pipeline completes, advancer drains and claims B.
         var a = new ActivationOrderingItem { PipelineTaskAsync = true };
@@ -1501,7 +1479,6 @@ public class PipelineConcurrencyTests
     {
         var box = new ReentrantBox();
         var pipeline = Pipeline.Create<TestPipelineItem, ReentrantPolicy>(new ReentrantPolicy(box));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var first = new TestPipelineItem();
         var second = new TestPipelineItem();
@@ -1547,7 +1524,6 @@ public class PipelineConcurrencyTests
                     ? new TestPipelineItem()
                     : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         const int iterations = 50;
         var faultingItems = new TestPipelineItem[iterations];
@@ -1654,7 +1630,6 @@ public class PipelineConcurrencyTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         // In-flight item with a pipeline task that will fault, triggering recovery.
         var faulting = new TestPipelineItem { CompleteAsync = true, PipelineTaskException = new InvalidOperationException("waiter fault") };
@@ -1702,7 +1677,6 @@ public class PipelineConcurrencyTests
             var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
                 new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
                 onIdle: _ => { idle.TrySetResult(); return default; });
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
             var failed = new TestPipelineItem
             {
@@ -1742,7 +1716,6 @@ public class PipelineConcurrencyTests
     public async Task MultipleConcurrentWaitForIdleCallers()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Signal();
@@ -1770,7 +1743,6 @@ public class PipelineConcurrencyTests
     public async Task WaitForEmptyAsync_AcrossRepeatedDrainCycles()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int cycles = 20;
 
         for (var c = 0; c < cycles; c++)
@@ -1802,7 +1774,6 @@ public class PipelineConcurrencyTests
     public async Task CompleteAsync_ConcurrentFromMultipleThreads_FirstWriterWins()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
         const int callers = 8;
 
         var item = new TestPipelineItem { CompleteAsync = true };
@@ -1836,7 +1807,6 @@ public class PipelineConcurrencyTests
     public async Task WaitForEmptyAsync_RacingCompleteAsync_AlwaysCompletes()
     {
         var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem { CompleteAsync = true };
         pipeline.Enqueue(item).Signal();
@@ -1864,7 +1834,6 @@ public class PipelineConcurrencyTests
         for (var iter = 0; iter < iterations; iter++)
         {
             var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             var item = new TestPipelineItem { CompleteAsync = true };
             pipeline.Enqueue(item).Signal();
             await item.WaitForExecutedAsync();
@@ -1916,7 +1885,6 @@ public class PipelineConcurrencyTests
         for (var iter = 0; iter < iterations; iter++)
         {
             var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             var item1 = new TestPipelineItem { CompleteAsync = true };
             var item2 = new TestPipelineItem { CompleteAsync = true };
             pipeline.Enqueue(item1).Signal();
@@ -1970,7 +1938,6 @@ public class PipelineConcurrencyTests
         for (var iter = 0; iter < iterations; iter++)
         {
             var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new(true));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             var pile = new TestPipelineItem[pileSize];
             for (var i = 0; i < pileSize; i++)
             {
@@ -2060,7 +2027,6 @@ public class PipelineConcurrencyTests
                 idleEntered.TrySetResult();
                 await idleCanReturn.Task.ConfigureAwait(false);
             });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         PushAndDrop(pipeline, ref itemRef);
 
@@ -2098,7 +2064,6 @@ public class PipelineConcurrencyTests
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         WeakReference? itemRef = null;
         Action? completer = null;
@@ -2158,7 +2123,6 @@ public class PipelineConcurrencyTests
         var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true), onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         WeakReference? waiterRef = null;
         WeakReference? deferredRef = null;
@@ -2217,7 +2181,6 @@ public class PipelineConcurrencyTests
         var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
             new(true, ctx => ctx.Kind is PipelineItemFailureKind.PipelineTask ? recovery : null),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -2272,7 +2235,6 @@ public class PipelineConcurrencyTests
                     return null;
                 }),
             onIdle: _ => { idleTcs.TrySetResult(); return default; });
-        using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
         var item = new TestPipelineItem
         {
@@ -2328,7 +2290,6 @@ public class PipelineConcurrencyTests
             using var cts = new CancellationTokenSource();
             var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
                 new(true), cancellationToken: cts.Token);
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
             // Two competing threads, no sync between them. The executor's first
             // WaitForNextAsync iteration is the prime target: it races the enqueue

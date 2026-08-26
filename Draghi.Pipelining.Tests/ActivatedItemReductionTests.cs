@@ -283,7 +283,6 @@ public class ActivatedItemReductionTests
             var probe = new ActivationProbe { Policy = nullPolicy };
             var holder = new PipelineHolder();
             var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp, holder));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             holder.Pipeline = pipeline;
             var all = new SyntheticItem[items];
             if (concurrentEnqueue)
@@ -338,7 +337,6 @@ public class ActivatedItemReductionTests
             var probe = new ActivationProbe { Policy = nullPolicy };
             var holder = new PipelineHolder();
             var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp: true, holder));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
             holder.Pipeline = pipeline;
             var expected = items * (1 + tenures);
             for (var i = 0; i < items; i++)
@@ -421,7 +419,6 @@ public class ActivatedItemReductionTests
         {
             var probe = new ActivationProbe { Policy = NullPolicy.NeverNull };
             var pipeline = Pipeline.Create<SyntheticItem, ProbePolicy>(new(probe, activateOnTp: true, holdRelease: true));
-            using var __pin = MstestWhenAllWorkaround.Pin(pipeline);
 
             var violations = 0;
             var stop = false;
