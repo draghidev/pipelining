@@ -1,4 +1,5 @@
 using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using Draghi.Pipelining.Internal;
@@ -114,9 +115,8 @@ struct InFlightStore<T>
             // A null reference claim would strand the advance license, so keep this guard in
             // release builds rather than turning it into a distant timeout.
             if (item is null && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                throw new InvalidOperationException(
-                    $"TryClaimCompletedHead(queue leg): claimed a null item. headSequence(post)={tenure.LastClaimedSequence}, " +
-                    $"taskCompleted={entry.PipelineTask.IsCompleted}.");
+                ThrowNullQueueClaim(tenure.LastClaimedSequence,
+                    entry.PipelineTask.IsCompleted);
             return true;
         }
         item = default!;
@@ -143,9 +143,8 @@ struct InFlightStore<T>
             pipelineTask = _slotPipelineTask;
             // Capture and validate before clearing so a corrupt claim fails at its source.
             if (item is null && RuntimeHelpers.IsReferenceOrContainsReferences<T>())
-                throw new InvalidOperationException(
-                    $"TryClaimCompletedSlot: won the Occupied->Consuming CAS but _slotItem was null. " +
-                    $"headSequence(pre)={tenure.LastClaimedSequence}, taskCompleted={_slotPipelineTask.IsCompleted}.");
+                ThrowNullSlotClaim(tenure.LastClaimedSequence,
+                    _slotPipelineTask.IsCompleted);
             // Advance tenure before Empty permits publication of a successor.
             sequence = tenure.ClaimHead();
             if (RuntimeHelpers.IsReferenceOrContainsReferences<T>())
@@ -156,6 +155,20 @@ struct InFlightStore<T>
         }
         return false;
     }
+
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void ThrowNullQueueClaim(long sequence, bool taskCompleted)
+        => throw new InvalidOperationException(
+            $"TryClaimCompletedHead(queue leg): claimed a null item. headSequence(post)={sequence}, " +
+            $"taskCompleted={taskCompleted}.");
+
+    [DoesNotReturn]
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    static void ThrowNullSlotClaim(long sequence, bool taskCompleted)
+        => throw new InvalidOperationException(
+            $"TryClaimCompletedSlot: won the Occupied->Consuming CAS but _slotItem was null. " +
+            $"headSequence(pre)={sequence}, taskCompleted={taskCompleted}.");
 
     /// Decrements the committed count after a claim and reports whether it reached zero.
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
