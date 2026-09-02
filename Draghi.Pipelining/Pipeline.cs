@@ -307,24 +307,29 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     continue;
                 }
 
+                var pipelineTask = itemResult.PipelineTask;
+                var pipelineTaskCompleted = pipelineTask.IsCompleted;
+                var pipelineTaskCompletedSuccessfully = pipelineTaskCompleted
+                    && pipelineTask.IsCompletedSuccessfully;
+
                 // Direct retirement is valid only when both tasks succeeded and no earlier resident exists.
                 if (_inFlight.Count is 0
-                    && itemResult.PipelineTask.IsCompletedSuccessfully && itemResult.TrailingExecutionTask.IsCompletedSuccessfully)
+                    && pipelineTaskCompletedSuccessfully && itemResult.TrailingExecutionTask.IsCompletedSuccessfully)
                 {
                     if (ClearExecutingItem(activated))
                     {
                         // Reclaim proves both the task token and activation turn are ours.
-                        itemResult.PipelineTask.GetAwaiter().GetResult();
+                        pipelineTask.GetAwaiter().GetResult();
                         RetireItem(item, null, ownedTurn: GetActivationOwner(activated, ownsTurn: true, executionGeneration));
                     }
                     else
                     {
                         // A lost reclaim routes through the store; the advance license orders activation
                         // before retirement.
-                        CommitInFlightItem(item, activateAtCommit: false, ownsTurn: false, turnGeneration: executionGeneration, itemResult.PipelineTask);
+                        CommitInFlightItem(item, activateAtCommit: false, ownsTurn: false, turnGeneration: executionGeneration, pipelineTask);
                     }
                 }
-                else if (itemResult.PipelineTask.IsCompleted && !itemResult.PipelineTask.IsCompletedSuccessfully)
+                else if (pipelineTaskCompleted && !pipelineTaskCompletedSuccessfully)
                 {
                     // Recovery receives unresolved trailing work so the substitute can sequence shared output.
                     var ownedFault = ClearExecutingItem(activated);
@@ -332,7 +337,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     var outstandingTrailing = itemResult.TrailingExecutionTask;
                     try
                     {
-                        itemResult.PipelineTask.GetAwaiter().GetResult();
+                        pipelineTask.GetAwaiter().GetResult();
                     }
                     catch (Exception ex)
                     {
@@ -346,7 +351,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                     // slot so a concurrent snapshot cannot yield the item twice.
                     Volatile.Write(ref _executingItemVisible, false);
                     _pendingTail = item;
-                    _pendingTailPipelineTask = itemResult.PipelineTask;
+                    _pendingTailPipelineTask = pipelineTask;
                     _pendingTailOwnsActivation = activated;
                     _pendingTailActivationGeneration = executionGeneration;
                     Volatile.Write(ref _hasPendingTail, true);
