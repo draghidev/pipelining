@@ -65,26 +65,30 @@ public readonly struct WaitForNextAwaitable
 
     public struct Awaiter : ICriticalNotifyCompletion
     {
-        readonly WaitForNextAwaitable _wait;
+        readonly SourceWakeEvent? _signal;
         ConfiguredValueTaskAwaitable<bool>.ConfiguredValueTaskAwaiter _taskAwaiter;
+        readonly bool _retry;
+        readonly Kind _kind;
 
         internal Awaiter(WaitForNextAwaitable wait)
         {
-            _wait = wait;
+            _signal = wait._signal;
+            _retry = wait._retry;
+            _kind = wait._kind;
             if (wait._kind == Kind.Task)
                 _taskAwaiter = wait._task.ConfigureAwait(false).GetAwaiter();
         }
 
-        public bool IsCompleted => _wait._kind switch
+        public bool IsCompleted => _kind switch
         {
             Kind.Immediate => true,
             Kind.Signal => false,
             _ => _taskAwaiter.IsCompleted,
         };
 
-        public bool GetResult() => _wait._kind switch
+        public bool GetResult() => _kind switch
         {
-            Kind.Immediate => _wait._retry,
+            Kind.Immediate => _retry,
             // A signal always retries; source completion is observed by the next pull or wait.
             Kind.Signal => true,
             _ => _taskAwaiter.GetResult(),
@@ -94,10 +98,10 @@ public readonly struct WaitForNextAwaitable
 
         public void UnsafeOnCompleted(Action continuation)
         {
-            switch (_wait._kind)
+            switch (_kind)
             {
                 case Kind.Signal:
-                    _wait._signal!.WaitOnCompleted(continuation);
+                    _signal!.WaitOnCompleted(continuation);
                     break;
                 case Kind.Task:
                     _taskAwaiter.UnsafeOnCompleted(continuation);
