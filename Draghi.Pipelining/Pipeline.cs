@@ -209,6 +209,41 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// </remarks>
     public Enumerator GetEnumerator() => new(this);
 
+    /// <summary>Returns a conservative concurrent enumeration bounded by the dispatched frontier
+    /// captured at construction.</summary>
+    /// <remarks>
+    /// The enumeration may omit or duplicate items under concurrent mutation. Such inaccuracies
+    /// consume positions from the captured cohort; it never intentionally extends the scan with a
+    /// position dispatched after <see cref="EnumerationFrontier.DispatchedThrough"/>.
+    /// </remarks>
+    public FrontierEnumerator GetEnumerator(out EnumerationFrontier frontier)
+    {
+        _depthState.CaptureEnumerationFrontier(out var retiredThrough, out var dispatchedThrough);
+        frontier = new(this, retiredThrough, dispatchedThrough);
+        return new(this, frontier);
+    }
+
+    public readonly struct EnumerationFrontier
+    {
+        readonly Pipeline<T, TPolicy, TSource, TEnumerator> _pipeline;
+
+        internal EnumerationFrontier(
+            Pipeline<T, TPolicy, TSource, TEnumerator> pipeline,
+            uint retiredThrough, uint dispatchedThrough)
+        {
+            _pipeline = pipeline;
+            RetiredAtCapture = retiredThrough;
+            DispatchedThrough = dispatchedThrough;
+        }
+
+        public uint RetiredAtCapture { get; }
+        public uint DispatchedThrough { get; }
+        public uint RetiredThrough => _pipeline._depthState.RetiredThrough;
+
+        public bool IsRetired(uint position)
+            => unchecked((int)(RetiredThrough - position)) >= 0;
+    }
+
     async Task ExecuteSource()
     {
         // Hoisted locals are cleared before suspension and termination to avoid retaining items.

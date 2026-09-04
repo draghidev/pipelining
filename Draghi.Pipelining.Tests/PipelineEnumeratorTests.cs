@@ -83,6 +83,98 @@ public class PipelineEnumeratorTests
     }
 
     [TestMethod]
+    public async Task FrontierEnumerator_StableStore_ReportsCapturedPositions()
+    {
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
+
+        const int count = 5;
+        var items = new TestPipelineItem[count];
+        for (var i = 0; i < count; i++)
+        {
+            items[i] = new TestPipelineItem { Name = $"frontier-{i}", CompleteAsync = true };
+            pipeline.Enqueue(items[i]).Signal();
+        }
+        for (var i = 0; i < count; i++)
+            await items[i].WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var enumerator = pipeline.Pipeline.GetEnumerator(out var frontier);
+        Assert.AreEqual((uint)count, frontier.DispatchedThrough - frontier.RetiredAtCapture);
+        for (var i = 0; i < count; i++)
+        {
+            Assert.IsTrue(enumerator.MoveNext());
+            Assert.AreEqual(frontier.RetiredAtCapture + (uint)i + 1, enumerator.Position);
+            Assert.AreSame(items[i], enumerator.Current);
+        }
+        Assert.IsFalse(enumerator.MoveNext());
+
+        foreach (var item in items)
+            item.CompletePipelineTask();
+        foreach (var item in items)
+            await item.WaitForCompleteAsync();
+    }
+
+    [TestMethod]
+    public async Task FrontierEnumerator_RetirementAndLaterDispatch_NeverOvershootsCapturedHighWater()
+    {
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
+
+        const int initialCount = 8;
+        var initial = new TestPipelineItem[initialCount];
+        for (var i = 0; i < initial.Length; i++)
+        {
+            initial[i] = new TestPipelineItem { Name = $"initial-{i}", CompleteAsync = true };
+            pipeline.Enqueue(initial[i]).Signal();
+        }
+        for (var i = 0; i < initial.Length; i++)
+            await initial[i].WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var enumerator = pipeline.Pipeline.GetEnumerator(out var frontier);
+
+        for (var i = 0; i < initial.Length / 2; i++)
+        {
+            initial[i].CompletePipelineTask();
+            await initial[i].WaitForCompleteAsync();
+        }
+
+        // Dispatch enough successors to reuse queue storage and grow past the captured tail.
+        var later = new TestPipelineItem[32];
+        for (var i = 0; i < later.Length; i++)
+        {
+            later[i] = new TestPipelineItem { Name = $"later-{i}", CompleteAsync = true };
+            pipeline.Enqueue(later[i]).Signal();
+        }
+        for (var i = 0; i < later.Length; i++)
+            await later[i].WaitForExecutedAsync();
+
+        while (enumerator.MoveNext())
+        {
+            Assert.IsTrue(
+                unchecked((int)(frontier.DispatchedThrough - enumerator.Position)) >= 0,
+                $"Position {enumerator.Position} crossed captured high-water {frontier.DispatchedThrough}.");
+            Assert.IsFalse(later.Contains(enumerator.Current),
+                $"Post-frontier {enumerator.Current.Name} filled position {enumerator.Position} " +
+                $"under high-water {frontier.DispatchedThrough}, retired-through {frontier.RetiredThrough}.");
+        }
+
+        for (var i = initial.Length / 2; i < initial.Length; i++)
+            initial[i].CompletePipelineTask();
+        foreach (var item in later)
+            item.CompletePipelineTask();
+        for (var i = initial.Length / 2; i < initial.Length; i++)
+            await initial[i].WaitForCompleteAsync();
+        foreach (var item in later)
+            await item.WaitForCompleteAsync();
+    }
+
+    [TestMethod]
     public async Task SegmentGrowth_YieldsAllItems()
     {
         // SPSC initial segment size is 32. Enqueue more than that to force segment growth.

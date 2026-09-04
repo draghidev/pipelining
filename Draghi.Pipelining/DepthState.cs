@@ -35,6 +35,16 @@ struct DepthState
         }
     }
 
+    public uint RetiredThrough => Volatile.Read(ref _retiredCount);
+
+    public void CaptureEnumerationFrontier(out uint retiredThrough, out uint dispatchedThrough)
+    {
+        // Match Depth's safe read order: retirement cannot precede dispatch. A dispatch racing the
+        // second read may join this cohort; a later dispatch is outside its captured high-water.
+        retiredThrough = Volatile.Read(ref _retiredCount);
+        dispatchedThrough = Volatile.Read(ref _dispatchCounter.Dispatched);
+    }
+
     [MethodImpl(MethodImplOptions.AggressiveInlining)]
     public void RecordDispatch()
     {

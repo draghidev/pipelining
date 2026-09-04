@@ -526,6 +526,58 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         void IDisposable.Dispose() {}
     }
 
+    // Fixed-tail raw snapshot for frontier enumeration. Every captured array position is surfaced,
+    // including a concurrently cleared default slot, so an observer can charge omissions against
+    // its cohort instead of walking into later enqueues.
+    internal struct FrontierEnumerator
+    {
+        Segment? _segment;
+        readonly Segment _tail;
+        readonly int _tailLast;
+        int _position;
+        int _last;
+
+        internal FrontierEnumerator(SingleProducerSingleConsumerQueue<T> queue)
+        {
+            _tail = Volatile.Read(ref queue._tail);
+            _tailLast = Volatile.Read(ref _tail._state._last);
+            _segment = Volatile.Read(ref queue._head);
+            _position = Volatile.Read(ref _segment._state._first);
+            _last = ReferenceEquals(_segment, _tail)
+                ? _tailLast
+                : Volatile.Read(ref _segment._state._last);
+        }
+
+        internal bool MoveNext(out T item)
+        {
+            while (_segment is not null)
+            {
+                if (_position != _last)
+                {
+                    item = _segment._array[_position];
+                    _position = (_position + 1) & (_segment._array.Length - 1);
+                    return true;
+                }
+
+                if (ReferenceEquals(_segment, _tail))
+                    break;
+                _segment = Volatile.Read(ref _segment._next);
+                if (_segment is not null)
+                {
+                    _position = Volatile.Read(ref _segment._state._first);
+                    _last = ReferenceEquals(_segment, _tail)
+                        ? _tailLast
+                        : Volatile.Read(ref _segment._state._last);
+                }
+            }
+
+            item = default!;
+            return false;
+        }
+    }
+
+    internal FrontierEnumerator GetFrontierEnumerator() => new(this);
+
     /// <summary>A segment in the queue containing one or more items.</summary>
     [StructLayout(LayoutKind.Sequential)]
     sealed class Segment
