@@ -36,6 +36,7 @@ struct DepthState
     }
 
     public uint RetiredThrough => Volatile.Read(ref _retiredCount);
+    public uint DispatchedThrough => Volatile.Read(ref _dispatchCounter.Dispatched);
 
     public void CaptureEnumerationFrontier(out uint retiredThrough, out uint dispatchedThrough)
     {

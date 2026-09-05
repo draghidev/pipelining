@@ -28,6 +28,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
 
     // Completed initially and between runs; a faulted run remains observable until reinitialization.
     Task _executionTask = Task.CompletedTask;
+    // Invalidates observation frontiers when a completed instance is cleared for another run.
+    long _runGeneration;
     // Shutdown handoff: null, caller in Complete, caller done, or the executor's waiter.
     object? _shutdownState;
     DepthState _depthState;
@@ -215,33 +217,86 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// The enumeration may omit or duplicate items under concurrent mutation. Such inaccuracies
     /// consume positions from the captured cohort; it never intentionally extends the scan with a
     /// position dispatched after <see cref="EnumerationFrontier.DispatchedThrough"/>.
+    /// The returned candidates are not pinned. Before using an identity whose retirement permits
+    /// reuse, validate its position with <see cref="EnumerationFrontier.IsRetired"/> while holding
+    /// the consumer's synchronization against retirement/reuse. Retirement must use that same
+    /// synchronization before making the identity available to another tenure.
     /// </remarks>
+    [Experimental("DRAGHI001")]
     public FrontierEnumerator GetEnumerator(out EnumerationFrontier frontier)
     {
-        _depthState.CaptureEnumerationFrontier(out var retiredThrough, out var dispatchedThrough);
-        frontier = new(this, retiredThrough, dispatchedThrough);
+        frontier = CaptureEnumerationFrontier();
         return new(this, frontier);
     }
 
+    internal EnumerationFrontier CaptureEnumerationFrontier()
+    {
+        var runGeneration = Volatile.Read(ref _runGeneration);
+        _depthState.CaptureEnumerationFrontier(out var retiredThrough, out var dispatchedThrough);
+        return new(this, runGeneration, retiredThrough, dispatchedThrough);
+    }
+
+    internal FrontierEnumerator GetEnumerator(EnumerationFrontier frontier)
+    {
+        if (!ReferenceEquals(frontier._pipeline, this))
+            throw new ArgumentException("The frontier belongs to another pipeline.", nameof(frontier));
+        return new(this, frontier);
+    }
+
+    /// <summary>A captured range of dispatched positions for conservative concurrent observation.</summary>
+    /// <remarks>
+    /// Retirement is read live from the captured pipeline run. Reusing the pipeline invalidates the
+    /// frontier; an invalidated frontier treats every captured position as retired.
+    /// This type does not itself prevent retirement or item reuse. A tenure-sensitive consumer must
+    /// combine <see cref="IsRetired"/> with its own synchronization covering the subsequent use.
+    /// <para>
+    /// Positions are unsigned sequence numbers ordered by their signed modular distance. Crossing
+    /// <see cref="uint.MaxValue"/> is therefore valid and does not invalidate an active frontier.
+    /// The capture, enumeration, and final position validation must together span fewer than
+    /// <c>2^31</c> retirements so past and future remain distinguishable. Pipeline depth is already
+    /// constrained to that same signed half-range; callers satisfy the temporal half by consuming a
+    /// frontier as the immediate, single-pass observation it represents rather than retaining it.
+    /// </para>
+    /// </remarks>
+    [Experimental("DRAGHI001")]
     public readonly struct EnumerationFrontier
     {
-        readonly Pipeline<T, TPolicy, TSource, TEnumerator> _pipeline;
+        internal readonly Pipeline<T, TPolicy, TSource, TEnumerator>? _pipeline;
 
         internal EnumerationFrontier(
             Pipeline<T, TPolicy, TSource, TEnumerator> pipeline,
-            uint retiredThrough, uint dispatchedThrough)
+            long runGeneration, uint retiredThrough, uint dispatchedThrough)
         {
             _pipeline = pipeline;
+            RunGeneration = runGeneration;
             RetiredAtCapture = retiredThrough;
             DispatchedThrough = dispatchedThrough;
         }
 
+        internal long RunGeneration { get; }
+        internal bool IsCurrentRun => _pipeline is { } pipeline
+            && Volatile.Read(ref pipeline._runGeneration) == RunGeneration;
+        /// <summary>The last position retired when the frontier was captured.</summary>
         public uint RetiredAtCapture { get; }
+        /// <summary>The last position dispatched when the frontier was captured.</summary>
         public uint DispatchedThrough { get; }
-        public uint RetiredThrough => _pipeline._depthState.RetiredThrough;
+        /// <summary>The latest retirement in the captured run, or the captured high-water after
+        /// that run has been invalidated.</summary>
+        public uint RetiredThrough => IsCurrentRun
+            ? _pipeline!._depthState.RetiredThrough
+            : DispatchedThrough;
 
+        /// <summary>Returns whether a captured position has retired or cannot safely be associated
+        /// with this frontier. This is an advisory observation and does not pin the corresponding
+        /// item against a later retirement. Positions are compared by signed modular distance, so
+        /// wraparound is valid within the frontier's documented half-range lifetime.</summary>
         public bool IsRetired(uint position)
-            => unchecked((int)(RetiredThrough - position)) >= 0;
+        {
+            var offset = position - RetiredAtCapture;
+            var capturedPositions = DispatchedThrough - RetiredAtCapture;
+            return offset == 0 || offset > capturedPositions
+                || unchecked((int)(RetiredThrough - position)) >= 0;
+        }
     }
 
     async Task ExecuteSource()
@@ -489,6 +544,8 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     /// <summary>Leaves a completed or condemned tenure as a clean, reusable instance.</summary>
     void ResetForReuse()
     {
+        // Invalidate stale observation frontiers before clearing their referenced run state.
+        Interlocked.Increment(ref _runGeneration);
         _shutdownItemException = null;
         _policy = default!;
         _source = default!;

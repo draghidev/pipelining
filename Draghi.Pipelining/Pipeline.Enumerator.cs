@@ -1,4 +1,5 @@
 using Draghi.Pipelining.Internal;
+using System.Diagnostics.CodeAnalysis;
 using System.Runtime.CompilerServices;
 
 namespace Draghi.Pipelining;
@@ -8,6 +9,18 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
     where TSource : IPipelineSource<T, TEnumerator>
     where TEnumerator : struct, IPipelineEnumerator<T>
 {
+    /// <summary>Conservatively observes the oldest candidates within a captured dispatch range.</summary>
+    /// <remarks>
+    /// Concurrent mutation may omit or duplicate items. Each candidate consumes one captured
+    /// position, and no position beyond the frontier is produced. A concurrently recycled storage
+    /// slot may contain a newer identity, which is why position validation at the use boundary is
+    /// required. For value types, concurrently cleared queue slots may surface as <c>default(T)</c>,
+    /// and non-atomic structs may tear; reference types are the reliable identity-observation form.
+    /// A successful <see cref="MoveNext"/> does not pin <see cref="Current"/>. Tenure-sensitive
+    /// consumers must validate <see cref="Position"/> with <see cref="EnumerationFrontier.IsRetired"/>
+    /// under their own retirement/reuse synchronization before dereferencing the candidate.
+    /// </remarks>
+    [Experimental("DRAGHI001")]
     public struct FrontierEnumerator
     {
         enum EnumerationPhase : byte
@@ -31,7 +44,7 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
         bool _hasPendingTail;
         bool _hasExecuting;
         uint _position;
-        uint _remaining;
+        int _remaining;
         EnumerationPhase _phase;
 
         internal FrontierEnumerator(
@@ -39,9 +52,6 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             EnumerationFrontier frontier)
         {
             _frontier = frontier;
-            _position = frontier.RetiredAtCapture;
-            _remaining = frontier.DispatchedThrough - frontier.RetiredAtCapture;
-
             _hasRecovery = Volatile.Read(ref pipeline._inFlightRecoveryVisible);
             _recovery = _hasRecovery ? pipeline._inFlightRecoveryItem : default!;
 
@@ -56,14 +66,47 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
             _executing = _hasExecuting
                 ? ReadSlot(ref pipeline._executingItem, ref pipeline._executingItemGeneration)
                 : default!;
+
+            _position = frontier.RetiredAtCapture;
+            var capturedPositions = frontier.DispatchedThrough - frontier.RetiredAtCapture;
+            var candidateLimit = (int)capturedPositions;
+            var candidateCount = (_hasRecovery ? 1 : 0) + (_hasSlot ? 1 : 0);
+            var countEnumerator = _queue;
+            while (candidateCount < candidateLimit && countEnumerator.MoveNext(out _))
+                candidateCount++;
+            if (candidateCount < candidateLimit && _hasPendingTail)
+                candidateCount++;
+            if (candidateCount < candidateLimit && _hasExecuting)
+                candidateCount++;
+
+            // A post-frontier candidate can enter only after publishing its dispatch count. Reading
+            // the count after every candidate snapshot therefore bounds how many newest candidates
+            // must be excluded. Missing/raced captured positions only shorten the observation.
+            var postFrontierDispatches = pipeline._depthState.DispatchedThrough
+                - frontier.DispatchedThrough;
+            _remaining = postFrontierDispatches > int.MaxValue || capturedPositions == 0
+                ? 0
+                : Math.Max(
+                    0,
+                    Math.Min(candidateLimit, candidateCount) - (int)postFrontierDispatches);
         }
 
         public T Current { get; private set; } = default!;
+        /// <summary>The captured position associated with <see cref="Current"/> after a successful
+        /// <see cref="MoveNext"/>.</summary>
         public uint Position => _position;
+        /// <summary>The dispatch and retirement range governing this observation.</summary>
         public EnumerationFrontier Frontier => _frontier;
 
+        /// <summary>Advances to the next conservative candidate in the captured range.</summary>
         public bool MoveNext()
         {
+            if (!_frontier.IsCurrentRun)
+            {
+                _remaining = 0;
+                Current = default!;
+                return false;
+            }
             while (_remaining != 0)
             {
                 ChargeConcurrentRetirements();
@@ -82,24 +125,16 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
 
         void ChargeConcurrentRetirements()
         {
-            var retiredThrough = _frontier.RetiredThrough;
-            var retiredDistance = unchecked((int)(retiredThrough - _position));
+            var retiredDistance = unchecked((int)(_frontier.RetiredThrough - _position));
             if (retiredDistance <= 0)
                 return;
-            var retired = (uint)retiredDistance;
-            if (retired >= _remaining)
-            {
-                DiscardCandidates(_remaining);
-                _position += _remaining;
-                _remaining = 0;
-                return;
-            }
+            var retired = Math.Min(retiredDistance, _remaining);
             DiscardCandidates(retired);
-            _position = retiredThrough;
+            _position += (uint)retired;
             _remaining -= retired;
         }
 
-        void DiscardCandidates(uint count)
+        void DiscardCandidates(int count)
         {
             while (count-- != 0 && TryReadCandidate(out _)) { }
         }

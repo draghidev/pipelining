@@ -526,9 +526,10 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
         void IDisposable.Dispose() {}
     }
 
-    // Fixed-tail raw snapshot for frontier enumeration. Every captured array position is surfaced,
-    // including a concurrently cleared default slot, so an observer can charge omissions against
-    // its cohort instead of walking into later enqueues.
+    // Fixed-tail best-effort snapshot for frontier enumeration. The current segment's range is
+    // captured immediately; later segments are entered at their then-current consumer position, so
+    // concurrent retirement may omit entries and a concurrently cleared slot may surface default.
+    // Pipeline's positional frontier treats either outcome conservatively.
     internal struct FrontierEnumerator
     {
         Segment? _segment;
@@ -539,9 +540,15 @@ public sealed class SingleProducerSingleConsumerQueue<T> : IEnumerable<T>
 
         internal FrontierEnumerator(SingleProducerSingleConsumerQueue<T> queue)
         {
-            _tail = Volatile.Read(ref queue._tail);
-            _tailLast = Volatile.Read(ref _tail._state._last);
+            // Capture head first. Segment growth publishes tail._next before advancing queue._tail,
+            // and the consumer may follow that link immediately. If the subsequently observed tail
+            // already has a successor, its relation to this head is ambiguous (growth overlapped the
+            // snapshot or the tail read was stale), so conservatively bound the scan to the captured
+            // head. Otherwise the captured tail is a fixed, reachable boundary; _next is never cleared.
             _segment = Volatile.Read(ref queue._head);
+            var tail = Volatile.Read(ref queue._tail);
+            _tail = Volatile.Read(ref tail._next) is null ? tail : _segment;
+            _tailLast = Volatile.Read(ref _tail._state._last);
             _position = Volatile.Read(ref _segment._state._first);
             _last = ReferenceEquals(_segment, _tail)
                 ? _tailLast

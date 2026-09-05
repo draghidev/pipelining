@@ -1,6 +1,8 @@
 namespace Draghi.Pipelining.Tests;
 
 using Draghi.Pipelining.Internal;
+using System.Reflection;
+using System.Threading.Tasks.Sources;
 
 [TestClass]
 public class PipelineEnumeratorTests
@@ -106,7 +108,7 @@ public class PipelineEnumeratorTests
         for (var i = 0; i < count; i++)
         {
             Assert.IsTrue(enumerator.MoveNext());
-            Assert.AreEqual(frontier.RetiredAtCapture + (uint)i + 1, enumerator.Position);
+            Assert.AreEqual(frontier.RetiredAtCapture + i + 1, enumerator.Position);
             Assert.AreSame(items[i], enumerator.Current);
         }
         Assert.IsFalse(enumerator.MoveNext());
@@ -157,7 +159,7 @@ public class PipelineEnumeratorTests
         while (enumerator.MoveNext())
         {
             Assert.IsTrue(
-                unchecked((int)(frontier.DispatchedThrough - enumerator.Position)) >= 0,
+                frontier.DispatchedThrough >= enumerator.Position,
                 $"Position {enumerator.Position} crossed captured high-water {frontier.DispatchedThrough}.");
             Assert.IsFalse(later.Contains(enumerator.Current),
                 $"Post-frontier {enumerator.Current.Name} filled position {enumerator.Position} " +
@@ -172,6 +174,186 @@ public class PipelineEnumeratorTests
             await initial[i].WaitForCompleteAsync();
         foreach (var item in later)
             await item.WaitForCompleteAsync();
+    }
+
+    [TestMethod]
+    public async Task FrontierEnumerator_RemovedBeforeRetirement_TrimsPostFrontierTail()
+    {
+        var idleTcs = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var pipeline = ObservablePipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true),
+            onIdle: _ => { idleTcs.TrySetResult(); return default; });
+        var blockingSource = new BlockingGetResultSource();
+        var first = new TestPipelineItem
+        {
+            Name = "captured-first",
+            PipelineTaskSource = blockingSource
+        };
+        var second = new TestPipelineItem { Name = "captured-second", CompleteAsync = true };
+        pipeline.Enqueue(first).Signal();
+        pipeline.Enqueue(second).Signal();
+        await first.WaitForExecutedAsync();
+        await second.WaitForExecutedAsync();
+        await idleTcs.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var frontier = pipeline.Pipeline.CaptureEnumerationFrontier();
+        blockingSource.Complete();
+        await blockingSource.GetResultEntered.WaitAsync(TimeSpan.FromSeconds(5));
+
+        var later = new TestPipelineItem { Name = "post-frontier", CompleteAsync = true };
+        try
+        {
+            pipeline.Enqueue(later).Signal();
+            await later.WaitForExecutedAsync();
+
+            var enumerator = pipeline.Pipeline.GetEnumerator(frontier);
+            var observed = new List<TestPipelineItem>();
+            while (enumerator.MoveNext())
+                observed.Add(enumerator.Current);
+
+            Assert.IsFalse(observed.Contains(later),
+                "A head removed before its retirement publication must shorten the captured cohort, " +
+                "not admit a post-frontier successor into its position.");
+            CollectionAssert.Contains(observed, second);
+        }
+        finally
+        {
+            // Never strand the advancer thread if an assertion above fails.
+            blockingSource.ReleaseGetResult();
+            second.CompletePipelineTask();
+            later.CompletePipelineTask();
+            await first.WaitForCompleteAsync();
+            await second.WaitForCompleteAsync();
+            await later.WaitForCompleteAsync();
+        }
+    }
+
+    sealed class BlockingGetResultSource : IValueTaskSource
+    {
+        ManualResetValueTaskSourceCore<bool> _core = new()
+        {
+            RunContinuationsAsynchronously = true
+        };
+        readonly TaskCompletionSource _getResultEntered =
+            new(TaskCreationOptions.RunContinuationsAsynchronously);
+        readonly ManualResetEventSlim _releaseGetResult = new();
+
+        internal Task GetResultEntered => _getResultEntered.Task;
+        internal void Complete() => _core.SetResult(true);
+        internal void ReleaseGetResult() => _releaseGetResult.Set();
+
+        void IValueTaskSource.GetResult(short token)
+        {
+            _getResultEntered.TrySetResult();
+            _releaseGetResult.Wait();
+            _ = _core.GetResult(token);
+        }
+
+        ValueTaskSourceStatus IValueTaskSource.GetStatus(short token) => _core.GetStatus(token);
+
+        void IValueTaskSource.OnCompleted(Action<object?> continuation, object? state, short token,
+            ValueTaskSourceOnCompletedFlags flags)
+            => _core.OnCompleted(continuation, state, token, flags);
+    }
+
+    [TestMethod]
+    public async Task FrontierEnumerator_ReusedPipelineRun_InvalidatesStaleObservation()
+    {
+        var source = TestObservableQueueSource<TestPipelineItem>.Create();
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy,
+            TestObservableQueueSource<TestPipelineItem>,
+            TestObservableQueueSource<TestPipelineItem>.Enumerator>(
+            new(runEnqueueAsynchronously: true), source);
+        var item = new TestPipelineItem { CompleteAsync = true };
+        source.Enqueue(item).Signal();
+        await item.WaitForExecutedAsync();
+
+        var stale = pipeline.GetEnumerator(out var frontier);
+        Assert.IsTrue(frontier.DispatchedThrough > frontier.RetiredAtCapture);
+
+        item.CompletePipelineTask();
+        await pipeline.CompleteAsync();
+
+        var nextSource = TestObservableQueueSource<TestPipelineItem>.Create();
+        var reused = Pipeline.Create(
+            new TestPipelinePolicy(runEnqueueAsynchronously: true), nextSource, pipeline);
+        Assert.AreSame(pipeline, reused);
+        Assert.IsTrue(frontier.IsRetired(frontier.DispatchedThrough));
+        Assert.IsFalse(stale.MoveNext(),
+            "An enumerator from a completed run must not expose retained identities after reuse.");
+
+        await reused.CompleteAsync();
+    }
+
+    [TestMethod]
+    public async Task EnumerationFrontier_Wraparound_UsesSignedModularOrdering()
+    {
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(
+            new(runEnqueueAsynchronously: true));
+        _ = pipeline.Pipeline.GetEnumerator(out var currentRun);
+        var frontier = new Pipeline<TestPipelineItem, TestPipelinePolicy,
+            UnboundedQueueSource<TestPipelineItem>,
+            UnboundedQueueSource<TestPipelineItem>.Enumerator>.EnumerationFrontier(
+                pipeline.Pipeline, currentRun.RunGeneration,
+                retiredThrough: uint.MaxValue - 2, dispatchedThrough: 2);
+
+        Assert.IsTrue(frontier.IsRetired(uint.MaxValue - 2), "Capture low-water is not live.");
+        Assert.IsTrue(frontier.IsRetired(uint.MaxValue - 1));
+        Assert.IsTrue(frontier.IsRetired(uint.MaxValue));
+        Assert.IsTrue(frontier.IsRetired(0));
+        Assert.IsFalse(frontier.IsRetired(1));
+        Assert.IsFalse(frontier.IsRetired(2));
+        Assert.IsTrue(frontier.IsRetired(3), "A position beyond the captured high-water fails closed.");
+
+        await pipeline.CompleteAsync();
+    }
+
+    [TestMethod]
+    public void QueueFrontierEnumerator_TailPublicationGap_StopsAtCapturedHead()
+    {
+        var queue = new SingleProducerSingleConsumerQueue<int>();
+        for (var i = 0; i < 7; i++)
+            queue.Enqueue(i);
+
+        // Enqueuing the eighth item publishes oldTail._next before advancing queue._tail. Recreate
+        // that canonical SPSC publication interval after moving the consumer onto the new segment.
+        var tailField = typeof(SingleProducerSingleConsumerQueue<int>).GetField(
+            "_tail", BindingFlags.Instance | BindingFlags.NonPublic)!;
+        var precedingTail = tailField.GetValue(queue);
+        queue.Enqueue(7);
+        var publishedTail = tailField.GetValue(queue);
+        Assert.AreNotSame(precedingTail, publishedTail);
+
+        for (var i = 0; i < 7; i++)
+        {
+            Assert.IsTrue(queue.TryDequeue(out var item));
+            Assert.AreEqual(i, item);
+        }
+        Assert.IsTrue(queue.TryPeek(out var head));
+        Assert.AreEqual(7, head);
+
+        SingleProducerSingleConsumerQueue<int>.FrontierEnumerator enumerator;
+        tailField.SetValue(queue, precedingTail);
+        try
+        {
+            enumerator = queue.GetFrontierEnumerator();
+        }
+        finally
+        {
+            tailField.SetValue(queue, publishedTail);
+        }
+
+        // Fill the captured head and force a later segment publication. A fixed frontier from the
+        // publication gap must not follow that successor merely because its captured tail was behind.
+        for (var i = 8; i < 22; i++)
+            queue.Enqueue(i);
+        queue.Enqueue(22);
+
+        var observed = new List<int>();
+        while (enumerator.MoveNext(out var item))
+            observed.Add(item);
+
+        CollectionAssert.AreEqual(new[] { 7 }, observed);
     }
 
     [TestMethod]
