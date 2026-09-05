@@ -539,10 +539,14 @@ public sealed partial class Pipeline<T, TPolicy, TSource, TEnumerator>
                 edgeLock.Exit();
             }
         }
+        // At the exact idle edge the activated slot was cleared above, giving the policy a
+        // pre-release zero signal. Retain the old turn through CompleteItem so that signal does not
+        // also grant a racing dispatch permission to activate against policy-owned teardown. A
+        // reentrant enqueue may publish its handoff, but cannot activate until this callback returns.
+        _policy.CompleteItem(item, exception);
         // Owner-checked release cannot clear a successor's turn.
         if (ownedTurn != 0)
             _activationGate.TryReleaseTurn(ownedTurn);
-        _policy.CompleteItem(item, exception);
         if (depth is 0)
             _policy.OnIdle();
         return depth is 0;

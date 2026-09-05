@@ -70,7 +70,7 @@ VARIABLES
   handoffFenceEpoch,       \* Dekker barrier epoch (ExecutorFenceHandoffPublication advances; publishes NOTHING)
   passDecrementEpoch,    \* [RetirementPasses -> epoch at their last count-decrement RMW]
   passPc,          \* [RetirementPasses -> "off"|"readFirstTier"|"readSecondTier"|"decideHeadClaim"|"armHeadDelivery"|"releasePhantomEdge"|"exitPass"
-                \*  |"releaseActivationTurn"|"decrementInFlightCount"|"reacquireLicense"|"phantomReadFirstTier"|"phantomReadSecondTier"|"phantomDecide"
+                \*  |"completeItem"|"releaseActivationTurn"|"decrementInFlightCount"|"reacquireLicense"|"phantomReadFirstTier"|"phantomReadSecondTier"|"phantomDecide"
                 \*  |"emptyEdgeLock"|"emptyEdgeObserve"|"emptyEdgeUnlock"|"emptyEdgeTurnClaim"|"emptyEdgeHandoffTake"
                 \*  |"emptyEdgeActivate"|"emptyEdgeRecordResolution"
                 \*  |"recoveryLock"|"recoveryPrepare"|"recoveryActivate"|"awaitEmptyEdgeResolution"|"recoveryDecrement"]
@@ -849,23 +849,22 @@ PassDecideHeadClaim(t) ==
                            /\ fifoViolation' = (fifoViolation \/ (\E jj \in 1..N : jj < qSeen /\ (slot = jj \/ (\E kk \in 1..Len(overflowQueue) : overflowQueue[kk] = jj))))
                       ELSE /\ UNCHANGED <<slot, overflowQueue, queuePublished, headTicket, inFlightCount,
                                           completionConsumed, completionDispatchTorn, fifoViolation, edgeLockOwner, executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed>>
-          \* The implementation's retirement order (RetireItemDeferred): release the
-          \* owned activationTurn, run CompleteItem (arbitrary
-          \* policy - the LARGE window), only then decrement the store count.
-          \* Here: the claim dequeues; trel releases; tdec decrements. The
-          \* trel->tdec gap IS the CompleteItem window, independently schedulable.
+          \* The implementation's retirement order (RetireItemDeferred): run CompleteItem
+          \* (arbitrary policy - the LARGE window) while the owned activationTurn remains held,
+          \* then release the turn and decrement the store count.
+          \* Here: the claim dequeues; tcomplete models policy work; trel releases; tdec decrements.
           /\ UNCHANGED activationTurn
           /\ passPc' = [passPc EXCEPT ![t] =
                IF completionConsumed' = completionConsumed THEN "readFirstTier"
                ELSE LET tgt == IF slot' # slot THEN passSlotSeen[t] ELSE passQueueSeen[t] IN
-                    IF recover /\ tgt = 2 /\ ~recoveryAttempted[tgt] THEN "recoveryLock" ELSE "releaseActivationTurn"]
+                    IF recover /\ tgt = 2 /\ ~recoveryAttempted[tgt] THEN "recoveryLock" ELSE "completeItem"]
           /\ UNCHANGED <<completionPublished, completionDispatch, completionCallbackRegistered, localDeliveryArmItem,
                          advanceOwner, advancePending, activationPerformed, localHandoffGeneration, handoffClaimed,
                          edgeLockOwner, faultDoubleActivate, faultTokenRead>>
   /\ passSlotSeen' = [passSlotSeen EXCEPT ![t] =
-       IF passPc'[t] \in {"releaseActivationTurn", "recoveryLock"} /\ slot' # slot THEN @ ELSE NONE]
+       IF passPc'[t] \in {"completeItem", "recoveryLock"} /\ slot' # slot THEN @ ELSE NONE]
   /\ passQueueSeen' = [passQueueSeen EXCEPT ![t] =
-       IF passPc'[t] \in {"releaseActivationTurn", "recoveryLock"} /\ overflowQueue' # overflowQueue THEN @ ELSE NONE]
+       IF passPc'[t] \in {"completeItem", "recoveryLock"} /\ overflowQueue' # overflowQueue THEN @ ELSE NONE]
   /\ UNCHANGED <<executorPc, executorItem, openedEmptyEdge, executionKind, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 \* Licensed phantom re-peek (Pipeline.Advance): a count-positive peek miss
@@ -908,10 +907,19 @@ PassPhantomDecide(t) ==
                  executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
                  openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
-\* The owned-activationTurn release: AFTER the claim/dequeue, BEFORE the store decrement
-\* (the RetireItemDeferred order). The window everything downstream must
-\* tolerate is activationTurn-free-while-count-high (the trel->tdec CompleteItem gap) -
-\* the benign stale-nonzero direction the code's comments name.
+\* Arbitrary policy completion runs after claim/dequeue while the retiring activation turn remains
+\* held. This is the pre-release zero-edge window used by policies for exclusive teardown.
+PassCompleteItem(t) ==
+  /\ passPc[t] = "completeItem"
+  /\ passPc' = [passPc EXCEPT ![t] = "releaseActivationTurn"]
+  /\ UNCHANGED <<inFlightCount, slot, queuePublished, overflowQueue, headTicket, completionPublished, completionDispatch, completionConsumed,
+                 completionDispatchTorn, completionCallbackRegistered, localDeliveryArmItem, visibleDeliveryArmItem, advanceOwner, advancePending, edgeLockOwner, activationTurn, activationPerformed,
+                 executionKind, localHandoffGeneration, visibleHandoffGeneration, handoffClaimed, faultDoubleActivate, executorPc, executorItem,
+                 passSlotSeen, passQueueSeen, openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
+
+\* The owned-activationTurn release: AFTER claim/dequeue and CompleteItem, BEFORE the store
+\* decrement. The remaining trel->tdec preemption window is activationTurn-free while count remains
+\* conservatively high - the benign stale-nonzero direction the code's comments name.
 PassReleaseActivationTurn(t) ==
   /\ passPc[t] = "releaseActivationTurn"
   /\ LET tgt == IF passSlotSeen[t] # NONE THEN passSlotSeen[t] ELSE passQueueSeen[t] IN
@@ -925,9 +933,9 @@ PassReleaseActivationTurn(t) ==
                  openedEmptyEdge, fifoViolation, faultTokenRead, lateCompletionCallback, handoffItem, generationCounter, executorGeneration, passEmptyEdgeHandoffGeneration, passEmptyEdgeHandoffItem, emptyEdgeActivationBusy, resolvedEmptyEdgeGeneration, faultConcurrentActivation, handoffFenceEpoch, passDecrementEpoch, itemGeneration, recoveryAttempted>>
 
 
-\* The store-count decrement, AFTER the CompleteItem window (the trel->tdec
-\* gap): everything reading inFlightCount in that window sees the RETIRED item still
-\* counted with its activationTurn already free - the benign stale-nonzero direction.
+\* The store-count decrement after turn release. Everything reading inFlightCount in the small
+\* trel->tdec window sees the retired item still counted with its activationTurn already free - the
+\* benign stale-nonzero direction.
 PassDecrementInFlightCount(t) ==
   /\ passPc[t] = "decrementInFlightCount"
   /\ inFlightCount' = inFlightCount - 1
@@ -1206,7 +1214,7 @@ Next ==
   \/ ExecutorDiscoverRecovery \/ ExecutorReclaimFailedHandoff \/ ExecutorAwaitEmptyEdgeResolution \/ ExecutorActivateRecovery \/ ExecutorCommitInheritedRecoveryTurn \/ ExecutorRepublishRecoveryHandoff \/ ExecutorResolvePriorHandoff \/ StoreIncrementInFlightCount \/ StorePublishCommittedItem \/ ExecutorPrepareEmptyEdgeActivation \/ ExecutorAcquireAdvanceLicense \/ ExecutorAssignAndPublishAtEmptyEdge \/ ExecutorAttachEmptyEdgeCallback \/ ExecutorReleaseAdvanceLicense \/ ExecutorAcquireEmptyEdgeLock \/ ExecutorAssignAtEmptyEdge \/ ExecutorActivateEmptyEdgeItem \/ ExecutorReadAdvanceLicense \/ ExecutorFinishOwnedPass \/ ExecutorNext
   \/ \E i \in 1..N : PublishCompletion(i) \/ BeginCompletionDispatch(i) \/ DeliverCompletionCallback(i) \/ CompletionCallbackAcquireOrDeposit(i) \/ ReclaimCompletionCallback(i)
   \/ PropagateDeliveryArmClear
-  \/ \E t \in RetirementPasses : PassReadFirstStoreTier(t) \/ PassReadSecondStoreTier(t) \/ PassDecideHeadClaim(t) \/ PassReleaseAfterPhantomEdge(t) \/ PassPhantomReadFirstTier(t) \/ PassPhantomReadSecondTier(t) \/ PassPhantomDecide(t) \/ PassReleaseActivationTurn(t) \/ PassDecrementInFlightCount(t) \/ PassTryReacquireLicense(t) \/ PassDecrementRecoveredItem(t)
+  \/ \E t \in RetirementPasses : PassReadFirstStoreTier(t) \/ PassReadSecondStoreTier(t) \/ PassDecideHeadClaim(t) \/ PassReleaseAfterPhantomEdge(t) \/ PassPhantomReadFirstTier(t) \/ PassPhantomReadSecondTier(t) \/ PassPhantomDecide(t) \/ PassCompleteItem(t) \/ PassReleaseActivationTurn(t) \/ PassDecrementInFlightCount(t) \/ PassTryReacquireLicense(t) \/ PassDecrementRecoveredItem(t)
                           \/ PassAcquireRecoveryLock(t) \/ PassPrepareRecoveryReplacement(t) \/ PassActivateRecoveryReplacement(t) \/ PassRetireRecoveredItem(t)
                           \/ PassExit(t)
                           \/ PassAcquireEmptyEdgeLock(t) \/ PassObserveEmptyEdgeHandoff(t) \/ PassReleaseEmptyEdgeLock(t) \/ PassClaimEmptyEdgeTurn(t) \/ PassTakeEmptyEdgeHandoff(t) \/ PassActivateEmptyEdgeItem(t) \/ PassRecordEmptyEdgeResolution(t)
@@ -1245,7 +1253,7 @@ ActivationTurnNamesLiveTenure ==
     \* pending release: the retiring retirement pass holds the release obligation between
     \* its claim (dequeue) and trel - the activationTurn legitimately names the dequeued item.
     \/ \E t \in RetirementPasses :
-         /\ passPc[t] = "releaseActivationTurn"
+         /\ passPc[t] \in {"completeItem", "releaseActivationTurn"}
          /\ (passSlotSeen[t] = activationTurn \/ passQueueSeen[t] = activationTurn)
     \* the walk-recovery episode: the substitute holds the activationTurn on its DEQUEUED
     \* position by design (in-place takeover, credit advanceOwner until the re-retire).

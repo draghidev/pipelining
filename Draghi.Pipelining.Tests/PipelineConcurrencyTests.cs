@@ -1504,6 +1504,51 @@ public class PipelineConcurrencyTests
         PipelineTestAsserts.AssertDepthSettlesToZero(() => pipeline.Depth);
     }
 
+    [TestMethod]
+    public async Task ZeroEdge_CompleteItemSeesNullSlotWhileRetainingActivationTurn()
+    {
+        var completionEntered = new TaskCompletionSource(
+            TaskCreationOptions.RunContinuationsAsynchronously);
+        using var releaseCompletion = new ManualResetEventSlim();
+        var first = new TestPipelineItem
+        {
+            CompleteAsync = true,
+            OnComplete = () =>
+            {
+                completionEntered.TrySetResult();
+                releaseCompletion.Wait();
+            }
+        };
+        var second = new TestPipelineItem { CompleteAsync = true };
+        var pipeline = Pipeline.Create<TestPipelineItem, TestPipelinePolicy>(new());
+
+        pipeline.Enqueue(first).Signal();
+        await first.WaitForExecutedAsync();
+        _ = Task.Run(first.CompletePipelineTask);
+        await completionEntered.Task.WaitAsync(TimeSpan.FromSeconds(5));
+
+        try
+        {
+            Assert.IsNull(pipeline.Pipeline.ActivatedItem,
+                "The final completion callback must observe the pre-release zero-edge sentinel.");
+            pipeline.Enqueue(second).Signal();
+            await second.WaitForExecutedAsync();
+            Assert.AreEqual(0, second.ActivationCount,
+                "A dispatch raced through the zero edge while CompleteItem still owned teardown.");
+        }
+        finally
+        {
+            releaseCompletion.Set();
+        }
+
+        await first.WaitForCompleteAsync();
+        await second.WaitForActivationAsync();
+        Assert.AreEqual(1, second.ActivationCount);
+        second.CompletePipelineTask();
+        await second.WaitForCompleteAsync();
+        await pipeline.CompleteAsync();
+    }
+
     /// Three-way stress: producer enqueues, executor processes items with faulting pipeline
     /// tasks (triggering recovery via the advancer), recovery continuations fire and coordinate
     /// with the activation lock. Exercises the interleaving of executor + advancer + recovery
